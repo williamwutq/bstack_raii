@@ -1,7 +1,7 @@
 # bstack_raii
 
 Typed, RAII-style ownership for persistent objects — `Rc`/`Weak` semantics that
-survive a process restart or crash, backed by a single [`bstack`] file.
+survive a process restart or crash, backed by [`bstack`] files.
 
 `std::rc::Rc` and `Weak` live and die with the process. `bstack_raii` gives you
 the same model — shared strong handles, non-owning weak handles, and automatic
@@ -11,14 +11,38 @@ and enums; the [`#[bstack_block]`](#structs) / [`#[bstack_enum]`](#enums-bstack_
 macros generate the on-disk layout, typed accessors, constructors, recursive
 teardown, and refcounting.
 
-It is a thin, typed layer over the mainline `bstack` allocator
-(`BStackRange` / `BStackSlice` / `BStackOwnedSlice`), which already provides the
-atomicity, crash-safety, and single-ownership guarantees. This crate adds the
-object model on top.
+On top of that core it grows a full object layer:
+
+- **Five ownership kinds** — [`#[bstack_owned]`, `#[embed]`, `#[bstack_strong]`,
+  `#[bstack_weak]`, `#[bstack_ref]`](#field-ownership) — each with matching
+  deep-clone ([`TryCloneIn`](#cloning-tryclonein--tryclone)), recursive teardown,
+  and [`bstack_move!`](#moving-out-bstack_move) semantics.
+- **Rich field shapes** — growable [`Vec` / `String`](#vectors-and-strings),
+  fixed-size [`[T; N]` arrays](#fixed-size-arrays-t-n), nullable
+  [`Option`](#nullable-fields-option), POD tuples, and
+  [generic blocks](#generic-blocks), composed to depth.
+- **[Cross-file pointers](#cross-file-pointers-foreignt) (`Foreign<T>`)** — a wide
+  pointer naming a target file *and* an offset in it, so an object graph can span
+  many `bstack` files (a sharded store, an index pointing at a data file), each
+  file staying an independent crash-safe unit, resolved through a process-wide file
+  registry.
+- **Crash-safe compound ops** — clone and teardown commit as one atomic batch and,
+  on a WAL-anchoring allocator, reclaim crash-orphaned allocations on the next open.
+- **[Standard-library collections](#standard-library-collections)** — persistent
+  `HashMap`, `BTreeMap`, `VecDeque`, `LinkedList`, `String`, and more, built from
+  the same primitives.
+- **A self-describing on-disk schema (RTTI)** — an optional type-registry stack
+  (see [BYTECODE.md](BYTECODE.md)) that lets a general program interpret
+  bstack_raii structures on disk with no compiled-in Rust types.
+
+It is a typed object layer over the mainline `bstack` allocator
+(`BStackRange` / `BStackSlice` / `BStackOwnedSlice`), which supplies the
+atomicity, crash-safety, and single-ownership primitives underneath — but the
+object model on top is substantial in its own right (comparable in size to
+`bstack` itself), not a thin wrapper.
 
 > **Status:** feature-complete and tested, but the on-disk ABI is not yet
-> stable. Developed inside the [`bstack`] repository; not yet published to
-> crates.io.
+> stable. Not yet published to crates.io.
 
 ## Contents
 
@@ -55,7 +79,7 @@ layer):
 
 ```toml
 [dependencies]
-bstack_raii = { git = "https://github.com/williamwutq/bstack" }
+bstack_raii = { git = "https://github.com/williamwutq/bstack_raii" }
 bstack = "0.4"
 ```
 
