@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta, nightly]
+        exclude:
+          # Trim nightly on Windows to keep the matrix lean (as bstack does).
+          - os: windows-latest
+            rust: nightly
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+    # The trybuild compile-fail UI tests (`compile_fail`) are toolchain-sensitive —
+    # their committed `.stderr` snapshots track one compiler's diagnostics. They run
+    # on stable in the Check workflow, and are skipped across the matrix so the logic
+    # tests stay green on every OS / channel.
+    - name: Check
+      run: cargo check --workspace --all-targets
+    - name: Test
+      run: cargo test --workspace -- --skip compile_fail
+    - name: Test (release)
+      run: cargo test --workspace --release -- --skip compile_fail
+    - name: Test (fault-injection)
+      run: cargo test --workspace --features fault-injection -- --skip compile_fail
