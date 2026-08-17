@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
 license = "MIT"
 description = "Typed, RAII-style ownership and lifetime layer over the bstack allocation primitives"
-repository = "https://github.com/williamwutq/bstack"
+repository = "https://github.com/williamwutq/bstack_raii"
 publish = false
 
 # This crate is developed inside the `bstack` repository but is NOT part of the
