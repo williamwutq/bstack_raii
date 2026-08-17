@@ -407,7 +407,8 @@ fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::R
     // `Foreign` is supported as a **scalar** `Foreign<T>` or `Option<Foreign<T>>`; a
     // foreign inside a `Vec` / array is not modelled by the RTTI interpreter yet.
     if field_foreign_target(ty).is_some() {
-        let scalar = foreign_inner(ty).is_some() || option_inner(ty).and_then(foreign_inner).is_some();
+        let scalar =
+            foreign_inner(ty).is_some() || option_inner(ty).and_then(foreign_inner).is_some();
         if !scalar {
             return Err(Error::new_spanned(
                 ty,
