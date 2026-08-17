@@ -29,9 +29,10 @@
 //!
 //! ## Not yet covered
 //!
-//! Generics, `Foreign`, tuple struct-fields, and complex enum variant payloads (vec /
-//! array / foreign / tuple) are clear compile errors rather than a wrong descriptor —
-//! they belong to a later RTTI phase.
+//! A scalar `Foreign<T>` / `Option<Foreign<T>>` is emitted as a `Shape::Foreign`
+//! carrying the target tag + ownership kind. Generics, tuple struct-fields, `Foreign`
+//! inside a container, and complex enum variant payloads (vec / array / foreign /
+//! tuple) are clear compile errors rather than a wrong descriptor.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -403,16 +404,20 @@ fn registration(name: &Ident, rtti_type: TokenStream) -> TokenStream {
 /// down to a leaf (`Pod` or a block reference); the ownership `kind` applies to the
 /// leaf.
 fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
-    // `Foreign` is a later (cross-file) phase; its schema shape needs the target's
-    // ownership kind, which the current `Shape::Foreign` does not yet carry.
+    // `Foreign` is supported as a **scalar** `Foreign<T>` or `Option<Foreign<T>>`; a
+    // foreign inside a `Vec` / array is not modelled by the RTTI interpreter yet.
     if field_foreign_target(ty).is_some() {
-        return Err(Error::new_spanned(
-            ty,
-            format!(
-                "[BSTACK0309] field `{fname}`: `Foreign` is not yet supported by #[bstack_class] \
-                 (cross-file RTTI is a later phase)"
-            ),
-        ));
+        let scalar = foreign_inner(ty).is_some() || option_inner(ty).and_then(foreign_inner).is_some();
+        if !scalar {
+            return Err(Error::new_spanned(
+                ty,
+                format!(
+                    "[BSTACK0309] field `{fname}`: `Foreign` inside a container is not yet \
+                     supported by #[bstack_class] (only scalar `Foreign<T>` / \
+                     `Option<Foreign<T>>`)"
+                ),
+            ));
+        }
     }
 
     // `Option<Inner>` — nullable leaf / child.
@@ -468,9 +473,38 @@ fn leaf_or_container_shape(
     leaf_shape(fname, orig, ty, kind)
 }
 
-/// A single leaf: a `Pod` value (its byte width) or a block reference (its target's
-/// tag), selected by the ownership `kind`.
+/// The `ForeignKind` variant for a foreign field's ownership annotation, or `None`
+/// (a `Foreign` must be annotated — never POD / `#[embed]`).
+fn foreign_kind_variant(kind: Kind) -> Option<TokenStream> {
+    Some(match kind {
+        Kind::Owned => quote!(Owned),
+        Kind::Strong => quote!(Strong),
+        Kind::Weak => quote!(Weak),
+        Kind::Ref => quote!(Ref),
+        Kind::Pod | Kind::Embed => return None,
+    })
+}
+
+/// A single leaf: a `Pod` value (its byte width), a cross-file `Foreign<T>` (its target
+/// tag + ownership kind), or an in-file block reference (its target's tag), selected by
+/// the ownership `kind`.
 fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
+    // A scalar `Foreign<T>`: emit the target tag + the ownership kind.
+    if let Some(target) = foreign_inner(ty) {
+        let fk = foreign_kind_variant(kind).ok_or_else(|| {
+            Error::new_spanned(
+                orig,
+                format!(
+                    "[BSTACK0302] field `{fname}`: a `Foreign` needs an ownership annotation \
+                     (#[bstack_owned/strong/weak/ref])"
+                ),
+            )
+        })?;
+        return Ok(quote!(::bstack_raii::rtti::Shape::Foreign {
+            tag: <#target as ::bstack_raii::BStackCast>::eightcc(),
+            kind: ::bstack_raii::rtti::ForeignKind::#fk,
+        }));
+    }
     if matches!(ty, Type::Tuple(_)) {
         return Err(Error::new_spanned(
             orig,

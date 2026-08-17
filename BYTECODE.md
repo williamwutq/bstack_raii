@@ -81,20 +81,20 @@ interpreter dispatches on for get/set/clone/teardown. Depth is bounded by the
 *source type* nesting (never by data depth: `Vec<[T;N]>`, `[Vec<T>;N]`,
 `[[T;N];M]`, `Option`-leaf), so it parses with a small fixed work-stack.
 
-| tag  | node    | payload                                          | inline on-disk form / interpretation                                         |
-|------|---------|--------------------------------------------------|------------------------------------------------------------------------------|
-| 0x00 | POD     | width:u32                                        | `width` raw bytes; memcpy on clone                                           |
-| 0x01 | OWNED   | eightcc:[u8;8]                                   | u64 offset; recurse + deep-clone / free child                                |
-| 0x02 | STRONG  | eightcc:[u8;8]                                   | u64 offset; **bump refcount** on clone (never copy)                          |
-| 0x03 | WEAK    | eightcc:[u8;8]                                   | u64 offset; copy offset + **stop** (don't follow)                            |
-| 0x04 | REF     | eightcc:[u8;8]                                   | u64 offset; **alias** on clone (design-ref-clone-alias)                      |
-| 0x05 | EMBED   | eightcc:[u8;8]                                   | child `OnDisk` inlined (no offset); recurse in place                         |
-| 0x06 | FOREIGN | eightcc:[u8;8]                                   | inline `ForeignRepr{file_id:u32, type_index:u32, offset:u64}` (16B); resolve |
-| 0x10 | OPTION  | inner:Shape                                      | 0-niche None over an offset-bearing inner                                    |
-| 0x11 | ARRAY   | n:u32, inner                                     | `[inner; n]`, contiguous                                                     |
-| 0x12 | VEC     | inner:Shape                                      | inline `VecDesc{data_off:u64, data_size:u64}`; elems = `inner`               |
-| 0x13 | TUPLE   | k:u8, inner×k                                    | POD tuple, fields in order                                                   |
-| 0x20 | CLASS   | flags:u8, inner:Shape, value_len:u32, value:[u8] | class variable stored inline in the record; flags bit0 = mutable (see below) |
+| tag  | node    | payload                                          | inline on-disk form / interpretation                                                                                                        |
+|------|---------|--------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| 0x00 | POD     | width:u32                                        | `width` raw bytes; memcpy on clone                                                                                                          |
+| 0x01 | OWNED   | eightcc:[u8;8]                                   | u64 offset; recurse + deep-clone / free child                                                                                               |
+| 0x02 | STRONG  | eightcc:[u8;8]                                   | u64 offset; **bump refcount** on clone (never copy)                                                                                         |
+| 0x03 | WEAK    | eightcc:[u8;8]                                   | u64 offset; copy offset + **stop** (don't follow)                                                                                           |
+| 0x04 | REF     | eightcc:[u8;8]                                   | u64 offset; **alias** on clone (design-ref-clone-alias)                                                                                     |
+| 0x05 | EMBED   | eightcc:[u8;8]                                   | child `OnDisk` inlined (no offset); recurse in place                                                                                        |
+| 0x06 | FOREIGN | eightcc:[u8;8], kind:u8                          | inline `ForeignRepr{file_id:u32, type_index:u32, offset:u64}` (16B); `kind` 0=owned/1=strong/2=weak/3=ref selects cross-file teardown/clone |
+| 0x10 | OPTION  | inner:Shape                                      | 0-niche None over an offset-bearing inner                                                                                                   |
+| 0x11 | ARRAY   | n:u32, inner                                     | `[inner; n]`, contiguous                                                                                                                    |
+| 0x12 | VEC     | inner:Shape                                      | inline `VecDesc{data_off:u64, data_size:u64}`; elems = `inner`                                                                              |
+| 0x13 | TUPLE   | k:u8, inner×k                                    | POD tuple, fields in order                                                                                                                  |
+| 0x20 | CLASS   | flags:u8, inner:Shape, value_len:u32, value:[u8] | class variable stored inline in the record; flags bit0 = mutable (see below)                                                                |
 
 ## Class variables (`static` fields)
 

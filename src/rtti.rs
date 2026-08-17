@@ -305,6 +305,37 @@ impl<'a> Reader<'a> {
 
 // -- Parsed, in-memory schema (structure only) -----------------------------
 
+/// The ownership relationship a [`Foreign`](crate::Foreign) pointer has with its
+/// target **in the target's own file** — the cross-file analog of the in-file
+/// `owned` / `strong` / `weak` / `ref` kinds, selecting teardown / clone behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKind {
+    /// `#[bstack_owned] Foreign<T>` — exclusively owns the target (freed / deep-cloned).
+    Owned,
+    /// `#[bstack_strong] Foreign<T>` — a strong reference (refcount bumped / decremented).
+    Strong,
+    /// `#[bstack_weak] Foreign<T>` — a weak reference (weak count bumped / decremented).
+    Weak,
+    /// `#[bstack_ref] Foreign<T>` — a non-owning alias (copied; frees nothing).
+    Ref,
+}
+
+impl ForeignKind {
+    fn from_u8(v: u8) -> io::Result<Self> {
+        Ok(match v {
+            0 => ForeignKind::Owned,
+            1 => ForeignKind::Strong,
+            2 => ForeignKind::Weak,
+            3 => ForeignKind::Ref,
+            other => {
+                return Err(corrupt(format!(
+                    "[BSTACK0803] unknown RTTI foreign kind {other:#04x}"
+                )));
+            }
+        })
+    }
+}
+
 /// The info-complex node — a field's type structure, its leaves carrying the RAII
 /// kind the interpreter dispatches on.
 #[derive(Clone, Debug, PartialEq)]
@@ -317,7 +348,12 @@ pub enum Shape {
     Weak(EightCC),
     Ref(EightCC),
     Embed(EightCC),
-    Foreign(EightCC),
+    /// A cross-file [`Foreign`](crate::Foreign) pointer: the target's tag **and** the
+    /// ownership kind of the target *in its own file* (which drives teardown / clone).
+    Foreign {
+        tag: EightCC,
+        kind: ForeignKind,
+    },
     Option(Box<Shape>),
     Array {
         n: u32,
@@ -363,9 +399,10 @@ impl Shape {
                 w.u8(t::EMBED);
                 w.eightcc(*cc);
             }
-            Shape::Foreign(cc) => {
+            Shape::Foreign { tag, kind } => {
                 w.u8(t::FOREIGN);
-                w.eightcc(*cc);
+                w.eightcc(*tag);
+                w.u8(*kind as u8);
             }
             Shape::Option(inner) => {
                 w.u8(t::OPTION);
@@ -411,7 +448,10 @@ impl Shape {
             t::WEAK => Shape::Weak(r.eightcc()?),
             t::REF => Shape::Ref(r.eightcc()?),
             t::EMBED => Shape::Embed(r.eightcc()?),
-            t::FOREIGN => Shape::Foreign(r.eightcc()?),
+            t::FOREIGN => Shape::Foreign {
+                tag: r.eightcc()?,
+                kind: ForeignKind::from_u8(r.u8()?)?,
+            },
             t::OPTION => Shape::Option(Box::new(Shape::decode(r)?)),
             t::ARRAY => {
                 let n = r.u32()?;
@@ -937,9 +977,17 @@ pub enum Value {
         variant: String,
         fields: Box<[(String, Value)]>,
     },
-    /// A reference that is **not** followed (`weak` / `ref` / cross-file `foreign`):
-    /// the target's tag and the raw stored offset (`0` == null).
+    /// An in-file reference that is **not** followed (`weak` / `ref`): the target's
+    /// tag and the raw stored offset (`0` == null).
     Ref { tag: EightCC, offset: u64 },
+    /// A cross-file [`Foreign`](crate::Foreign) pointer, recorded (not followed): the
+    /// target's tag, ownership kind, file id (`0` == the current file), and offset.
+    Foreign {
+        tag: EightCC,
+        kind: ForeignKind,
+        file_id: u64,
+        offset: u64,
+    },
     /// An absent nullable (`Option` niche `0`, or an empty/absent vector slot).
     Null,
     /// A present `Option`, wrapping its inner value.
@@ -1104,6 +1152,17 @@ fn read_u64_at(data: &BStack, off: u64) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// Read a `ForeignRepr` at `off` — `{ file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }`
+/// — returning `(file_id, offset)`. (`type_index` = the target's RTTI ordinal + 1; the
+/// interpreter resolves the target type from the field's shape tag instead.)
+fn read_foreign_repr(data: &BStack, off: u64) -> io::Result<(u64, u64)> {
+    let mut b = [0u8; FOREIGN_REPR_LEN as usize];
+    data.get_into(off, &mut b)?;
+    let file_id = u32::from_le_bytes(b[0..4].try_into().unwrap()) as u64;
+    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    Ok((file_id, offset))
+}
+
 impl RttiRegistry {
     /// Read a structure of type `ordinal` at `block_off` in `data` into a [`Value`]
     /// tree — the core RTTI operation: interpret an on-disk structure with no
@@ -1234,12 +1293,16 @@ impl RttiRegistry {
                             offset: read_u64_at(data, offset)?,
                         });
                     }
-                    Shape::Foreign(tag) => {
-                        // ForeignRepr { file_id:u32, type_index:u32, offset:u64 } — the
-                        // address is the trailing u64; cross-file targets are not
-                        // followed here.
-                        let off = read_u64_at(data, offset + (FOREIGN_REPR_LEN - 8))?;
-                        results.push(Value::Ref { tag, offset: off });
+                    Shape::Foreign { tag, kind } => {
+                        // ForeignRepr { file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }.
+                        // The target is in another file — recorded, not followed.
+                        let (file_id, off) = read_foreign_repr(data, offset)?;
+                        results.push(Value::Foreign {
+                            tag,
+                            kind,
+                            file_id,
+                            offset: off,
+                        });
                     }
                     Shape::Option(inner) => {
                         // The niche: a `0` in the leading u64 of the slot is `None`.
@@ -1501,7 +1564,7 @@ impl RttiRegistry {
                             release_weak(data, ctrl_off, &mut to_free)?;
                         }
                     }
-                    Shape::Foreign(_) => return Err(teardown_unsupported()),
+                    Shape::Foreign { .. } => return Err(teardown_unsupported()),
                     Shape::Option(inner) => {
                         if read_u64_at(data, offset)? != 0 {
                             work.push(TdOp::Shape {
@@ -1574,7 +1637,7 @@ impl RttiRegistry {
                                         }
                                     }
                                 }
-                                Shape::Foreign(_) => return Err(teardown_unsupported()),
+                                Shape::Foreign { .. } => return Err(teardown_unsupported()),
                                 // POD / `ref` elements own no sub-blocks.
                                 _ => {}
                             }
@@ -1821,7 +1884,7 @@ impl RttiRegistry {
         }
         let tag = match shape {
             Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) => t,
-            Shape::Weak(_) | Shape::Foreign(_) => {
+            Shape::Weak(_) | Shape::Foreign { .. } => {
                 return Err(swap_error(
                     "swapping a `weak` / `foreign` reference is not yet supported",
                 ));
@@ -1985,7 +2048,7 @@ impl RttiRegistry {
                 data.copy(off, range.start(), size)?;
                 Moved::Ref(Some(AnyRef::new(*tag, range.start())))
             }
-            Shape::Foreign(_) => return Err(move_unsupported()),
+            Shape::Foreign { .. } => return Err(move_unsupported()),
             // The niche's `0` is handled by the inner leaf (which reads the same slot).
             Shape::Option(inner) => {
                 self.move_field(alloc, data, inner, off, cache, materialized)?
@@ -2209,7 +2272,7 @@ impl RttiRegistry {
                             st.bumps.push(ctrl + CTRL_WEAK_OFFSET);
                         }
                     }
-                    Shape::Foreign(_) => return Err(clone_unsupported()),
+                    Shape::Foreign { .. } => return Err(clone_unsupported()),
                     Shape::Option(inner) => {
                         // The slot (and its `0` niche) is already copied; only a
                         // present reference needs its child cloned / bumped.
@@ -2284,7 +2347,7 @@ impl RttiRegistry {
                                         }
                                     }
                                 }
-                                Shape::Foreign(_) => return Err(clone_unsupported()),
+                                Shape::Foreign { .. } => return Err(clone_unsupported()),
                                 // POD / `ref` elements are copied verbatim.
                                 _ => {}
                             }
@@ -2371,7 +2434,7 @@ impl RttiRegistry {
         Ok(match shape {
             Shape::Pod { width } => *width as u64,
             Shape::Owned(_) | Shape::Strong(_) | Shape::Weak(_) | Shape::Ref(_) => 8,
-            Shape::Foreign(_) => FOREIGN_REPR_LEN,
+            Shape::Foreign { .. } => FOREIGN_REPR_LEN,
             Shape::Vec(_) => VECDESC_LEN,
             Shape::Option(inner) => self.shape_stride(inner, cache)?,
             Shape::Array { n, inner } => *n as u64 * self.shape_stride(inner, cache)?,
@@ -2438,7 +2501,7 @@ fn shape_has_reference(shape: &Shape) -> bool {
         | Shape::Weak(_)
         | Shape::Ref(_)
         | Shape::Embed(_)
-        | Shape::Foreign(_) => true,
+        | Shape::Foreign { .. } => true,
         Shape::Option(inner) | Shape::Vec(inner) | Shape::Array { inner, .. } => {
             shape_has_reference(inner)
         }

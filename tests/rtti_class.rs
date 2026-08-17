@@ -7,9 +7,10 @@
 #![allow(dead_code)] // some fixtures are inspected only via RTTI, never instantiated
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
-use bstack_raii::rtti::{self, AnyRef, Moved, RttiBody, Shape, Value};
+use bstack_raii::registry::FileId;
+use bstack_raii::rtti::{self, AnyRef, ForeignKind, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
-    BStackBlock, BStackCast, BStackDrop, BStackOwned, ForeignRepr, bstack_class, rtti_path,
+    BStackBlock, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr, bstack_class, rtti_path,
 };
 
 #[bstack_class]
@@ -100,6 +101,23 @@ struct Config {
     counter: u64,
     /// An ordinary per-instance field.
     id: u32,
+}
+
+#[bstack_class]
+struct FModel {
+    #[bstack_owned]
+    owned_f: Foreign<Point>,
+    #[bstack_ref]
+    ref_f: Foreign<Point>,
+    n: u32,
+}
+
+#[bstack_class]
+struct FShared {
+    #[bstack_strong]
+    s: Foreign<RCell>,
+    #[bstack_weak]
+    w: Foreign<WCell>,
 }
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
@@ -1137,6 +1155,111 @@ fn class_variable_via_path() {
         reg.swap(data, ord, 0, rtti_path!(counter), AnyRef::new(ctag, 0))
             .is_err()
     );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn bstack_class_foreign_shapes() {
+    let path = temp_path("fschema");
+    let reg = rtti::sync(&path).unwrap();
+    let point_tag = <Point as BStackCast>::eightcc();
+
+    // Scalar Foreign fields carry the target tag + the ownership kind.
+    let fm = reg
+        .load_type(reg.ordinal_of(<FModel as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Struct(f) = &fm.body else {
+        panic!("FModel struct");
+    };
+    assert_eq!(f[0].name, "owned_f");
+    assert_eq!(
+        f[0].shape,
+        Shape::Foreign {
+            tag: point_tag,
+            kind: ForeignKind::Owned
+        }
+    );
+    assert_eq!(
+        f[1].shape,
+        Shape::Foreign {
+            tag: point_tag,
+            kind: ForeignKind::Ref
+        }
+    );
+
+    let fs = reg
+        .load_type(reg.ordinal_of(<FShared as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Struct(g) = &fs.body else {
+        panic!("FShared struct");
+    };
+    assert_eq!(
+        g[0].shape,
+        Shape::Foreign {
+            tag: <RCell as BStackCast>::eightcc(),
+            kind: ForeignKind::Strong
+        }
+    );
+    assert_eq!(
+        g[1].shape,
+        Shape::Foreign {
+            tag: <WCell as BStackCast>::eightcc(),
+            kind: ForeignKind::Weak
+        }
+    );
+
+    drop(reg);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn interpret_reads_foreign_pointer() {
+    let schema = temp_path("fread_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("fread_data");
+    let point_tag = <Point as BStackCast>::eightcc();
+    let ord = reg.ordinal_of(<FModel as BStackCast>::eightcc()).unwrap();
+
+    // Two local Points; the FModel points at them with SELF (file_id 0) foreigns.
+    let p1 = Point::new(&alloc, 1, 2).unwrap();
+    let p2 = Point::new(&alloc, 3, 4).unwrap();
+    let p1_off = BStackBlock::range(p1.handle()).start();
+    let p2_off = BStackBlock::range(p2.handle()).start();
+    let fm = FModel::new(
+        &alloc,
+        Foreign::at(FileId::SELF, p1.handle()),
+        Foreign::at(FileId::SELF, p2.handle()),
+        5,
+    )
+    .unwrap();
+    let off = BStackBlock::range(fm.handle()).start();
+
+    // Read records the pointer (tag + kind + file_id + offset), not followed.
+    let Value::Block { fields, .. } = reg.read_value(alloc.stack(), ord, off).unwrap() else {
+        panic!("expected a block");
+    };
+    assert_eq!(
+        fields[0].1,
+        Value::Foreign {
+            tag: point_tag,
+            kind: ForeignKind::Owned,
+            file_id: 0,
+            offset: p1_off,
+        }
+    );
+    assert_eq!(
+        fields[1].1,
+        Value::Foreign {
+            tag: point_tag,
+            kind: ForeignKind::Ref,
+            file_id: 0,
+            offset: p2_off,
+        }
+    );
+    assert_eq!(fields[2].1, pod(&5u32.to_le_bytes()));
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
