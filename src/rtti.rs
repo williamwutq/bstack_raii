@@ -39,10 +39,12 @@
 //! a live data file → a [`Value`] tree, no compiled-in types), and
 //! [`RttiRegistry::teardown`] is the non-recursive **free interpreter** (reclaims
 //! `owned` / `embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / option,
-//! refcount decrements and all), [`RttiRegistry::set_pod`] overwrites a POD field in
-//! place, and [`RttiRegistry::clone_value`] is the non-recursive **deep-clone
-//! interpreter** (owned deep-copied, shared refcount-bumped). Still TODO: cross-file
-//! `foreign` teardown / clone, and live mutable-class-variable writes.
+//! refcount decrements and all), and [`RttiRegistry::clone_value`] is the
+//! non-recursive **deep-clone interpreter** (owned deep-copied, shared
+//! refcount-bumped). [`RttiRegistry::class_value`] / [`RttiRegistry::set_class_value`]
+//! read and write a `#[bstack_static]` class variable's value live in the schema
+//! stack (a `#[bstack_mut]` one is set in place, crash-atomically). Still TODO:
+//! cross-file `foreign` teardown / clone.
 //!
 //! Individual fields are reached by a **path** (`["outer", "inner", …]`):
 //! [`get`](RttiRegistry::get) reads one field, [`set`](RttiRegistry::set) overwrites
@@ -862,6 +864,54 @@ impl RttiRegistry {
         self.stack
             .get_into(rec.offset + RECORD_HEADER_LEN, &mut body)?;
         decode_type(rec.tag, &body)
+    }
+
+    /// Read a class variable's current value bytes **live** from the schema stack.
+    /// A mutable one may have been rewritten (by [`set_class_value`](Self::set_class_value),
+    /// possibly through another handle) since it was registered, so the snapshot in a
+    /// cached [`load_type`](Self::load_type) can be stale — this always reads the file.
+    /// Works for const and mutable class variables alike.
+    pub fn class_value(&self, tag: EightCC, name: &str) -> io::Result<Vec<u8>> {
+        let (off, len, _mutable) = self.locate_class_value(tag, name)?;
+        let mut buf = vec![0u8; len];
+        self.stack.get_into(off, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Overwrite a **mutable** (`#[bstack_mut]`) class variable's value in place — one
+    /// atomic write to the schema stack. The value slot is fixed-size (the mutable
+    /// case requires a `Sized` type), so the record never moves and the append-only
+    /// structure is preserved; the write is crash-atomic under the bstack's own lock.
+    ///
+    /// Errors if the class variable is absent, is `const` (not `#[bstack_mut]`), or
+    /// `value` is not the slot's exact width.
+    pub fn set_class_value(&self, tag: EightCC, name: &str, value: &[u8]) -> io::Result<()> {
+        let (off, len, mutable) = self.locate_class_value(tag, name)?;
+        if !mutable {
+            return Err(class_error(format!(
+                "`{name}` is a const class variable; only a `#[bstack_mut]` one is settable"
+            )));
+        }
+        if value.len() != len {
+            return Err(class_error(format!(
+                "class variable `{name}` is {len} bytes, got {}",
+                value.len()
+            )));
+        }
+        self.stack.set(off, value)
+    }
+
+    /// Locate a class variable's value slot: its absolute offset in the schema stack,
+    /// byte length, and mutability.
+    fn locate_class_value(&self, tag: EightCC, name: &str) -> io::Result<(u64, usize, bool)> {
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        let rec = &self.records[ord as usize];
+        let mut body = vec![0u8; rec.body_len as usize];
+        self.stack
+            .get_into(rec.offset + RECORD_HEADER_LEN, &mut body)?;
+        let (pos, len, mutable) = class_value_slot(&body, name)?
+            .ok_or_else(|| class_error(format!("no class variable named `{name}`")))?;
+        Ok((rec.offset + RECORD_HEADER_LEN + pos as u64, len, mutable))
     }
 }
 
@@ -2401,6 +2451,61 @@ fn read_disc(data: &BStack, off: u64, width: u8) -> io::Result<u64> {
     let w = width as usize;
     data.get_into(off, &mut b[..w])?;
     Ok(u64::from_le_bytes(b))
+}
+
+fn class_error(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("[BSTACK0812] RTTI class variable: {msg}"),
+    )
+}
+
+/// Locate the value bytes of the `CLASS` field named `target` within a decoded record
+/// body: `(offset within body, value length, mutable)`, or `None` if there is no such
+/// (class) field. Walks the `TypeDesc` header + fields exactly as `decode_type` does,
+/// stopping at the target instead of building an [`RttiType`].
+fn class_value_slot(body: &[u8], target: &str) -> io::Result<Option<(usize, usize, bool)>> {
+    let mut r = Reader::new(body);
+    let flags = r.u8()?;
+    let _disc_width = r.u8()?;
+    let name_len = r.u16()? as usize;
+    let count = r.u16()? as usize;
+    let _disc_off = r.u16()?;
+    let _payload_off = r.u16()?;
+    let _ondisk_size = r.u64()?;
+    let _name = r.string(name_len)?;
+    r.align(8)?;
+    // Only structs carry class variables; an enum's `count` is its variants.
+    if flags & FLAG_ENUM != 0 {
+        return Ok(None);
+    }
+    for _ in 0..count {
+        let _offset = r.u32()?;
+        let fname_len = r.u16()? as usize;
+        let _shape_len = r.u16()? as usize;
+        let fname = r.string(fname_len)?;
+        r.align(4)?;
+        if fname == target {
+            return class_value_within_shape(&mut r);
+        }
+        // Skip this field's shape (decode advances the cursor, bounds-checked) + pad.
+        let _ = Shape::decode(&mut r)?;
+        r.align(4)?;
+    }
+    Ok(None)
+}
+
+/// If the shape at the cursor is a `CLASS` shape, consume its header and return
+/// `(value offset within body, value length, mutable)` with the cursor left at the
+/// value bytes; otherwise `None` (the named field is not a class variable).
+fn class_value_within_shape(r: &mut Reader) -> io::Result<Option<(usize, usize, bool)>> {
+    if r.u8()? != shape_tag::CLASS {
+        return Ok(None);
+    }
+    let mutable = r.u8()? != 0;
+    let _inner = Shape::decode(r)?;
+    let value_len = r.u32()? as usize;
+    Ok(Some((r.pos, value_len, mutable)))
 }
 
 /// Pop the `n` values a container's children pushed, restoring declaration order.

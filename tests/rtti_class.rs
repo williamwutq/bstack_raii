@@ -1049,3 +1049,53 @@ fn interpret_move_out_vec_array_option() {
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
 }
+
+#[test]
+fn class_variable_live_read_write() {
+    let path = temp_path("classvar");
+    let ctag = <Config as BStackCast>::eightcc();
+
+    {
+        let reg = rtti::sync(&path).unwrap();
+        // Registration values: mutable `counter` = 0u64, const `version` = 7u32.
+        assert_eq!(
+            reg.class_value(ctag, "counter").unwrap(),
+            0u64.to_le_bytes()
+        );
+        assert_eq!(
+            reg.class_value(ctag, "version").unwrap(),
+            7u32.to_le_bytes()
+        );
+
+        // Live in-place write to the mutable class variable.
+        reg.set_class_value(ctag, "counter", &42u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            reg.class_value(ctag, "counter").unwrap(),
+            42u64.to_le_bytes()
+        );
+
+        // Rejections: a const var, a wrong-width value, an unknown name.
+        assert!(
+            reg.set_class_value(ctag, "version", &1u32.to_le_bytes())
+                .is_err()
+        );
+        assert!(reg.set_class_value(ctag, "counter", &[1, 2, 3]).is_err());
+        assert!(reg.class_value(ctag, "nope").is_err());
+    }
+
+    // The write persisted to the schema file: reopen and it is still 42.
+    {
+        let reg = rtti::sync(&path).unwrap();
+        assert_eq!(
+            reg.class_value(ctag, "counter").unwrap(),
+            42u64.to_le_bytes()
+        );
+        assert_eq!(
+            reg.class_value(ctag, "version").unwrap(),
+            7u32.to_le_bytes()
+        );
+    }
+
+    std::fs::remove_file(&path).ok();
+}

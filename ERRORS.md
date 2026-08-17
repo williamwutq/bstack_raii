@@ -415,6 +415,13 @@ supported), or `new`'s eightcc does not equal the field's declared type. **Fix:*
 `swap` an owning data-reference field with an `AnyRef` of the *same* type; use `set`
 for a POD/`ref` field.
 
+### BSTACK0812 — invalid RTTI class-variable access
+`class_value` / `set_class_value` was given a name that is not a class variable of
+the type, or `set_class_value` targeted a **const** class variable (only a
+`#[bstack_mut]` one is settable) or passed a value of the wrong width (the slot is
+fixed-size). **Fix:** name a `#[bstack_static]` field; write only a `#[bstack_mut]`
+one, with exactly its byte width.
+
 ### BSTACK0811 — RTTI `move_out` of an unsupported field
 `move_out` reached a `foreign` reference, or a reference **array** whose element is an
 `embed` / `foreign` / nested-array shape (there is no single `u64` slot per element to
