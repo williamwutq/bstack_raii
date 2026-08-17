@@ -1,6 +1,6 @@
-//! Procedural macros for [`bstack_raii`](https://github.com/williamwutq/bstack).
+//! Procedural macros for [`bstack_raii`](https://github.com/williamwutq/bstack_raii).
 //!
-//! Three entry points, all documented in `RAII.md` at the repository root:
+//! Three entry points:
 //!
 //! * [`macro@bstack_block`] — attribute macro. Turns an ergonomic struct into a
 //!   parallel `#[repr(C, packed)]` on-disk representation plus generated
@@ -215,8 +215,6 @@ pub fn bstack_class(args: TokenStream, item: TokenStream) -> TokenStream {
 /// * `bstack_move!(owned, allocator)` — for a **bare** `BStackOwned<X>`, which
 ///   carries no allocator; the allocator is supplied explicitly (symmetric with
 ///   `owned.bstack_drop(allocator)`).
-///
-/// See RAII.md "`bstack_move!`".
 #[proc_macro]
 pub fn bstack_move(input: TokenStream) -> TokenStream {
     use syn::parse::Parser;

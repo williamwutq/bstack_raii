@@ -9,7 +9,7 @@
 //!
 //! All the layout facts these teardowns need are constants in [`crate::layout`]
 //! (the injected refcount / control fields sit at fixed offsets after the
-//! header, per RAII.md) plus the `OnDisk` / `Control` sizes from
+//! header) plus the `OnDisk` / `Control` sizes from
 //! [`BStackBlock`] / [`BStackWeakable`]. No per-type layout members are
 //! required.
 

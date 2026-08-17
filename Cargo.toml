@@ -8,10 +8,9 @@ description = "Typed, RAII-style ownership and lifetime layer over the bstack al
 repository = "https://github.com/williamwutq/bstack_raii"
 publish = false
 
-# This crate is developed inside the `bstack` repository but is NOT part of the
-# `bstack` package or its CI. It is its own self-contained workspace so that
-# root-level `cargo` commands in the bstack repo never descend into it. See
-# RAII.md (in the repo root) for the full design this crate implements.
+# A standalone Cargo workspace: the `bstack_raii` library plus its `derive`
+# proc-macro crate. Extracted from the `bstack` monorepo; it depends on `bstack`
+# from crates.io, not on a sibling path.
 [workspace]
 members = ["derive"]
 

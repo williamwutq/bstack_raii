@@ -110,7 +110,7 @@ pub const HEADER_SIZE: u64 = core::mem::size_of::<BlockHeader>() as u64;
 
 // -- Injected-field offsets ------------------------------------------------
 //
-// RAII.md injects the refcount / control back-pointer / control counters
+// The macros inject the refcount / control back-pointer / control counters
 // immediately after the header, ahead of any user fields and in a fixed order.
 // Their offsets are therefore the same for *every* block, so they live here as
 // constants rather than as per-type trait members.

@@ -7,9 +7,8 @@
 //! providing persistent-storage ownership with C++-style `unique_ptr` /
 //! `shared_ptr` / `weak_ptr` conveniences.
 //!
-//! The full design lives in `RAII.md` at the repository root. This crate is its
-//! implementation. It is a separate crate (not a `bstack` feature) so that its
-//! large, not-yet-stable ABI surface never gates `bstack`'s ABI stability.
+//! It is a separate crate (not a `bstack` feature) so that its large, not-yet-stable
+//! ABI surface never gates `bstack`'s ABI stability.
 //!
 //! ## Module map (bottom-up)
 //!
