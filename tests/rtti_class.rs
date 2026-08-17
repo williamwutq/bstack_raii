@@ -1443,3 +1443,66 @@ fn interpret_clone_foreign_owned_across_files() {
     std::fs::remove_file(&fpath).ok();
     std::fs::remove_file(&reg_file).ok();
 }
+
+#[test]
+fn interpret_move_out_foreign() {
+    // move_out of a block with foreign fields hands each foreign pointer back whole
+    // (tag + kind + file id + offset); the targets live in their own files and outlive
+    // the freed shell.
+    let schema = temp_path("fmv_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FModel as BStackCast>::eightcc()).unwrap();
+    let point_tag = <Point as BStackCast>::eightcc();
+
+    let (home, hpath) = data_alloc("fmv_home");
+    let (foreign, fpath) = data_alloc("fmv_foreign");
+
+    let leaf = Point::new(&foreign, 88, 99).unwrap();
+    let leaf_off = BStackBlock::range(leaf.handle()).start();
+
+    let reg_file = temp_path("fmv_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let hp = Point::new(&home, 1, 2).unwrap();
+    let hp_off = BStackBlock::range(hp.handle()).start();
+    let fm = FModel::new(
+        &home,
+        unsafe { Foreign::<Point>::new(fid, leaf_off) },
+        Foreign::at(FileId::SELF, hp.handle()),
+        7,
+    )
+    .unwrap();
+    let off = BStackBlock::range(fm.handle()).start();
+
+    let moved = reg.move_out(&home, ord, off).unwrap();
+    assert_eq!(
+        moved["owned_f"],
+        Moved::Foreign {
+            tag: point_tag,
+            kind: ForeignKind::Owned,
+            file_id: fid.get() as u64,
+            offset: leaf_off,
+        }
+    );
+    assert_eq!(
+        moved["ref_f"],
+        Moved::Foreign {
+            tag: point_tag,
+            kind: ForeignKind::Ref,
+            file_id: 0,
+            offset: hp_off,
+        }
+    );
+    let Moved::Pod(n) = &moved["n"] else {
+        panic!("n should be POD");
+    };
+    assert_eq!(&n[..], &7u32.to_le_bytes());
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}

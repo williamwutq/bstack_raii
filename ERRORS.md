@@ -422,12 +422,11 @@ the type, or `set_class_value` targeted a **const** class variable (only a
 fixed-size). **Fix:** name a `#[bstack_static]` field; write only a `#[bstack_mut]`
 one, with exactly its byte width.
 
-### BSTACK0811 — RTTI `move_out` of an unsupported field
-`move_out` reached a `foreign` reference, or a reference **array** whose element is an
-`embed` / `foreign` / nested-array shape (there is no single `u64` slot per element to
-hand out). **Fix:** move a structure with `foreign` fields through its compiled-in
-`bstack_move!` for now, and prefer a `Vec` (handed back whole) or a flat
-`[owned/strong/weak/ref; N]` array (handed out element-by-element).
+### BSTACK0811 — RTTI `move_out` of an unsupported array element
+`move_out` reached a reference **array** whose element is an `embed` / `foreign` /
+nested-array shape (there is no single `u64` slot per element to hand out). A scalar
+`Foreign<T>` moves out fine (as a `Moved::Foreign`). **Fix:** prefer a `Vec` (handed
+back whole) or a flat `[owned/strong/weak/ref; N]` array (handed out element-by-element).
 
 ### BSTACK080E — RTTI clone internal invariant
 A clone finished the walk but a child block (or the root) was not recorded in the

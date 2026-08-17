@@ -43,8 +43,10 @@
 //! non-recursive **deep-clone interpreter** (owned deep-copied, shared
 //! refcount-bumped). [`RttiRegistry::class_value`] / [`RttiRegistry::set_class_value`]
 //! read and write a `#[bstack_static]` class variable's value live in the schema
-//! stack (a `#[bstack_mut]` one is set in place, crash-atomically). Still TODO:
-//! cross-file `foreign` teardown / clone.
+//! stack (a `#[bstack_mut]` one is set in place, crash-atomically). Cross-file
+//! `Foreign` pointers are handled too — teardown / clone / move_out resolve the
+//! target file through the registry and act on it in place (only a `Foreign` *inside
+//! a container* is still deferred).
 //!
 //! Individual fields are reached by a **path** (`["outer", "inner", …]`):
 //! [`get`](RttiRegistry::get) reads one field, [`set`](RttiRegistry::set) overwrites
@@ -1040,6 +1042,15 @@ pub enum Moved {
     /// storage lives in the freed shell, so unlike a vector there is no block to hand
     /// back whole. `None` per null element.
     List(Vec<Option<AnyRef>>),
+    /// A cross-file [`Foreign`](crate::Foreign) pointer, transferred whole (the target
+    /// lives in another file and outlives the freed shell): tag, ownership kind, file
+    /// id, and offset (`offset == 0` == null). The caller now owns the reference.
+    Foreign {
+        tag: EightCC,
+        kind: ForeignKind,
+        file_id: u64,
+        offset: u64,
+    },
 }
 
 /// What a field path resolves to (see `RttiRegistry::resolve_field`): a per-instance
@@ -2206,7 +2217,16 @@ impl RttiRegistry {
                 data.copy(off, range.start(), size)?;
                 Moved::Ref(Some(AnyRef::new(*tag, range.start())))
             }
-            Shape::Foreign { .. } => return Err(move_unsupported()),
+            Shape::Foreign { tag, kind } => {
+                // The target lives in another file; hand its pointer to the caller.
+                let (file_id, offset) = read_foreign_repr(data, off)?;
+                Moved::Foreign {
+                    tag: *tag,
+                    kind: *kind,
+                    file_id,
+                    offset,
+                }
+            }
             // The niche's `0` is handled by the inner leaf (which reads the same slot).
             Shape::Option(inner) => {
                 self.move_field(alloc, data, inner, off, cache, materialized)?
@@ -2649,8 +2669,8 @@ fn swap_error(msg: impl std::fmt::Display) -> io::Error {
 fn move_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "[BSTACK0811] RTTI move_out of a `foreign` reference (or an array of embedded / foreign / \
-         nested elements) is not yet supported",
+        "[BSTACK0811] RTTI move_out of a reference array whose element is an embedded / foreign / \
+         nested-array shape is not yet supported",
     )
 }
 
