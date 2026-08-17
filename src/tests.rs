@@ -4974,7 +4974,7 @@ fn wal_teardown_reclaims_on_free_fault() {
     let stack = alloc.stack();
 
     let build = |a: &_| {
-        let list = BStackLinkedList::<MacroLeaf>::new(a).unwrap();
+        let list = crate::BStackLinkedList::<MacroLeaf>::new(a).unwrap();
         for v in 0..5u32 {
             list.push_back(a, MacroLeaf::new(a, v).unwrap()).unwrap();
         }
