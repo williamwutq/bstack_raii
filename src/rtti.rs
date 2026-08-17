@@ -1780,6 +1780,84 @@ impl RttiRegistry {
         }
     }
 
+    /// Clone a `Foreign` reference across the file boundary. The clone's slot was
+    /// already byte-copied (so a `ref` alias and a null are done); an `owned` target
+    /// is **deep-copied in its own file** and the copied slot repointed at the new
+    /// offset; a `strong` / `weak` bumps the target's count in its own file. `SELF`
+    /// resolves against `home`; a detached target file **errors** (fail-safe — never
+    /// alias an owner, which would double-free later — matching the generated path).
+    ///
+    /// `src_off` / `new_off` are the source / clone `ForeignRepr` slot locations in the
+    /// home file.
+    fn clone_foreign<A: BStackRaiiAllocator>(
+        &self,
+        home: &A,
+        home_data: &BStack,
+        tag: EightCC,
+        kind: ForeignKind,
+        src_off: u64,
+        new_off: u64,
+    ) -> io::Result<()> {
+        if matches!(kind, ForeignKind::Ref) {
+            return Ok(()); // aliased — the copied slot is correct
+        }
+        let (file_id, src_target) = read_foreign_repr(home_data, src_off)?;
+        if src_target == 0 {
+            return Ok(()); // null — copied as 0
+        }
+        if file_id == 0 {
+            self.clone_foreign_in(home, home_data, tag, kind, src_target, new_off)
+        } else {
+            let fid = FileId::from_u64(file_id).ok_or_else(clone_unsupported)?;
+            let host = registry::host_arc(fid).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "[BSTACK080F] RTTI clone: the foreign target's file is detached / not attached",
+                )
+            })?;
+            let alloc = ForeignHostAllocator::new(host, fid);
+            self.clone_foreign_in(&alloc, home_data, tag, kind, src_target, new_off)
+        }
+    }
+
+    /// The per-kind foreign clone against an already-resolved `target` allocator. For
+    /// `owned` it patches the clone's `ForeignRepr.offset` (@ `new_off + 8`, in the
+    /// home file) to the freshly-cloned target offset.
+    fn clone_foreign_in<A: BStackRaiiAllocator>(
+        &self,
+        target: &A,
+        home_data: &BStack,
+        tag: EightCC,
+        kind: ForeignKind,
+        src_target: u64,
+        new_off: u64,
+    ) -> io::Result<()> {
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        let tstack = target.stack();
+        match kind {
+            ForeignKind::Ref => Ok(()),
+            ForeignKind::Owned => {
+                let new_target = self.clone_value(target, ord, src_target)?;
+                // Repoint only the address word of the copied ForeignRepr.
+                home_data.set(new_off + (FOREIGN_REPR_LEN - 8), new_target.to_le_bytes())
+            }
+            ForeignKind::Strong => {
+                let off = if self.load_type(ord)?.weak {
+                    let ctrl = read_u64_at(tstack, src_target + CTRL_BACKPTR_OFFSET)?;
+                    ctrl + CTRL_STRONG_OFFSET
+                } else {
+                    src_target + RC_REFCOUNT_OFFSET
+                };
+                refcount::fetch_add(tstack, off, 1)?;
+                Ok(())
+            }
+            ForeignKind::Weak => {
+                refcount::fetch_add(tstack, src_target + CTRL_WEAK_OFFSET, 1)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Resolve a **field path** (`["outer", "inner", …]`) from the root of type
     /// `ordinal` at `block_off` to its target field's absolute offset and shape.
     ///
@@ -2352,7 +2430,11 @@ impl RttiRegistry {
                             st.bumps.push(ctrl + CTRL_WEAK_OFFSET);
                         }
                     }
-                    Shape::Foreign { .. } => return Err(clone_unsupported()),
+                    Shape::Foreign { tag, kind } => {
+                        // The slot was byte-copied (same target); repoint an `owned`
+                        // deep-copy across the file boundary, bump `strong`/`weak`.
+                        self.clone_foreign(alloc, data, tag, kind, src_off, new_off)?;
+                    }
                     Shape::Option(inner) => {
                         // The slot (and its `0` niche) is already copied; only a
                         // present reference needs its child cloned / bumped.

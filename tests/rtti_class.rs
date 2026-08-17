@@ -1366,3 +1366,80 @@ fn interpret_teardown_foreign_strong_across_files() {
     std::fs::remove_file(&fpath).ok();
     std::fs::remove_file(&reg_file).ok();
 }
+
+#[test]
+fn interpret_clone_foreign_owned_across_files() {
+    // Cross-file RTTI clone: cloning an FModel deep-copies its `#[bstack_owned]
+    // Foreign<Point>` target into a FRESH block in the foreign file and repoints the
+    // clone's pointer there; the `#[bstack_ref]` foreign is aliased (copied verbatim).
+    let schema = temp_path("fcl_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ford = reg.ordinal_of(<FModel as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+    let point_tag = <Point as BStackCast>::eightcc();
+
+    let (home, hpath) = data_alloc("fcl_home");
+    let (foreign, fpath) = data_alloc("fcl_foreign");
+
+    let leaf = Point::new(&foreign, 88, 99).unwrap();
+    let leaf_off = BStackBlock::range(leaf.handle()).start();
+
+    let reg_file = temp_path("fcl_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let hp = Point::new(&home, 1, 2).unwrap();
+    let fm = FModel::new(
+        &home,
+        unsafe { Foreign::<Point>::new(fid, leaf_off) },
+        Foreign::at(FileId::SELF, hp.handle()),
+        7,
+    )
+    .unwrap();
+    let src = BStackBlock::range(fm.handle()).start();
+
+    let dst = reg.clone_value(&home, ford, src).unwrap();
+    let Value::Block { fields, .. } = reg.read_value(home.stack(), ford, dst).unwrap() else {
+        panic!("clone should be a block");
+    };
+    // owned foreign → deep-copied to a new offset in the same foreign file.
+    let Value::Foreign {
+        kind,
+        file_id,
+        offset: new_target,
+        ..
+    } = fields[0].1
+    else {
+        panic!("owned_f should be a foreign");
+    };
+    assert_eq!(kind, ForeignKind::Owned);
+    assert_ne!(file_id, 0);
+    assert_ne!(
+        new_target, leaf_off,
+        "owned foreign must deep-copy to a new offset"
+    );
+
+    // The cloned target carries the same value, and lives in the foreign file.
+    let cloned = registry::with_host(fid, |host| reg.read_value(host.stack(), pord, new_target))
+        .unwrap()
+        .unwrap();
+    let Value::Block { tag, fields: pf } = cloned else {
+        panic!("cloned target block");
+    };
+    assert_eq!(tag, point_tag);
+    assert_eq!(pf[0].1, pod(&88u32.to_le_bytes()));
+    assert_eq!(pf[1].1, pod(&99u32.to_le_bytes()));
+
+    // ref foreign → aliased (kind Ref; not deep-copied).
+    let Value::Foreign { kind: rk, .. } = fields[1].1 else {
+        panic!("ref_f should be a foreign");
+    };
+    assert_eq!(rk, ForeignKind::Ref);
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
