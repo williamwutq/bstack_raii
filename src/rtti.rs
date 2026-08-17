@@ -72,6 +72,7 @@ use crate::layout::{
     RC_REFCOUNT_OFFSET,
 };
 use crate::refcount;
+use crate::registry::{self, FileId, ForeignHostAllocator};
 use crate::small_map::SmallStringMap;
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
@@ -1564,7 +1565,13 @@ impl RttiRegistry {
                             release_weak(data, ctrl_off, &mut to_free)?;
                         }
                     }
-                    Shape::Foreign { .. } => return Err(teardown_unsupported()),
+                    Shape::Foreign { tag, kind } => {
+                        // Cross-file: resolve the target's file and tear it down there
+                        // (a self-contained transaction on that file), side-effecting
+                        // outside the home `to_free`.
+                        let (file_id, off) = read_foreign_repr(data, offset)?;
+                        self.teardown_foreign(alloc, tag, kind, file_id, off)?;
+                    }
                     Shape::Option(inner) => {
                         if read_u64_at(data, offset)? != 0 {
                             work.push(TdOp::Shape {
@@ -1698,6 +1705,79 @@ impl RttiRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Tear down a `Foreign` reference's target **in the target's own file**. `SELF`
+    /// (`file_id == 0`) resolves against `home`; a registered file is reached through
+    /// its [`ForeignHost`](crate::registry::ForeignHost) — a detached / unknown file
+    /// leaks (the design permits it) rather than erroring. `offset == 0` (null) is a
+    /// no-op.
+    fn teardown_foreign<A: BStackRaiiAllocator>(
+        &self,
+        home: &A,
+        tag: EightCC,
+        kind: ForeignKind,
+        file_id: u64,
+        offset: u64,
+    ) -> io::Result<()> {
+        if offset == 0 || matches!(kind, ForeignKind::Ref) {
+            return Ok(()); // null, or a non-owning alias
+        }
+        if file_id == 0 {
+            self.teardown_foreign_in(home, tag, kind, offset)
+        } else {
+            let Some(fid) = FileId::from_u64(file_id) else {
+                return Ok(());
+            };
+            match registry::host_arc(fid) {
+                Some(host) => {
+                    let alloc = ForeignHostAllocator::new(host, fid);
+                    self.teardown_foreign_in(&alloc, tag, kind, offset)
+                }
+                // File not attached / detached → leak (never a premature free).
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// The per-kind foreign teardown against an already-resolved `target` allocator:
+    /// `owned` recurses a full teardown; `strong` / `weak` decrement (in the target
+    /// file) and free only the last owner. `offset` is the target's data offset for
+    /// `owned` / `strong`, its control offset for `weak`.
+    fn teardown_foreign_in<A: BStackRaiiAllocator>(
+        &self,
+        target: &A,
+        tag: EightCC,
+        kind: ForeignKind,
+        offset: u64,
+    ) -> io::Result<()> {
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        let data = target.stack();
+        match kind {
+            ForeignKind::Ref => Ok(()),
+            ForeignKind::Owned => self.teardown(target, ord, offset),
+            ForeignKind::Strong => {
+                if self.load_type(ord)?.weak {
+                    let ctrl = read_u64_at(data, offset + CTRL_BACKPTR_OFFSET)?;
+                    if refcount::fetch_sub(data, ctrl + CTRL_STRONG_OFFSET, 1)? == 1 {
+                        self.teardown(target, ord, offset)?;
+                        if refcount::fetch_sub(data, ctrl + CTRL_WEAK_OFFSET, 1)? == 1 {
+                            target.free_many([BStackRange::new(ctrl, CONTROL_SIZE)])?;
+                        }
+                    }
+                } else if refcount::fetch_sub(data, offset + RC_REFCOUNT_OFFSET, 1)? == 1 {
+                    self.teardown(target, ord, offset)?;
+                }
+                Ok(())
+            }
+            ForeignKind::Weak => {
+                // A weak foreign's offset is the control offset.
+                if refcount::fetch_sub(data, offset + CTRL_WEAK_OFFSET, 1)? == 1 {
+                    target.free_many([BStackRange::new(offset, CONTROL_SIZE)])?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Resolve a **field path** (`["outer", "inner", …]`) from the root of type

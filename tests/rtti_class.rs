@@ -7,7 +7,7 @@
 #![allow(dead_code)] // some fixtures are inspected only via RTTI, never instantiated
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
-use bstack_raii::registry::FileId;
+use bstack_raii::registry::{self, FileId};
 use bstack_raii::rtti::{self, AnyRef, ForeignKind, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
     BStackBlock, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr, bstack_class, rtti_path,
@@ -118,6 +118,13 @@ struct FShared {
     s: Foreign<RCell>,
     #[bstack_weak]
     w: Foreign<WCell>,
+}
+
+#[bstack_class]
+struct FStrong {
+    #[bstack_strong]
+    s: Foreign<RCell>,
+    n: u32,
 }
 
 fn temp_path(tag: &str) -> std::path::PathBuf {
@@ -1264,4 +1271,98 @@ fn interpret_reads_foreign_pointer() {
     drop(reg);
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_teardown_foreign_owned_across_files() {
+    // Cross-file RTTI teardown: an FModel in the home file owns a Point in a foreign
+    // file (via `#[bstack_owned] Foreign<Point>`). Tearing the FModel down through the
+    // interpreter must free that Point in *its own* file, resolved through the global
+    // registry — exactly as the generated `bstack_drop` does.
+    let schema = temp_path("ftd_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FModel as BStackCast>::eightcc()).unwrap();
+
+    let (home, hpath) = data_alloc("ftd_home");
+    let (foreign, fpath) = data_alloc("ftd_foreign");
+
+    // Allocate the owned target in the foreign file.
+    let base = foreign.stack().len().unwrap();
+    let leaf = Point::new(&foreign, 88, 99).unwrap();
+    let leaf_off = BStackBlock::range(leaf.handle()).start();
+    assert!(foreign.stack().len().unwrap() > base);
+
+    // Attach the foreign file to the process-wide registry (tolerant of a prior init).
+    let reg_file = temp_path("ftd_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+    assert!(!fid.is_self());
+
+    // Build the home holder: a cross-file owned foreign + a harmless self ref foreign.
+    let hp = Point::new(&home, 1, 2).unwrap();
+    let fm = FModel::new(
+        &home,
+        unsafe { Foreign::<Point>::new(fid, leaf_off) },
+        Foreign::at(FileId::SELF, hp.handle()),
+        7,
+    )
+    .unwrap();
+    let off = BStackBlock::range(fm.handle()).start();
+
+    // Interpret the teardown; the foreign target is reclaimed in the foreign file.
+    reg.teardown(&home, ord, off).unwrap();
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign owned target not reclaimed by RTTI teardown: {after} > {base}"
+    );
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn interpret_teardown_foreign_strong_across_files() {
+    // Cross-file RC teardown: a `#[bstack_strong] Foreign<RCell>` decrements the
+    // target's refcount *in its own file* and frees it at zero. The home holder is the
+    // sole owner (count 1), so the interpreted teardown drives 1 -> 0.
+    let schema = temp_path("fst_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FStrong as BStackCast>::eightcc()).unwrap();
+
+    let (home, hpath) = data_alloc("fst_home");
+    let (foreign, fpath) = data_alloc("fst_foreign");
+
+    // An rc target in the foreign file at refcount 1, with no live handle to auto-drop
+    // it — the strong foreign is its (sole, uncounted-here) owner.
+    let base = foreign.stack().len().unwrap();
+    let cell = RCell::new(&foreign, 88).unwrap();
+    let cell_off = cell.handle().range().start();
+    std::mem::forget(cell);
+    assert!(foreign.stack().len().unwrap() > base);
+
+    let reg_file = temp_path("fst_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let h = FStrong::new(&home, unsafe { Foreign::<RCell>::new(fid, cell_off) }, 1).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    reg.teardown(&home, ord, off).unwrap();
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign strong target not freed at zero by RTTI teardown: {after} > {base}"
+    );
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
 }
