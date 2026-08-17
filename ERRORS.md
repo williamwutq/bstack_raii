@@ -129,11 +129,6 @@ A whole array-of-vectors can't be nullable. **Fix:** make each element nullable 
 A whole foreign-array can't be nullable (a null foreign is already `offset 0`). **Fix:**
 use `[Option<Foreign<T>>; N]`.
 
-### BSTACK0112 — tuple field not describable by `#[bstack_class]`
-A `#[bstack_class]` struct has a tuple field, which RTTI has no single-tag shape for
-yet (a plain `#[bstack_block]` stores it as a POD aggregate). **Fix:** wrap it in a
-named `#[bstack_class]` struct and store that.
-
 ---
 
 ## Enum variants & discriminants (`02xx`)
@@ -203,12 +198,6 @@ A `Foreign` must target a block, not an array. (`[Foreign<T>; N]` is fine;
 ### BSTACK0308 — `Foreign` target is a tuple
 A `Foreign` must target a `#[bstack_block]`, not a tuple. **Fix:** bridge with a
 `#[bstack_block]` struct.
-
-### BSTACK0309 — `Foreign` not yet supported by `#[bstack_class]`
-A `#[bstack_class]` struct has a `Foreign` field. Cross-file RTTI is a later phase
-(its schema shape must carry the target's ownership kind, which the current wire
-form doesn't yet). **Fix:** use `#[bstack_block]` for a type with `Foreign` fields
-for now, or drop the field.
 
 ---
 
@@ -390,13 +379,6 @@ ordinal, or `sync` the schema so the pointer's type is present.
 A followed field (`owned` / `strong` / `embed`) names a target eightcc that is not in
 this RTTI stack. **Fix:** `sync` the producer's full compiled-in schema so every
 referenced type is appended before reading.
-
-### BSTACK080C — RTTI teardown of a foreign reference
-`teardown` reached a `foreign` (cross-file) reference, whose reclamation needs the
-registry routing the generated path does; the interpreter does not do cross-file
-teardown yet. **Fix:** tear a structure with `foreign` fields down through its
-compiled-in handle for now. (In-file `owned` / `embed` / `strong` / `weak` / `ref` /
-`vec` / array / tuple / `option` are all handled.)
 
 ### BSTACK080D — invalid RTTI `get` / `set` field path
 A `get` / `set` field path could not be resolved or written: the path is empty, a

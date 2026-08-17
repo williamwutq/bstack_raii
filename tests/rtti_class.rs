@@ -8,7 +8,7 @@
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::registry::{self, FileId};
-use bstack_raii::rtti::{self, AnyRef, ForeignKind, Moved, RttiBody, Shape, Value};
+use bstack_raii::rtti::{self, AnyRef, ForeignKind, ForeignPtr, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
     BStackBlock, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr, bstack_class, rtti_path,
 };
@@ -124,6 +124,35 @@ struct FShared {
 struct FStrong {
     #[bstack_strong]
     s: Foreign<RCell>,
+    n: u32,
+}
+
+// Cross-file `Foreign` inside containers — the RTTI interpreter walks each element.
+#[bstack_class]
+struct FVec {
+    #[bstack_owned]
+    links: Vec<Foreign<Point>>,
+    n: u32,
+}
+
+#[bstack_class]
+struct FArr {
+    #[bstack_owned]
+    links: [Foreign<Point>; 2],
+    n: u32,
+}
+
+#[bstack_class]
+struct FTup {
+    #[bstack_owned]
+    pair: (Foreign<Point>, u32),
+    n: u32,
+}
+
+// A pure-POD tuple field (no foreign) — describable by RTTI as a `Shape::Tuple`.
+#[bstack_class]
+struct PTup {
+    pair: (u16, u8),
     n: u32,
 }
 
@@ -1498,6 +1527,354 @@ fn interpret_move_out_foreign() {
         panic!("n should be POD");
     };
     assert_eq!(&n[..], &7u32.to_le_bytes());
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn bstack_class_foreign_container_shapes() {
+    // The emitter lowers `Foreign` inside a `Vec` / array / tuple to the container
+    // shape wrapping a `Foreign` leaf (all sharing the field's ownership kind).
+    let path = temp_path("fcont_schema");
+    let reg = rtti::sync(&path).unwrap();
+    let pt = <Point as BStackCast>::eightcc();
+    let f = Shape::Foreign {
+        tag: pt,
+        kind: ForeignKind::Owned,
+    };
+
+    let fv = reg
+        .load_type(reg.ordinal_of(<FVec as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Struct(g) = &fv.body else {
+        panic!("FVec struct");
+    };
+    assert_eq!(g[0].shape, Shape::Vec(Box::new(f.clone())));
+
+    let fa = reg
+        .load_type(reg.ordinal_of(<FArr as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Struct(g) = &fa.body else {
+        panic!("FArr struct");
+    };
+    assert_eq!(
+        g[0].shape,
+        Shape::Array {
+            n: 2,
+            inner: Box::new(f.clone()),
+        }
+    );
+
+    let ft = reg
+        .load_type(reg.ordinal_of(<FTup as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Struct(g) = &ft.body else {
+        panic!("FTup struct");
+    };
+    assert_eq!(
+        g[0].shape,
+        Shape::Tuple(vec![f.clone(), Shape::Pod { width: 4 }])
+    );
+
+    drop(reg);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn bstack_class_pod_tuple_field() {
+    // A pure-POD tuple field is describable too — a `Shape::Tuple` of opaque POD
+    // members (each its whole width), read as a `Value::Tuple` and moved out whole.
+    let path = temp_path("ptup_schema");
+    let reg = rtti::sync(&path).unwrap();
+    let ord = reg.ordinal_of(<PTup as BStackCast>::eightcc()).unwrap();
+
+    let ty = reg.load_type(ord).unwrap();
+    let RttiBody::Struct(g) = &ty.body else {
+        panic!("PTup struct");
+    };
+    assert_eq!(
+        g[0].shape,
+        Shape::Tuple(vec![Shape::Pod { width: 2 }, Shape::Pod { width: 1 }])
+    );
+
+    let (home, hpath) = data_alloc("ptup_home");
+    let h = PTup::new(&home, (0x1234u16, 0x56u8), 7).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    let Value::Block { fields, .. } = reg.read_value(home.stack(), ord, off).unwrap() else {
+        panic!("block");
+    };
+    let Value::Tuple(items) = &fields[0].1 else {
+        panic!("pair tuple");
+    };
+    assert_eq!(items[0], pod(&0x1234u16.to_le_bytes()));
+    assert_eq!(items[1], pod(&0x56u8.to_le_bytes()));
+
+    // A POD tuple moves out as one opaque blob (cumulative packed bytes).
+    let moved = reg.move_out(&home, ord, off).unwrap();
+    let Moved::Pod(bytes) = &moved["pair"] else {
+        panic!("pod tuple should move whole");
+    };
+    assert_eq!(&bytes[..], &[0x34, 0x12, 0x56]);
+
+    drop(reg);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&hpath).ok();
+}
+
+#[test]
+fn interpret_foreign_vec_teardown_across_files() {
+    // `#[bstack_owned] Vec<Foreign<Point>>`: interpreted teardown frees every element
+    // target in the foreign file (each a 16-byte `ForeignRepr` in the vec data block).
+    let schema = temp_path("fvect_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FVec as BStackCast>::eightcc()).unwrap();
+
+    let (home, hpath) = data_alloc("fvect_home");
+    let (foreign, fpath) = data_alloc("fvect_foreign");
+
+    // Baseline BEFORE the targets, then build three owned Points in the foreign file.
+    let base = foreign.stack().len().unwrap();
+    let mut offs = Vec::new();
+    for i in 0..3u32 {
+        let p = Point::new(&foreign, 10 + i, 20 + i).unwrap();
+        offs.push(BStackBlock::range(p.handle()).start());
+    }
+    assert!(foreign.stack().len().unwrap() > base);
+
+    let reg_file = temp_path("fvect_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let links: Vec<Foreign<Point>> = offs
+        .iter()
+        .map(|&o| unsafe { Foreign::<Point>::new(fid, o) })
+        .collect();
+    let h = FVec::new(&home, links, 7).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    reg.teardown(&home, ord, off).unwrap();
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign vec element targets not reclaimed: {after} > {base}"
+    );
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn interpret_foreign_vec_clone_across_files() {
+    // Cloning `Vec<Foreign<Point>>` deep-copies EVERY element's target into a fresh
+    // block in the foreign file and repoints the clone's `ForeignRepr` there.
+    let schema = temp_path("fvecc_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FVec as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+
+    let (home, hpath) = data_alloc("fvecc_home");
+    let (foreign, fpath) = data_alloc("fvecc_foreign");
+
+    let mut offs = Vec::new();
+    for i in 0..3u32 {
+        let p = Point::new(&foreign, 10 + i, 20 + i).unwrap();
+        offs.push(BStackBlock::range(p.handle()).start());
+    }
+
+    let reg_file = temp_path("fvecc_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let links: Vec<Foreign<Point>> = offs
+        .iter()
+        .map(|&o| unsafe { Foreign::<Point>::new(fid, o) })
+        .collect();
+    let h = FVec::new(&home, links, 7).unwrap();
+    let src = BStackBlock::range(h.handle()).start();
+
+    let dst = reg.clone_value(&home, ord, src).unwrap();
+
+    // Pull each element's foreign offset out of a read of the vec.
+    let elem_offs = |root: u64| -> Vec<u64> {
+        let Value::Block { fields, .. } = reg.read_value(home.stack(), ord, root).unwrap() else {
+            panic!("block");
+        };
+        let Value::Vec(items) = &fields[0].1 else {
+            panic!("links vec");
+        };
+        items
+            .iter()
+            .map(|v| match v {
+                Value::Foreign { offset, .. } => *offset,
+                _ => panic!("foreign element"),
+            })
+            .collect()
+    };
+    let orig = elem_offs(src);
+    let cloned = elem_offs(dst);
+    assert_eq!(cloned.len(), 3);
+    for (o, c) in orig.iter().zip(&cloned) {
+        assert_ne!(
+            *o, *c,
+            "each foreign element must deep-copy to a new offset"
+        );
+    }
+    // Each cloned target holds the same Point value in the foreign file.
+    for (i, &c) in cloned.iter().enumerate() {
+        let v = registry::with_host(fid, |host| reg.read_value(host.stack(), pord, c))
+            .unwrap()
+            .unwrap();
+        let Value::Block { fields, .. } = v else {
+            panic!("point block");
+        };
+        assert_eq!(fields[0].1, pod(&(10u32 + i as u32).to_le_bytes()));
+    }
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn interpret_foreign_array_across_files() {
+    // `#[bstack_owned] [Foreign<Point>; 2]`: read yields an array of foreign pointers;
+    // move_out hands them back as a `Moved::ForeignList` (the shell is freed, targets
+    // survive in the foreign file).
+    let schema = temp_path("farr_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FArr as BStackCast>::eightcc()).unwrap();
+    let pt = <Point as BStackCast>::eightcc();
+
+    let (home, hpath) = data_alloc("farr_home");
+    let (foreign, fpath) = data_alloc("farr_foreign");
+
+    let p0 = Point::new(&foreign, 1, 2).unwrap();
+    let o0 = BStackBlock::range(p0.handle()).start();
+    let p1 = Point::new(&foreign, 3, 4).unwrap();
+    let o1 = BStackBlock::range(p1.handle()).start();
+
+    let reg_file = temp_path("farr_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let h = FArr::new(
+        &home,
+        [unsafe { Foreign::<Point>::new(fid, o0) }, unsafe {
+            Foreign::<Point>::new(fid, o1)
+        }],
+        9,
+    )
+    .unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    // Read: a 2-element array of foreign pointers.
+    let Value::Block { fields, .. } = reg.read_value(home.stack(), ord, off).unwrap() else {
+        panic!("block");
+    };
+    let Value::Array(items) = &fields[0].1 else {
+        panic!("links array");
+    };
+    assert_eq!(items.len(), 2);
+    assert!(matches!(items[0], Value::Foreign { offset, .. } if offset == o0));
+
+    // move_out: the array becomes a ForeignList; targets outlive the freed shell.
+    let moved = reg.move_out(&home, ord, off).unwrap();
+    assert_eq!(
+        moved["links"],
+        Moved::ForeignList(vec![
+            ForeignPtr {
+                tag: pt,
+                kind: ForeignKind::Owned,
+                file_id: fid.get() as u64,
+                offset: o0,
+            },
+            ForeignPtr {
+                tag: pt,
+                kind: ForeignKind::Owned,
+                file_id: fid.get() as u64,
+                offset: o1,
+            },
+        ])
+    );
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn interpret_foreign_tuple_across_files() {
+    // `#[bstack_owned] (Foreign<Point>, u32)`: read yields a tuple whose members are a
+    // foreign pointer and a POD; move_out hands each member back as its own `Moved`;
+    // teardown frees the foreign target in its file.
+    let schema = temp_path("ftup_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FTup as BStackCast>::eightcc()).unwrap();
+    let pt = <Point as BStackCast>::eightcc();
+
+    let (home, hpath) = data_alloc("ftup_home");
+    let (foreign, fpath) = data_alloc("ftup_foreign");
+
+    let base = foreign.stack().len().unwrap();
+    let p = Point::new(&foreign, 5, 6).unwrap();
+    let po = BStackBlock::range(p.handle()).start();
+
+    let reg_file = temp_path("ftup_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    // Read + move_out on one holder.
+    let h = FTup::new(&home, (unsafe { Foreign::<Point>::new(fid, po) }, 42u32), 9).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+    let Value::Block { fields, .. } = reg.read_value(home.stack(), ord, off).unwrap() else {
+        panic!("block");
+    };
+    let Value::Tuple(items) = &fields[0].1 else {
+        panic!("pair tuple");
+    };
+    assert!(matches!(items[0], Value::Foreign { offset, .. } if offset == po));
+    assert_eq!(items[1], pod(&42u32.to_le_bytes()));
+
+    let moved = reg.move_out(&home, ord, off).unwrap();
+    let Moved::Tuple(parts) = &moved["pair"] else {
+        panic!("pair should move as a tuple, got {:?}", moved["pair"]);
+    };
+    assert_eq!(
+        parts[0],
+        Moved::Foreign {
+            tag: pt,
+            kind: ForeignKind::Owned,
+            file_id: fid.get() as u64,
+            offset: po,
+        }
+    );
+    assert_eq!(parts[1], Moved::Pod(Box::from(&42u32.to_le_bytes()[..])));
+
+    // A second holder, torn down: its foreign target is reclaimed in the foreign file.
+    let h2 = FTup::new(&home, (unsafe { Foreign::<Point>::new(fid, po) }, 1u32), 0).unwrap();
+    let off2 = BStackBlock::range(h2.handle()).start();
+    reg.teardown(&home, ord, off2).unwrap();
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign tuple target not reclaimed by teardown: {after} > {base}"
+    );
 
     registry::detach(fid);
     drop(reg);

@@ -404,22 +404,9 @@ fn registration(name: &Ident, rtti_type: TokenStream) -> TokenStream {
 /// down to a leaf (`Pod` or a block reference); the ownership `kind` applies to the
 /// leaf.
 fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
-    // `Foreign` is supported as a **scalar** `Foreign<T>` or `Option<Foreign<T>>`; a
-    // foreign inside a `Vec` / array is not modelled by the RTTI interpreter yet.
-    if field_foreign_target(ty).is_some() {
-        let scalar =
-            foreign_inner(ty).is_some() || option_inner(ty).and_then(foreign_inner).is_some();
-        if !scalar {
-            return Err(Error::new_spanned(
-                ty,
-                format!(
-                    "[BSTACK0309] field `{fname}`: `Foreign` inside a container is not yet \
-                     supported by #[bstack_class] (only scalar `Foreign<T>` / \
-                     `Option<Foreign<T>>`)"
-                ),
-            ));
-        }
-    }
+    // `Foreign` composes inside a `Vec` / array / tuple (its 16-byte `ForeignRepr`
+    // is the container's element / member); the recursion below reaches the
+    // `Foreign` leaf in each case.
 
     // `Option<Inner>` — nullable leaf / child.
     if let Some(inner) = option_inner(ty) {
@@ -506,14 +493,54 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
             kind: ::bstack_raii::rtti::ForeignKind::#fk,
         }));
     }
-    if matches!(ty, Type::Tuple(_)) {
-        return Err(Error::new_spanned(
-            orig,
-            format!(
-                "[BSTACK0112] field `{fname}`: a tuple field is not yet supported by \
-                 #[bstack_class]; wrap it in a named #[bstack_class] struct"
-            ),
-        ));
+    if let Type::Tuple(tup) = ty {
+        // A tuple field is a `Shape::Tuple` of its members' shapes, laid out inline at
+        // cumulative offsets (matching the static macro). A member is either a
+        // cross-file `Foreign` (optionally `Option`-null, using the offset-0 niche —
+        // all foreign members share the field's ownership annotation) or an opaque POD
+        // value of its **whole** width. A POD `Option<PodInOption>` member is *not*
+        // peeled: its niche is bytemuck's, not offset-0, so it stays a single `Pod`.
+        let has_foreign = tup
+            .elems
+            .iter()
+            .any(|e| foreign_inner(option_inner(e).unwrap_or(e)).is_some());
+        let fk = if has_foreign {
+            Some(foreign_kind_variant(kind).ok_or_else(|| {
+                Error::new_spanned(
+                    orig,
+                    format!(
+                        "[BSTACK0302] field `{fname}`: a tuple containing a `Foreign` needs an \
+                         ownership annotation (#[bstack_owned/strong/weak/ref]) naming the \
+                         foreign elements' kind"
+                    ),
+                )
+            })?)
+        } else {
+            None
+        };
+        let mut elems = Vec::with_capacity(tup.elems.len());
+        for e in &tup.elems {
+            let es = if let Some(target) = foreign_inner(option_inner(e).unwrap_or(e)) {
+                let fk = fk.clone().expect("foreign member ⇒ has_foreign");
+                let leaf = quote!(::bstack_raii::rtti::Shape::Foreign {
+                    tag: <#target as ::bstack_raii::BStackCast>::eightcc(),
+                    kind: ::bstack_raii::rtti::ForeignKind::#fk,
+                });
+                if option_inner(e).is_some() {
+                    quote!(::bstack_raii::rtti::Shape::Option(::std::boxed::Box::new(#leaf)))
+                } else {
+                    leaf
+                }
+            } else {
+                // Opaque POD of the whole member type (an `Option<PodInOption>` keeps
+                // its bytemuck niche inline).
+                quote!(::bstack_raii::rtti::Shape::Pod {
+                    width: ::core::mem::size_of::<#e>() as u32,
+                })
+            };
+            elems.push(es);
+        }
+        return Ok(quote!(::bstack_raii::rtti::Shape::Tuple(::std::vec![#(#elems),*])));
     }
     Ok(match kind {
         Kind::Pod => quote!(::bstack_raii::rtti::Shape::Pod {

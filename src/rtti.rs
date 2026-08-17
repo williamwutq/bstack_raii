@@ -1051,6 +1051,27 @@ pub enum Moved {
         file_id: u64,
         offset: u64,
     },
+    /// A fixed array of cross-file [`Foreign`](crate::Foreign) pointers (`[Foreign; N]`),
+    /// moved element-by-element — the foreign analog of [`List`](Self::List). Its inline
+    /// `ForeignRepr` storage dies with the freed shell, so each pointer is handed back
+    /// (a `ForeignPtr` whose `offset == 0` is null). The caller now owns each reference.
+    ForeignList(Vec<ForeignPtr>),
+    /// A tuple with at least one `Foreign` member, moved member-by-member: each element
+    /// as its own [`Moved`] (POD by value, foreign as [`Foreign`](Self::Foreign)). Pure
+    /// POD tuples come out as [`Pod`](Self::Pod) instead.
+    Tuple(Vec<Moved>),
+}
+
+/// One cross-file [`Foreign`](crate::Foreign) pointer handed out by
+/// [`move_out`](RttiRegistry::move_out) as an element of a [`Moved::ForeignList`]:
+/// the target's tag, its ownership kind, and its `(file_id, offset)` (`offset == 0`
+/// == null). The caller owns the reference and reclaims it in its own file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForeignPtr {
+    pub tag: EightCC,
+    pub kind: ForeignKind,
+    pub file_id: u64,
+    pub offset: u64,
 }
 
 /// What a field path resolves to (see `RttiRegistry::resolve_field`): a per-instance
@@ -1344,9 +1365,12 @@ impl RttiRegistry {
                         if data_off == 0 {
                             results.push(Value::Vec(Box::default()));
                         } else {
-                            let len = read_u64_at(data, data_off)?; // element count @0
+                            // `@0` is the byte length; the element count is
+                            // `byte_len / stride`.
                             let base = data_off + BYTEVEC_HEADER;
                             let stride = self.shape_stride(&inner, &mut cache)?;
+                            let byte_len = read_u64_at(data, data_off)?;
+                            let len = byte_len.checked_div(stride).unwrap_or(0);
                             let elem_ops: Vec<Op> = (0..len)
                                 .map(|i| Op::Shape {
                                     shape: (*inner).clone(),
@@ -1615,14 +1639,18 @@ impl RttiRegistry {
                         if data_off != 0 {
                             let data_size = read_u64_at(data, offset + 8)?; // .data_size @8
                             // A vector of owning/shared elements releases each element
-                            // (`u64` offsets from the data block's element area) too.
+                            // from the data block's element area too. The `@0` word is
+                            // the byte length, so the count is `byte_len / stride`
+                            // (stride = 8 for a `u64` offset, 16 for a `ForeignRepr`).
                             let base = data_off + BYTEVEC_HEADER;
-                            let len = read_u64_at(data, data_off)?; // element count @0
+                            let stride = self.shape_stride(&inner, &mut cache)?;
+                            let byte_len = read_u64_at(data, data_off)?;
+                            let len = byte_len.checked_div(stride).unwrap_or(0);
                             match &*inner {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {
-                                        let e = read_u64_at(data, base + i * 8)?;
+                                        let e = read_u64_at(data, base + i * stride)?;
                                         if e != 0 {
                                             work.push(TdOp::Block {
                                                 ord,
@@ -1634,7 +1662,7 @@ impl RttiRegistry {
                                 }
                                 Shape::Strong(tag) => {
                                     for i in 0..len {
-                                        let e = read_u64_at(data, base + i * 8)?;
+                                        let e = read_u64_at(data, base + i * stride)?;
                                         if e != 0 {
                                             self.release_strong(
                                                 data,
@@ -1649,13 +1677,23 @@ impl RttiRegistry {
                                 }
                                 Shape::Weak(_) => {
                                     for i in 0..len {
-                                        let c = read_u64_at(data, base + i * 8)?;
+                                        let c = read_u64_at(data, base + i * stride)?;
                                         if c != 0 {
                                             release_weak(data, c, &mut to_free)?;
                                         }
                                     }
                                 }
-                                Shape::Foreign { .. } => return Err(teardown_unsupported()),
+                                // A vector of `Foreign` pointers: each element is a
+                                // 16-byte `ForeignRepr`; tear its target down in the
+                                // target's own file (a null offset is a no-op).
+                                other if foreign_leaf(other).is_some() => {
+                                    let (tag, kind) = foreign_leaf(other).unwrap();
+                                    for i in 0..len {
+                                        let (file_id, foff) =
+                                            read_foreign_repr(data, base + i * stride)?;
+                                        self.teardown_foreign(alloc, tag, kind, file_id, foff)?;
+                                    }
+                                }
                                 // POD / `ref` elements own no sub-blocks.
                                 _ => {}
                             }
@@ -2244,7 +2282,22 @@ impl RttiRegistry {
                 }
             }
             Shape::Array { n, inner } => {
-                if shape_has_reference(inner) {
+                if let Some((tag, kind)) = foreign_leaf(inner) {
+                    // A foreign array: each element is a 16-byte `ForeignRepr` inline
+                    // in the shell; hand every cross-file pointer back to the caller.
+                    let mut list = Vec::with_capacity(*n as usize);
+                    for i in 0..*n as u64 {
+                        let (file_id, offset) =
+                            read_foreign_repr(data, off + i * FOREIGN_REPR_LEN)?;
+                        list.push(ForeignPtr {
+                            tag,
+                            kind,
+                            file_id,
+                            offset,
+                        });
+                    }
+                    Moved::ForeignList(list)
+                } else if shape_has_reference(inner) {
                     // A reference array: each element is a `u64` at `off + i*8`.
                     let tag = element_ref_tag(inner).ok_or_else(move_unsupported)?;
                     let mut list = Vec::with_capacity(*n as usize);
@@ -2262,14 +2315,27 @@ impl RttiRegistry {
                 }
             }
             Shape::Tuple(items) => {
-                // A POD aggregate: its inline bytes (sum of element strides).
-                let mut total = 0u64;
-                for it in items {
-                    total += self.shape_stride(it, cache)?;
+                if items.iter().any(|it| foreign_leaf(it).is_some()) {
+                    // A tuple with a `Foreign` member: move each member individually —
+                    // POD by value, a foreign member as its own `Moved::Foreign` — at
+                    // cumulative element offsets.
+                    let mut parts = Vec::with_capacity(items.len());
+                    let mut eo = off;
+                    for it in items {
+                        parts.push(self.move_field(alloc, data, it, eo, cache, materialized)?);
+                        eo += self.shape_stride(it, cache)?;
+                    }
+                    Moved::Tuple(parts)
+                } else {
+                    // A POD aggregate: its inline bytes (sum of element strides).
+                    let mut total = 0u64;
+                    for it in items {
+                        total += self.shape_stride(it, cache)?;
+                    }
+                    let mut buf = vec![0u8; total as usize];
+                    data.get_into(off, &mut buf)?;
+                    Moved::Pod(buf.into())
                 }
-                let mut buf = vec![0u8; total as usize];
-                data.get_into(off, &mut buf)?;
-                Moved::Pod(buf.into())
             }
             // Filtered out before this call, but keep the match total.
             Shape::Class { .. } => Moved::Pod(Box::default()),
@@ -2286,8 +2352,10 @@ impl RttiRegistry {
     /// a `ref` is a byte-copied alias; POD is copied verbatim. Vectors get a fresh
     /// data block (and cloned owned elements). Every allocation is orphaned until the
     /// caller links the root, so a crash mid-clone leaks but never corrupts; on any
-    /// error the partial clone's blocks are freed. Cross-file `foreign` references
-    /// are not yet supported (they error).
+    /// error the partial clone's blocks are freed. Cross-file `foreign` references —
+    /// scalar or inside a `vec` / array / tuple — are handled per their kind in the
+    /// target's own file (`owned` deep-copied there, `strong` / `weak` bumped, `ref`
+    /// aliased); a detached target file is a hard error.
     pub fn clone_value<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
@@ -2498,23 +2566,27 @@ impl RttiRegistry {
                             // Repoint the (freshly-copied) descriptor's data pointer;
                             // its size word was copied verbatim.
                             data.set(new_off, new_data.to_le_bytes())?;
-                            let len = read_u64_at(data, src_data)?;
+                            // `@0` is the byte length; count is `byte_len / stride`
+                            // (8 per `u64` offset, 16 per `ForeignRepr`).
+                            let stride = self.shape_stride(&inner, &mut st.cache)?;
+                            let byte_len = read_u64_at(data, src_data)?;
+                            let len = byte_len.checked_div(stride).unwrap_or(0);
                             let sbase = src_data + BYTEVEC_HEADER;
                             let nbase = new_data + BYTEVEC_HEADER;
                             match &*inner {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {
-                                        let e = read_u64_at(data, sbase + i * 8)?;
+                                        let e = read_u64_at(data, sbase + i * stride)?;
                                         if e != 0 {
-                                            st.patches.push((nbase + i * 8, e));
+                                            st.patches.push((nbase + i * stride, e));
                                             work.push(CloneOp::Block { src_off: e, ord });
                                         }
                                     }
                                 }
                                 Shape::Strong(tag) => {
                                     for i in 0..len {
-                                        let e = read_u64_at(data, sbase + i * 8)?;
+                                        let e = read_u64_at(data, sbase + i * stride)?;
                                         if e != 0 {
                                             let off = self.strong_bump_off(data, *tag, e, st)?;
                                             st.bumps.push(off);
@@ -2523,13 +2595,24 @@ impl RttiRegistry {
                                 }
                                 Shape::Weak(_) => {
                                     for i in 0..len {
-                                        let c = read_u64_at(data, sbase + i * 8)?;
+                                        let c = read_u64_at(data, sbase + i * stride)?;
                                         if c != 0 {
                                             st.bumps.push(c + CTRL_WEAK_OFFSET);
                                         }
                                     }
                                 }
-                                Shape::Foreign { .. } => return Err(clone_unsupported()),
+                                // A vector of `Foreign` pointers: the data block (and
+                                // its reprs) was byte-copied above; deep-copy each
+                                // `owned` target across the boundary, bump `strong` /
+                                // `weak` — the per-element mirror of the scalar path.
+                                other if foreign_leaf(other).is_some() => {
+                                    let (tag, kind) = foreign_leaf(other).unwrap();
+                                    for i in 0..len {
+                                        let so = sbase + i * stride;
+                                        let no = nbase + i * stride;
+                                        self.clone_foreign(alloc, data, tag, kind, so, no)?;
+                                    }
+                                }
                                 // POD / `ref` elements are copied verbatim.
                                 _ => {}
                             }
@@ -2644,14 +2727,6 @@ fn unknown_tag() -> io::Error {
     corrupt("[BSTACK080B] RTTI pointer/field references an unregistered type tag")
 }
 
-fn teardown_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "[BSTACK080C] RTTI teardown of a `foreign` reference is not yet supported (cross-file \
-         reclamation)",
-    )
-}
-
 fn set_error(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -2698,6 +2773,17 @@ fn element_ref_tag(shape: &Shape) -> Option<EightCC> {
     match shape {
         Shape::Owned(t) | Shape::Strong(t) | Shape::Weak(t) | Shape::Ref(t) => Some(*t),
         Shape::Option(inner) => element_ref_tag(inner),
+        _ => None,
+    }
+}
+
+/// The `(tag, kind)` of a cross-file `Foreign` leaf (optionally `Option`-wrapped) —
+/// its slot is a 16-byte [`ForeignRepr`]. `None` for any non-foreign shape. Used to
+/// drive the per-element foreign path in a `Vec` / array / tuple.
+fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
+    match shape {
+        Shape::Foreign { tag, kind } => Some((*tag, *kind)),
+        Shape::Option(inner) => foreign_leaf(inner),
         _ => None,
     }
 }
