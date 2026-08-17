@@ -1,0 +1,38 @@
+# Design Guidelines
+
+Design principles for the `bstack_raii` crate. These complement [Rust's API design guidelines](https://rust-lang.github.io/api-guidelines/) and the underlying [`bstack` guidelines](https://github.com/williamwutq/bstack), and inform decisions about safety, API shape, and feature scope. Where `bstack` reasons about a single crash-safe file, `bstack_raii` reasons about a *typed object graph* over one or more such files — so its safety surface is about keeping that graph well-formed (valid offsets, honest reference counts, the null niche) rather than about the bytes of any one write.
+
+---
+
+## The corruption-vs-leak baseline
+
+Every compound operation in this crate — a constructor, `try_clone_in`, `bstack_drop`, a `replace_`, a stdlib mutation — is designed so that an I/O failure or crash mid-operation degrades to a **reclaimable leak** (an orphaned or over-counted block), never to an observable torn structure. Allocations happen before the linking write; frees happen after the unlinking write; the linking/unlinking write itself is a single crash-atomic `bstack` commit (`set` / `set_batched` / `inplace_gen`). A WAL-anchoring allocator then reclaims those orphans on the next open.
+
+This baseline is what makes most of the safety judgments below tractable: **a leak is not a safety violation.** The interesting line is between operations that can only *leak* under misuse or failure (safe) and operations that can produce a *silently wrong object graph* from otherwise-safe code (unsafe).
+
+## When to mark a method `unsafe`
+
+### Mark `unsafe fn` when:
+
+- **The method can compromise memory safety** — of a `bstack` file's structure, of the allocator, or of heap memory — regardless of how it is called: use-after-free, reading a handle as the wrong type, buffer overruns, or any violation of Rust's memory model.
+
+- **The method can produce a silently-wrong object graph from an otherwise safe context** — a dangling or mistyped pointer that later code will dereference, free, refcount, or clone as if valid, corrupting the graph without any `unsafe` at the eventual point of failure. The key qualifier is *from a safe context*: if reaching the dangerous state already required an `unsafe` block earlier in the call chain (constructing the bad `Foreign`, writing through a `raw_` place), the consuming method need not itself be `unsafe fn` — the hazard window is already guarded. Concretely, this is why:
+  - **`Foreign::new` / `Foreign::from_repr` / `*::from_foreign` are `unsafe fn`.** They assert that a raw `(file, offset)` names a valid `T` block. From safe code that promise cannot be checked, and a bad foreign pointer is not inert: cross-file teardown would free an arbitrary offset, and clone would deep-copy or refcount garbage in another file — silent persistent corruption of a *different* file. The safe ways to obtain a `Foreign` (`Foreign::at`, `from_local`, or simply reading a `#[bstack_block]` field) are borrow-bound to a real block, so they carry no such obligation and stay safe.
+  - **The generated `raw_<field>_slice` place is `unsafe`.** A read of the field's inline bytes is always valid; the *write* half bypasses the typed invariants — e.g. it can store an offset that no allocation backs into an `#[bstack_owned]` slot, so a later, entirely safe `bstack_drop` frees a bogus range. The write is the reason for `unsafe`, not the view.
+  - **The free-standing `foreign_drop_*` / `foreign_clone_*` helpers are `unsafe fn`.** They act on a caller-asserted raw `Foreign`, so they inherit its obligation.
+
+- **The method can trigger undefined behavior.** Note: panicking is not undefined behavior. The interpreter's node-budget guard *panics* (or returns `Err`) on a cyclic or corrupt structure rather than looping or reading out of bounds; a method that panics on misuse does not need to be `unsafe fn` on that basis alone.
+
+### Do not mark `unsafe fn` purely because:
+
+- **The method can lose data or leak.** Teardown frees blocks; `replace_` and `bstack_move!` detach a subtree that becomes unreachable garbage if the caller drops the returned handle without re-rooting or freeing it. This is the crate's [corruption-vs-leak baseline](#the-corruption-vs-leak-baseline) working as designed — a leak wastes space, it does not violate memory safety or the well-formedness of the reachable graph. Operations that lose or orphan data by design are safe (they return the value for you to re-home precisely so the choice is explicit).
+
+- **The method can be misused to build a wrong-but-well-formed graph when called deliberately.** Intentional misuse is the caller's responsibility, not a safety obligation on the API. Wiring a `#[bstack_ref]` or `#[bstack_weak]` to a block it logically should not point at, via a perfectly safe `set_<field>`, produces a semantically wrong graph but a *structurally valid* one — every offset still names a real block of the right type. That is the caller's choice, exactly as taking a sub-slice and passing it to `dealloc` is in `bstack`. (A future improvement would push more of these relationships into the type system; until then they are documented contracts, not `unsafe`.)
+
+- **A downcast or resolution can fail.** `bstack_cast!`, `AnyRef::downcast`, and registry resolution check the 8-byte type tag (or the `FileId`) and return `Option` / `Result` on a mismatch. A *checked* narrowing that cannot proceed to a wrong-typed read is safe, not `unsafe` — the check is the whole point.
+
+### Unsafe traits
+
+Mark a trait `unsafe trait` when implementors must uphold invariants the type system cannot express or verify. The crate's central case is **`BStackRaiiAllocator`**: an implementor asserts the **null niche** (payload offset 0 is never handed out, so a `0` offset can serve as the universal "none" — an absent `Option`, a dead weak, an unset `Foreign`, "no WAL block") and, *only when it returns `Some`*, that its **WAL anchor** names a stable reserved 8-byte slot the allocator never allocates from and that survives open/close. Neither can be checked by a method signature, and a violation is unsound rather than merely incorrect — a real allocation at offset 0 would be indistinguishable from null throughout the layer. Hence the `unsafe impl`, one line for an allocator that already upholds the niche.
+
+By contrast, a trait whose entire contract is carried by its supertrait bounds or its method documentation stays a safe `trait`. `SyncBStackRaiiAllocator` is just `BStackRaiiAllocator + Send + Sync` — it adds no invariant beyond what those bounds already guarantee, so it is a safe marker trait even though it gates a value into the process-wide file registry.
