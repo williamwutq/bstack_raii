@@ -993,6 +993,15 @@ pub enum Moved {
     List(Vec<Option<AnyRef>>),
 }
 
+/// What a field path resolves to (see `RttiRegistry::resolve_field`): a per-instance
+/// slot in the data file, or a `#[bstack_static]` class variable living schema-side.
+enum Resolved {
+    /// A per-instance field: its absolute offset in the data file, and its shape.
+    Instance { offset: u64, shape: Shape },
+    /// A class variable, addressed by its owning type's tag + its name.
+    Class { tag: EightCC, name: String },
+}
+
 /// One step of the non-recursive walk. The interpreter runs a `work` stack of these
 /// against a `results` value stack: leaf steps push a [`Value`]; an `Assemble*` step
 /// pops the `n` values its children pushed and combines them into one.
@@ -1643,7 +1652,7 @@ impl RttiRegistry {
         ordinal: RttiOrdinal,
         block_off: u64,
         path: &[&str],
-    ) -> io::Result<(u64, Shape)> {
+    ) -> io::Result<Resolved> {
         if path.is_empty() {
             return Err(set_error("empty field path"));
         }
@@ -1673,7 +1682,19 @@ impl RttiRegistry {
             let field_off = field_base + field.offset as u64;
 
             if i + 1 == path.len() {
-                return Ok((field_off, field.shape.clone()));
+                // A `#[bstack_static]` class variable lives in the schema record for
+                // *this type*, not in the instance — resolve it by (type tag, name),
+                // not an instance offset.
+                if matches!(field.shape, Shape::Class { .. }) {
+                    return Ok(Resolved::Class {
+                        tag: ty.tag,
+                        name: field.name.clone(),
+                    });
+                }
+                return Ok(Resolved::Instance {
+                    offset: field_off,
+                    shape: field.shape.clone(),
+                });
             }
             // Descend into a block reference for the next segment.
             match &field.shape {
@@ -1700,8 +1721,9 @@ impl RttiRegistry {
     }
 
     /// Read a single field named by `path` into a [`Value`] — a targeted `get`
-    /// (`read_value` scoped to one field). Follows an owning reference into its
-    /// child, exactly as a full read would.
+    /// (`read_value` scoped to one field). Follows an owning reference into its child,
+    /// exactly as a full read would. A `#[bstack_static]` class variable at the path
+    /// yields its **live** value ([`Value::Class`]), read from the schema.
     pub fn get(
         &self,
         data: &BStack,
@@ -1709,18 +1731,23 @@ impl RttiRegistry {
         block_off: u64,
         path: &[&str],
     ) -> io::Result<Value> {
-        let (offset, shape) = self.resolve_field(data, ordinal, block_off, path)?;
-        self.run_read(data, vec![Op::Shape { shape, offset }])
+        match self.resolve_field(data, ordinal, block_off, path)? {
+            Resolved::Instance { offset, shape } => {
+                self.run_read(data, vec![Op::Shape { shape, offset }])
+            }
+            Resolved::Class { tag, name } => Ok(Value::Class(self.class_value(tag, &name)?.into())),
+        }
     }
 
-    /// Overwrite the **POD** or **`ref`** field named by `path` with `value` — the
-    /// interpreted `set_<field>`, one atomic write. The mirror of a POD read, now
-    /// reaching any depth.
+    /// Overwrite the field named by `path` with `value` — the interpreted
+    /// `set_<field>`, one atomic write, reaching any depth.
     ///
-    /// Only a POD field (exact-width bytes) or a `ref` field (an 8-byte target
-    /// offset — a non-owning alias) may be `set`; an `owned` / `strong` / `weak`
-    /// field is *replaced*, not overwritten — that is [`swap`](Self::swap). Errors on
-    /// a non-POD/ref target or a wrong-width value.
+    /// A **POD** field takes its exact-width bytes; a **`ref`** field an 8-byte target
+    /// offset (a non-owning alias); a **`#[bstack_static]` mutable class variable**
+    /// routes to [`set_class_value`](Self::set_class_value) (written in the schema, not
+    /// the instance). An `owned` / `strong` / `weak` field is *replaced*, not
+    /// overwritten — that is [`swap`](Self::swap). Errors on any other target or a
+    /// wrong-width value.
     pub fn set(
         &self,
         data: &BStack,
@@ -1729,7 +1756,11 @@ impl RttiRegistry {
         path: &[&str],
         value: &[u8],
     ) -> io::Result<()> {
-        let (offset, shape) = self.resolve_field(data, ordinal, block_off, path)?;
+        let (offset, shape) = match self.resolve_field(data, ordinal, block_off, path)? {
+            Resolved::Instance { offset, shape } => (offset, shape),
+            // A class variable is schema-side; write it in place there.
+            Resolved::Class { tag, name } => return self.set_class_value(tag, &name, value),
+        };
         match shape {
             Shape::Pod { width } => {
                 if value.len() != width as usize {
@@ -1750,7 +1781,8 @@ impl RttiRegistry {
             }
             _ => {
                 return Err(set_error(
-                    "field is not POD or `ref`; an owning reference is `swap`ped, not set",
+                    "field is not POD / `ref` / class variable; an owning reference is \
+                     `swap`ped, not set",
                 ));
             }
         }
@@ -1775,7 +1807,14 @@ impl RttiRegistry {
         path: &[&str],
         new: AnyRef,
     ) -> io::Result<Option<AnyRef>> {
-        let (offset, mut shape) = self.resolve_field(data, ordinal, block_off, path)?;
+        let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
+            Resolved::Instance { offset, shape } => (offset, shape),
+            Resolved::Class { .. } => {
+                return Err(swap_error(
+                    "a class variable is a value, not a reference — use `set`",
+                ));
+            }
+        };
         // A nullable reference swaps its inner target.
         if let Shape::Option(inner) = shape {
             shape = *inner;

@@ -1099,3 +1099,46 @@ fn class_variable_live_read_write() {
 
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn class_variable_via_path() {
+    let schema = temp_path("cvpath_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("cvpath_data");
+    let ctag = <Config as BStackCast>::eightcc();
+    let ord = reg.ordinal_of(ctag).unwrap();
+    let data = alloc.stack(); // unused for a top-level class-var path, but the API takes it
+
+    // get a class variable by path → its live value.
+    let Value::Class(b) = reg.get(data, ord, 0, rtti_path!(counter)).unwrap() else {
+        panic!("counter should read as a class value");
+    };
+    assert_eq!(&b[..], &0u64.to_le_bytes());
+
+    // set a mutable class variable by path; it routes to the schema-side write.
+    reg.set(data, ord, 0, rtti_path!(counter), &99u64.to_le_bytes())
+        .unwrap();
+    let Value::Class(b) = reg.get(data, ord, 0, rtti_path!(counter)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(&b[..], &99u64.to_le_bytes());
+    // the low-level accessor agrees (same slot).
+    assert_eq!(
+        reg.class_value(ctag, "counter").unwrap(),
+        99u64.to_le_bytes()
+    );
+
+    // A const class variable rejects `set`; `swap` rejects any class variable.
+    assert!(
+        reg.set(data, ord, 0, rtti_path!(version), &1u32.to_le_bytes())
+            .is_err()
+    );
+    assert!(
+        reg.swap(data, ord, 0, rtti_path!(counter), AnyRef::new(ctag, 0))
+            .is_err()
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
