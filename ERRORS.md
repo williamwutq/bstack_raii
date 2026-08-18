@@ -155,14 +155,6 @@ An ownership annotation was placed on a unit, multi-field tuple, or struct varia
 Only a single-field tuple variant may be annotated. **Fix:** e.g. `#[bstack_owned] V(T)`;
 unit / multi-field / struct variants are POD aggregates and take no annotation.
 
-### BSTACK0206 — enum variant payload not describable by `#[bstack_class]`
-A `#[bstack_class]` enum has a variant whose payload is a vec / array / foreign /
-tuple reference, which RTTI does not model yet (a plain `#[bstack_enum]` accepts it).
-Unit, POD-aggregate (`V(A, B)` / `V { .. }`), and scalar reference (`#[bstack_owned]
-V(T)`, optionally `Option<T>`) variants are supported. **Fix:** use `#[bstack_enum]`
-for such a type, or reshape the variant (e.g. wrap the payload in a named
-`#[bstack_class]` block).
-
 ---
 
 ## Cross-file pointers — `Foreign<T>` (`03xx`)
@@ -389,13 +381,35 @@ the wrong width (a POD field takes its exact width; a `ref` takes an 8-byte offs
 **Fix:** name a valid path whose interior segments are `owned` / `strong` / `ref` /
 `embed` references; `set` only a POD or `ref` leaf (`swap` an owning reference).
 
+### BSTACK080E — RTTI clone internal invariant
+A clone finished the walk but a child block (or the root) was not recorded in the
+source→clone map — only possible if the source structure was mutated concurrently
+mid-clone, or the schema and data disagree. **Fix:** do not mutate a structure while
+it is being cloned; verify the schema matches the data file.
+
+### BSTACK080F — RTTI clone: unreachable foreign target file
+`clone_value` reached a `foreign` reference whose target file could not be resolved —
+it is detached / not `attach`ed to the process registry, or the stored file id is
+invalid. An `owned` foreign must deep-copy its target *in that file*, so a missing
+file is a hard error (fail-safe: never alias an owner). **Fix:** `attach` the target
+file to the registry before cloning a structure that owns a foreign into it.
+
 ### BSTACK0810 — invalid RTTI `swap`
-A `swap` target is not a swappable reference, or the replacement does not match: the
-field is POD / a container (only `owned` / `strong` / `ref`, optionally
-`Option`-wrapped, may be swapped), it is a `weak` / `foreign` reference (not yet
-supported), or `new`'s eightcc does not equal the field's declared type. **Fix:**
-`swap` an owning data-reference field with an `AnyRef` of the *same* type; use `set`
-for a POD/`ref` field.
+A `swap` target is not a swappable in-file reference, or the replacement does not
+match: the field is POD or a container (only `owned` / `strong` / `weak` / `ref`,
+optionally `Option`-wrapped, may be swapped), or `new`'s eightcc does not equal the
+field's declared type. A cross-file `foreign` field uses `swap_foreign` instead (an
+`AnyRef` can't name its file); a class variable uses `set`. **Fix:** `swap` an in-file
+reference with an `AnyRef` of the *same* type, or `swap_foreign` a foreign field with
+a `ForeignPtr`.
+
+### BSTACK0811 — RTTI `move_out` of an unsupported array element
+`move_out` reached an **array** whose element is a vector (or another reference-bearing
+container that is not a flat reference, an `#[embed]`, a `Foreign`, or a nested array) —
+there is no clean per-element hand-out for it. Flat reference arrays (`Moved::List`),
+foreign arrays (`Moved::ForeignList`), embed arrays and nested reference arrays
+(`Moved::Array`), and whole vectors (`Moved::Vec`) all move out fine. **Fix:** wrap the
+element's vector in a named `#[bstack_class]` block, or restructure the field.
 
 ### BSTACK0812 — invalid RTTI class-variable access
 `class_value` / `set_class_value` was given a name that is not a class variable of
@@ -403,22 +417,3 @@ the type, or `set_class_value` targeted a **const** class variable (only a
 `#[bstack_mut]` one is settable) or passed a value of the wrong width (the slot is
 fixed-size). **Fix:** name a `#[bstack_static]` field; write only a `#[bstack_mut]`
 one, with exactly its byte width.
-
-### BSTACK0811 — RTTI `move_out` of an unsupported array element
-`move_out` reached a reference **array** whose element is an `embed` / `foreign` /
-nested-array shape (there is no single `u64` slot per element to hand out). A scalar
-`Foreign<T>` moves out fine (as a `Moved::Foreign`). **Fix:** prefer a `Vec` (handed
-back whole) or a flat `[owned/strong/weak/ref; N]` array (handed out element-by-element).
-
-### BSTACK080E — RTTI clone internal invariant
-A clone finished the walk but a child block (or the root) was not recorded in the
-source→clone map — only possible if the source structure was mutated concurrently
-mid-clone, or the schema and data disagree. **Fix:** do not mutate a structure while
-it is being cloned; verify the schema matches the data file.
-
-### BSTACK080F — RTTI clone of a foreign reference
-`clone_value` reached a `foreign` (cross-file) reference, whose copy needs the
-cross-file allocation routing the generated path does. **Fix:** clone a structure
-with `foreign` fields through its compiled-in handle for now. (In-file `owned` /
-`embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / `option` are handled —
-owned is deep-copied, shared is refcount-bumped.)

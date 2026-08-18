@@ -44,9 +44,9 @@
 //! refcount-bumped). [`RttiRegistry::class_value`] / [`RttiRegistry::set_class_value`]
 //! read and write a `#[bstack_static]` class variable's value live in the schema
 //! stack (a `#[bstack_mut]` one is set in place, crash-atomically). Cross-file
-//! `Foreign` pointers are handled too — teardown / clone / move_out resolve the
-//! target file through the registry and act on it in place (only a `Foreign` *inside
-//! a container* is still deferred).
+//! `Foreign` pointers are handled too — scalar or inside a `Vec` / array / tuple —
+//! with teardown / clone / move_out resolving the target file through the registry and
+//! acting on it in place.
 //!
 //! Individual fields are reached by a **path** (`["outer", "inner", …]`):
 //! [`get`](RttiRegistry::get) reads one field, [`set`](RttiRegistry::set) overwrites
@@ -1060,6 +1060,12 @@ pub enum Moved {
     /// as its own [`Moved`] (POD by value, foreign as [`Foreign`](Self::Foreign)). Pure
     /// POD tuples come out as [`Pod`](Self::Pod) instead.
     Tuple(Vec<Moved>),
+    /// A **nested** reference array (`[[T; M]; N]`, …), moved outer-element-by-element —
+    /// each inner container as its own [`Moved`] (a [`List`](Self::List) /
+    /// [`ForeignList`](Self::ForeignList) / nested `Array`). A flat reference array is a
+    /// [`List`](Self::List) / [`ForeignList`](Self::ForeignList); a pure-POD array
+    /// (nested or not) is a [`Pod`](Self::Pod) blob.
+    Array(Vec<Moved>),
 }
 
 /// One cross-file [`Foreign`](crate::Foreign) pointer handed out by
@@ -1445,8 +1451,10 @@ impl RttiRegistry {
     }
 
     /// Read the structure a typed [`ForeignRepr`] points at, within `data`. The
-    /// pointer must be **typed** (carry an RTTI ordinal) and refer to the current
-    /// file (`file_id == 0`); cross-file resolution is a later phase.
+    /// pointer must be **typed** (carry an RTTI ordinal), and `data` must be the file
+    /// it targets. This resolves within a single file by design — for a cross-file
+    /// pointer, resolve its `file_id` through the [`registry`](crate::registry) first
+    /// and call this against that file's stack.
     pub fn read_ptr(&self, data: &BStack, ptr: ForeignRepr) -> io::Result<Value> {
         let ord = self.resolve_ptr(ptr).ok_or_else(|| {
             corrupt("[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer")
@@ -1489,7 +1497,8 @@ impl RttiRegistry {
     /// **`weak`** reference decrements the control block's `weak` and frees the control
     /// block alone when last; `ref` is non-owning and left alone; `pod` / class own
     /// nothing. Vectors free their data block plus any owning/shared element blocks.
-    /// Only cross-file `foreign` references are unsupported (they error).
+    /// Cross-file `foreign` references (scalar or in a container) are torn down in the
+    /// target's own file through the registry; a detached target file leaks.
     pub fn teardown<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
@@ -2066,9 +2075,12 @@ impl RttiRegistry {
     /// not duplicated).
     ///
     /// `new`'s [`tag`](AnyRef::tag) **must equal the field's declared type** (an
-    /// eightcc mismatch is rejected), and the target must be a data-block reference
-    /// (`owned` / `strong` / `ref`, optionally `Option`-wrapped). A POD field, a
-    /// container, or a `weak` / `foreign` field is rejected.
+    /// eightcc mismatch is rejected), and the target must be an in-file reference
+    /// (`owned` / `strong` / `weak` / `ref`, optionally `Option`-wrapped). For a `weak`
+    /// field, `new` and the returned old reference are the target's **control-block**
+    /// [`AnyRef`] (exactly what [`move_out`](Self::move_out) hands back). A POD field or
+    /// a container is rejected; a cross-file `foreign` field uses
+    /// [`swap_foreign`](Self::swap_foreign) instead (an [`AnyRef`] can't name its file).
     pub fn swap(
         &self,
         data: &BStack,
@@ -2090,10 +2102,12 @@ impl RttiRegistry {
             shape = *inner;
         }
         let tag = match shape {
-            Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) => t,
-            Shape::Weak(_) | Shape::Foreign { .. } => {
+            // `owned`/`strong`/`ref` hold a data offset; `weak` holds a control offset —
+            // both are a single `u64` slot exchanged the same way (no refcount change).
+            Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) | Shape::Weak(t) => t,
+            Shape::Foreign { .. } => {
                 return Err(swap_error(
-                    "swapping a `weak` / `foreign` reference is not yet supported",
+                    "a `foreign` reference names a cross-file target — use `swap_foreign`",
                 ));
             }
             _ => return Err(swap_error("field is not a swappable reference")),
@@ -2108,6 +2122,67 @@ impl RttiRegistry {
         Ok((old != 0).then(|| AnyRef::new(tag, old)))
     }
 
+    /// **Swap** the cross-file `Foreign` reference named by `path` to point at `new`,
+    /// returning the previous target as a [`ForeignPtr`] (`None` if it was null) — the
+    /// foreign analog of [`swap`](Self::swap). A wholesale exchange of the 16-byte
+    /// pointer with **no** cross-file refcount change: ownership moves, so the old
+    /// target is handed back for the caller to reclaim in its own file (or re-store)
+    /// and the new one is installed. (`swap` takes an [`AnyRef`], which can't name a
+    /// target's file — hence the separate entry.)
+    ///
+    /// `new.tag` **must equal the field's foreign target type** (an eightcc mismatch is
+    /// rejected); `new.kind` is informational (the field's schema kind governs). The
+    /// path must resolve to a scalar `Foreign` (optionally `Option`-wrapped).
+    pub fn swap_foreign(
+        &self,
+        data: &BStack,
+        ordinal: RttiOrdinal,
+        block_off: u64,
+        path: &[&str],
+        new: ForeignPtr,
+    ) -> io::Result<Option<ForeignPtr>> {
+        let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
+            Resolved::Instance { offset, shape } => (offset, shape),
+            Resolved::Class { .. } => {
+                return Err(swap_error(
+                    "a class variable is a value, not a reference — use `set`",
+                ));
+            }
+        };
+        if let Shape::Option(inner) = shape {
+            shape = *inner;
+        }
+        let (tag, kind) = match shape {
+            Shape::Foreign { tag, kind } => (tag, kind),
+            _ => {
+                return Err(swap_error(
+                    "field is not a `foreign` reference — use `swap` for in-file references",
+                ));
+            }
+        };
+        if new.tag != tag {
+            return Err(swap_error(
+                "eightcc mismatch: `new` is not the field's foreign target type",
+            ));
+        }
+        // The old pointer (returned with the field's schema kind).
+        let (old_file, old_off) = read_foreign_repr(data, offset)?;
+        // Install the new 16-byte `ForeignRepr { file_id:u32, type_index:u32, offset:u64 }`
+        // (type_index = the target's ordinal + 1, per `typed_ptr`).
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        let mut b = [0u8; FOREIGN_REPR_LEN as usize];
+        b[0..4].copy_from_slice(&(new.file_id as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&(ord + 1).to_le_bytes());
+        b[8..16].copy_from_slice(&new.offset.to_le_bytes());
+        data.set(offset, b)?;
+        Ok((old_off != 0).then_some(ForeignPtr {
+            tag,
+            kind,
+            file_id: old_file,
+            offset: old_off,
+        }))
+    }
+
     /// **Disassemble** the block of type `ordinal` at `block_off`: hand back its
     /// immediate fields as owned [`Moved`] parts, freeing **only the parent shell** —
     /// the interpreted `bstack_move!`, the inverse of construction.
@@ -2116,11 +2191,16 @@ impl RttiRegistry {
     /// (and inline POD arrays / tuples) come out by value; `owned` / `strong` / `ref`
     /// children come out as [`AnyRef`]s (the child block stays alive); a `weak` comes
     /// out as its control [`AnyRef`]; a whole **vector** transfers as a [`VecRef`]
-    /// (its data block untouched, exactly like a detached `BStackVec`); a reference
-    /// **array** is handed out element-by-element (its inline storage dies with the
-    /// shell). An **`#[embed]`** child is *materialized* — copied into a fresh block
-    /// (so its grandchildren transfer with it) and returned as an `AnyRef`. Class
-    /// variables are skipped (schema-side). `foreign` is not yet supported.
+    /// (its data block untouched, exactly like a detached `BStackVec`); a flat reference
+    /// **array** is handed out element-by-element as a [`Moved::List`] (a foreign array
+    /// as a [`Moved::ForeignList`], a nested reference array as a [`Moved::Array`]) —
+    /// its inline storage dies with the shell. An **`#[embed]`** child (scalar or an
+    /// array of them) is *materialized* — copied into a fresh block (so its
+    /// grandchildren transfer with it) and returned as an `AnyRef`. A cross-file
+    /// **`foreign`** pointer (scalar, in a vector kept whole, in an array, or a tuple
+    /// member) is handed back verbatim ([`Moved::Foreign`] / [`Moved::ForeignList`] /
+    /// [`Moved::Tuple`]); its target lives in another file and outlives the shell. Class
+    /// variables are skipped (schema-side).
     ///
     /// After this the block itself is gone; the caller owns every returned part and
     /// must reuse or tear each down. On any error nothing is freed *except* orphaned
@@ -2297,17 +2377,54 @@ impl RttiRegistry {
                         });
                     }
                     Moved::ForeignList(list)
-                } else if shape_has_reference(inner) {
-                    // A reference array: each element is a `u64` at `off + i*8`.
-                    let tag = element_ref_tag(inner).ok_or_else(move_unsupported)?;
+                } else if let Some(tag) = element_ref_tag(inner) {
+                    // A flat reference array (`owned` / `strong` / `weak` / `ref`, opt):
+                    // each element is a `u64` offset at `off + i*8`.
                     let mut list = Vec::with_capacity(*n as usize);
                     for i in 0..*n as u64 {
                         let e = read_u64_at(data, off + i * 8)?;
                         list.push((e != 0).then(|| AnyRef::new(tag, e)));
                     }
                     Moved::List(list)
+                } else if let Shape::Embed(etag) = &**inner {
+                    // An array of embedded children (`#[embed] [Child; N]`): each is
+                    // stored inline; materialize each into a fresh standalone block (its
+                    // grandchildren transfer via the copied offsets), recorded so a later
+                    // failure reclaims them.
+                    let ord = self.ordinal_of(*etag).ok_or_else(unknown_tag)?;
+                    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
+                        e.insert(self.load_type(ord)?);
+                    }
+                    let size = cache[&ord].ondisk_size;
+                    let mut list = Vec::with_capacity(*n as usize);
+                    for i in 0..*n as u64 {
+                        let range = alloc.alloc(size)?.as_range();
+                        materialized.push(range);
+                        data.copy(off + i * size, range.start(), size)?;
+                        list.push(Some(AnyRef::new(*etag, range.start())));
+                    }
+                    Moved::List(list)
+                } else if matches!(&**inner, Shape::Array { .. }) && shape_has_reference(inner) {
+                    // A nested reference array (`[[T; M]; N]`, …): move each outer
+                    // element (itself a container) as its own `Moved`.
+                    let stride = self.shape_stride(inner, cache)?;
+                    let mut parts = Vec::with_capacity(*n as usize);
+                    for i in 0..*n as u64 {
+                        parts.push(self.move_field(
+                            alloc,
+                            data,
+                            inner,
+                            off + i * stride,
+                            cache,
+                            materialized,
+                        )?);
+                    }
+                    Moved::Array(parts)
+                } else if shape_has_reference(inner) {
+                    // Any other reference-bearing element we can't flatten one-per-`u64`.
+                    return Err(move_unsupported());
                 } else {
-                    // A POD array: the whole inline run of bytes.
+                    // A POD array (nested or not): the whole inline run of bytes.
                     let total = *n as u64 * self.shape_stride(inner, cache)?;
                     let mut buf = vec![0u8; total as usize];
                     data.get_into(off, &mut buf)?;
@@ -2744,8 +2861,9 @@ fn swap_error(msg: impl std::fmt::Display) -> io::Error {
 fn move_unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "[BSTACK0811] RTTI move_out of a reference array whose element is an embedded / foreign / \
-         nested-array shape is not yet supported",
+        "[BSTACK0811] RTTI move_out of an array whose element is a vector (or other \
+         reference-bearing container that is neither a flat reference, an `#[embed]`, nor a \
+         nested array) is not yet supported",
     )
 }
 
@@ -2790,8 +2908,8 @@ fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
 
 fn clone_unsupported() -> io::Error {
     io::Error::new(
-        io::ErrorKind::Unsupported,
-        "[BSTACK080F] RTTI clone of a `foreign` reference is not yet supported (cross-file copy)",
+        io::ErrorKind::NotFound,
+        "[BSTACK080F] RTTI clone: the foreign target names an invalid file id",
     )
 }
 

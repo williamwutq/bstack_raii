@@ -10,7 +10,8 @@ use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::registry::{self, FileId};
 use bstack_raii::rtti::{self, AnyRef, ForeignKind, ForeignPtr, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
-    BStackBlock, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr, bstack_class, rtti_path,
+    BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr,
+    bstack_class, rtti_path,
 };
 
 #[bstack_class]
@@ -153,6 +154,43 @@ struct FTup {
 #[bstack_class]
 struct PTup {
     pair: (u16, u8),
+    n: u32,
+}
+
+// Complex enum-variant payloads (in-file): a POD vector, an owned vector, an owned
+// fixed array.
+#[bstack_class]
+enum CEnum {
+    Empty,
+    Tags(Vec<u32>),
+    #[bstack_owned]
+    Kids(Vec<Point>),
+    #[bstack_owned]
+    Row([Point; 2]),
+}
+
+// Enum variants holding foreign containers.
+#[bstack_class]
+enum FEnum {
+    Empty,
+    #[bstack_owned]
+    Many(Vec<Foreign<Point>>),
+    #[bstack_owned]
+    Duo([Foreign<Point>; 2]),
+}
+
+// An array of embedded children; a nested owned reference array.
+#[bstack_class]
+struct EmbArr {
+    #[embed]
+    kids: [Point; 2],
+    n: u32,
+}
+
+#[bstack_class]
+struct NestArr {
+    #[bstack_owned]
+    grid: [[Point; 2]; 2],
     n: u32,
 }
 
@@ -1875,6 +1913,394 @@ fn interpret_foreign_tuple_across_files() {
         after <= base,
         "foreign tuple target not reclaimed by teardown: {after} > {base}"
     );
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn bstack_class_complex_enum_variant_shapes() {
+    // Complex variant payloads lower to the right container shapes (in-file + foreign).
+    let path = temp_path("cev_schema");
+    let reg = rtti::sync(&path).unwrap();
+    let pt = <Point as BStackCast>::eightcc();
+
+    let ce = reg
+        .load_type(reg.ordinal_of(<CEnum as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Enum(e) = &ce.body else {
+        panic!("CEnum enum");
+    };
+    let cv = |n: &str| e.variants.iter().find(|v| v.name == n).unwrap();
+    assert!(cv("Empty").fields.is_empty());
+    assert_eq!(
+        cv("Tags").fields[0].shape,
+        Shape::Vec(Box::new(Shape::Pod { width: 4 }))
+    );
+    assert_eq!(
+        cv("Kids").fields[0].shape,
+        Shape::Vec(Box::new(Shape::Owned(pt)))
+    );
+    assert_eq!(
+        cv("Row").fields[0].shape,
+        Shape::Array {
+            n: 2,
+            inner: Box::new(Shape::Owned(pt)),
+        }
+    );
+
+    let fe = reg
+        .load_type(reg.ordinal_of(<FEnum as BStackCast>::eightcc()).unwrap())
+        .unwrap();
+    let RttiBody::Enum(e2) = &fe.body else {
+        panic!("FEnum enum");
+    };
+    let fv = |n: &str| e2.variants.iter().find(|v| v.name == n).unwrap();
+    let f = Shape::Foreign {
+        tag: pt,
+        kind: ForeignKind::Owned,
+    };
+    assert_eq!(fv("Many").fields[0].shape, Shape::Vec(Box::new(f.clone())));
+    assert_eq!(
+        fv("Duo").fields[0].shape,
+        Shape::Array {
+            n: 2,
+            inner: Box::new(f),
+        }
+    );
+
+    drop(reg);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn interpret_enum_owned_vec_variant() {
+    // An `#[bstack_owned] V(Vec<Point>)` variant: read yields the enum + its owned
+    // vector of child blocks; teardown reclaims the whole variant (leak oracle).
+    let schema = temp_path("eov_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<CEnum as BStackCast>::eightcc()).unwrap();
+    let (alloc, dpath) = data_alloc("eov_data");
+
+    let e = CEnum::new(
+        &alloc,
+        CEnumData::Kids(
+            BStackBlockVec::from_handles(
+                &alloc,
+                vec![
+                    Point::new(&alloc, 1, 2).unwrap(),
+                    Point::new(&alloc, 3, 4).unwrap(),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let off = BStackBlock::range(e.handle()).start();
+
+    let Value::Enum {
+        variant, fields, ..
+    } = reg.read_value(alloc.stack(), ord, off).unwrap()
+    else {
+        panic!("enum");
+    };
+    assert_eq!(variant, "Kids");
+    let Value::Vec(items) = &fields[0].1 else {
+        panic!("owned vec payload");
+    };
+    assert_eq!(items.len(), 2);
+    assert!(matches!(&items[0], Value::Block { .. }));
+    reg.teardown(&alloc, ord, off).unwrap();
+
+    // Full build+teardown cycle returns to baseline.
+    let cycle = || {
+        let e = CEnum::new(
+            &alloc,
+            CEnumData::Kids(
+                BStackBlockVec::from_handles(
+                    &alloc,
+                    vec![
+                        Point::new(&alloc, 5, 6).unwrap(),
+                        Point::new(&alloc, 7, 8).unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let o = BStackBlock::range(e.handle()).start();
+        reg.teardown(&alloc, ord, o).unwrap();
+    };
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "owned-vec enum variant teardown leaked"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_enum_foreign_vec_variant_across_files() {
+    // An `#[bstack_owned] V(Vec<Foreign<Point>>)` variant: teardown frees every element
+    // target in the foreign file.
+    let schema = temp_path("efv_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FEnum as BStackCast>::eightcc()).unwrap();
+
+    let (home, hpath) = data_alloc("efv_home");
+    let (foreign, fpath) = data_alloc("efv_foreign");
+
+    let base = foreign.stack().len().unwrap();
+    let mut offs = Vec::new();
+    for i in 0..3u32 {
+        let p = Point::new(&foreign, 10 + i, 20 + i).unwrap();
+        offs.push(BStackBlock::range(p.handle()).start());
+    }
+
+    let reg_file = temp_path("efv_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let links: Vec<Foreign<Point>> = offs
+        .iter()
+        .map(|&o| unsafe { Foreign::<Point>::new(fid, o) })
+        .collect();
+    let e = FEnum::new(&home, FEnumData::Many(links)).unwrap();
+    let off = BStackBlock::range(e.handle()).start();
+
+    reg.teardown(&home, ord, off).unwrap();
+    let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
+    assert!(
+        after <= base,
+        "foreign-vec enum variant targets not reclaimed: {after} > {base}"
+    );
+
+    registry::detach(fid);
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&hpath).ok();
+    std::fs::remove_file(&fpath).ok();
+    std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn interpret_move_out_embed_array() {
+    // `#[embed] [Point; 2]`: move_out materializes each embedded child into a fresh
+    // standalone block and hands them back as a `Moved::List`.
+    let schema = temp_path("mea_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<EmbArr as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+    let ptag = <Point as BStackCast>::eightcc();
+    let (alloc, dpath) = data_alloc("mea_data");
+
+    let e = EmbArr::new(
+        &alloc,
+        [
+            Point::new(&alloc, 1, 2).unwrap(),
+            Point::new(&alloc, 3, 4).unwrap(),
+        ],
+        9,
+    )
+    .unwrap();
+    let off = BStackBlock::range(e.handle()).start();
+
+    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let Moved::List(kids) = &moved["kids"] else {
+        panic!("embed array should move as a List, got {:?}", moved["kids"]);
+    };
+    assert_eq!(kids.len(), 2);
+    for (i, slot) in kids.iter().enumerate() {
+        let a = slot.expect("materialized embed is never null");
+        assert_eq!(a.tag(), ptag);
+        let Value::Block { fields, .. } = reg.read_value(alloc.stack(), pord, a.offset()).unwrap()
+        else {
+            panic!("materialized point block");
+        };
+        assert_eq!(fields[0].1, pod(&((2 * i as u32) + 1).to_le_bytes()));
+    }
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_move_out_nested_array() {
+    // `#[bstack_owned] [[Point; 2]; 2]`: move_out hands back a `Moved::Array` of inner
+    // `Moved::List`s (the child blocks survive the freed shell).
+    let schema = temp_path("mna_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<NestArr as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+    let (alloc, dpath) = data_alloc("mna_data");
+
+    let e = NestArr::new(
+        &alloc,
+        [
+            [
+                Point::new(&alloc, 1, 0).unwrap(),
+                Point::new(&alloc, 2, 0).unwrap(),
+            ],
+            [
+                Point::new(&alloc, 3, 0).unwrap(),
+                Point::new(&alloc, 4, 0).unwrap(),
+            ],
+        ],
+        9,
+    )
+    .unwrap();
+    let off = BStackBlock::range(e.handle()).start();
+
+    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let Moved::Array(rows) = &moved["grid"] else {
+        panic!(
+            "nested array should move as an Array, got {:?}",
+            moved["grid"]
+        );
+    };
+    assert_eq!(rows.len(), 2);
+    let mut expect = 1u32;
+    for row in rows {
+        let Moved::List(cells) = row else {
+            panic!("inner row should move as a List");
+        };
+        assert_eq!(cells.len(), 2);
+        for slot in cells {
+            let a = slot.expect("owned element is non-null");
+            let Value::Block { fields, .. } =
+                reg.read_value(alloc.stack(), pord, a.offset()).unwrap()
+            else {
+                panic!("point block");
+            };
+            assert_eq!(fields[0].1, pod(&expect.to_le_bytes()));
+            expect += 1;
+        }
+    }
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_swap_weak() {
+    // `swap` on a `weak` path exchanges the control-block pointer (no refcount change),
+    // returning the old control `AnyRef`.
+    let schema = temp_path("swpw_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg
+        .ordinal_of(<WeakHolder as BStackCast>::eightcc())
+        .unwrap();
+    let wtag = <WCell as BStackCast>::eightcc();
+    let (alloc, dpath) = data_alloc("swpw_data");
+
+    let cell1 = WCell::new(&alloc, 1).unwrap();
+    let cell2 = WCell::new(&alloc, 2).unwrap();
+    let h1 = WeakHolder::new(&alloc, 7).unwrap();
+    h1.handle()
+        .set_w(&alloc, cell1.downgrade().unwrap())
+        .unwrap();
+    let off1 = BStackBlock::range(h1.handle()).start();
+    let h2 = WeakHolder::new(&alloc, 8).unwrap();
+    h2.handle()
+        .set_w(&alloc, cell2.downgrade().unwrap())
+        .unwrap();
+    let off2 = BStackBlock::range(h2.handle()).start();
+
+    let ctrl = |off: u64| match reg.get(alloc.stack(), ord, off, rtti_path!(w)).unwrap() {
+        Value::Ref { offset, .. } => offset,
+        v => panic!("weak get: {v:?}"),
+    };
+    let c1 = ctrl(off1);
+    let c2 = ctrl(off2);
+    assert_ne!(c1, c2);
+
+    let old = reg
+        .swap(
+            alloc.stack(),
+            ord,
+            off1,
+            rtti_path!(w),
+            AnyRef::new(wtag, c2),
+        )
+        .unwrap();
+    assert_eq!(old, Some(AnyRef::new(wtag, c1)));
+    assert_eq!(ctrl(off1), c2, "weak now points at cell2's control");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_swap_foreign_across_files() {
+    // `swap_foreign` on an owned `Foreign` path exchanges the 16-byte pointer, returning
+    // the old cross-file target (which the caller now owns) — a purely local rewrite.
+    let schema = temp_path("swpf_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FModel as BStackCast>::eightcc()).unwrap();
+    let ptag = <Point as BStackCast>::eightcc();
+
+    let (home, hpath) = data_alloc("swpf_home");
+    let (foreign, fpath) = data_alloc("swpf_foreign");
+
+    let p1 = Point::new(&foreign, 1, 2).unwrap();
+    let o1 = BStackBlock::range(p1.handle()).start();
+    let p2 = Point::new(&foreign, 3, 4).unwrap();
+    let o2 = BStackBlock::range(p2.handle()).start();
+
+    let reg_file = temp_path("swpf_reg");
+    let _ = registry::init(&reg_file);
+    let fid = registry::attach(&fpath, foreign).unwrap();
+
+    let hp = Point::new(&home, 9, 9).unwrap();
+    let fm = FModel::new(
+        &home,
+        unsafe { Foreign::<Point>::new(fid, o1) },
+        Foreign::at(FileId::SELF, hp.handle()),
+        7,
+    )
+    .unwrap();
+    let off = BStackBlock::range(fm.handle()).start();
+
+    let new = ForeignPtr {
+        tag: ptag,
+        kind: ForeignKind::Owned,
+        file_id: fid.get() as u64,
+        offset: o2,
+    };
+    let old = reg
+        .swap_foreign(home.stack(), ord, off, rtti_path!(owned_f), new)
+        .unwrap();
+    assert_eq!(
+        old,
+        Some(ForeignPtr {
+            tag: ptag,
+            kind: ForeignKind::Owned,
+            file_id: fid.get() as u64,
+            offset: o1,
+        })
+    );
+
+    // owned_f now points at o2.
+    let Value::Foreign { offset, .. } = reg
+        .get(home.stack(), ord, off, rtti_path!(owned_f))
+        .unwrap()
+    else {
+        panic!("foreign");
+    };
+    assert_eq!(offset, o2);
 
     registry::detach(fid);
     drop(reg);

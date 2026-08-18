@@ -29,10 +29,12 @@
 //!
 //! ## Not yet covered
 //!
-//! A scalar `Foreign<T>` / `Option<Foreign<T>>` is emitted as a `Shape::Foreign`
-//! carrying the target tag + ownership kind. Generics, tuple struct-fields, `Foreign`
-//! inside a container, and complex enum variant payloads (vec / array / foreign /
-//! tuple) are clear compile errors rather than a wrong descriptor.
+//! Only a **generic** `#[bstack_class]` is refused — a clear `[BSTACK0408]` compile
+//! error, never a wrong descriptor — because RTTI needs one concrete `XOnDisk` layout
+//! to `size_of` / `offset_of!`. Every non-generic shape is describable: `Foreign`
+//! (scalar, `Option`, in a `Vec` / array / tuple — each a `Shape::Foreign` carrying
+//! the target tag + ownership kind), POD and foreign tuples, class variables, and all
+//! struct-field and enum-variant shapes (including complex variant payloads).
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -229,11 +231,32 @@ fn enum_variant(variant: &syn::Variant, value: i128) -> syn::Result<TokenStream>
     let disc = value as i64;
     let kind = classify_attrs(&variant.attrs)?;
 
-    let fields: Vec<TokenStream> = match &variant.fields {
-        Fields::Unit => Vec::new(),
-        _ if kind == Kind::Pod => {
-            // POD aggregate: fields packed at cumulative `size_of` byte offsets,
-            // declaration order, unaligned (see `emit::pod_aggregate_variant`).
+    let fields: Vec<TokenStream> = match variant.fields.len() {
+        0 => Vec::new(),
+        1 => {
+            // A single-field variant — annotated (`#[owned] V(T)`) or a bare
+            // POD / `Vec` / array / tuple (`V(u32)`, `V(Vec<u32>)`, `V([u8; 4])`) — is
+            // one field at payload offset 0, described by `field_shape` (the same
+            // struct-field lowering: scalar reference, `Foreign`, container, `Option`).
+            let f = variant.fields.iter().next().unwrap();
+            let fname = f
+                .ident
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let shape = field_shape(&fname, f, &f.ty, kind)?;
+            vec![quote! {
+                ::bstack_raii::rtti::RttiField {
+                    name: ::std::string::String::from(#fname),
+                    offset: 0u32,
+                    shape: #shape,
+                }
+            }]
+        }
+        _ => {
+            // A multi-field POD aggregate (`V(A, B)` / `V { x, y }`): fields packed at
+            // cumulative `size_of` byte offsets, declaration order (unaligned — see
+            // `emit::pod_aggregate_variant`).
             let mut preceding: Vec<&Type> = Vec::new();
             let mut out = Vec::with_capacity(variant.fields.len());
             for (i, f) in variant.fields.iter().enumerate() {
@@ -263,48 +286,6 @@ fn enum_variant(variant: &syn::Variant, value: i128) -> syn::Result<TokenStream>
                 preceding.push(ty);
             }
             out
-        }
-        _ => {
-            // A reference-kind variant is a single-field tuple stored as one `u64`
-            // offset (or an embedded child) at payload offset 0.
-            let f = variant
-                .fields
-                .iter()
-                .next()
-                .expect("an annotated variant has exactly one field");
-            let ty = &f.ty;
-            let (inner, nullable) = match option_inner(ty) {
-                Some(i) => (i, true),
-                None => (ty, false),
-            };
-            if vec_info(inner).is_some()
-                || matches!(inner, Type::Array(_) | Type::Tuple(_))
-                || field_foreign_target(inner).is_some()
-            {
-                return Err(Error::new_spanned(
-                    ty,
-                    format!(
-                        "[BSTACK0206] variant `{vname}`: a vec / array / foreign / tuple payload \
-                         is not yet supported by #[bstack_class]"
-                    ),
-                ));
-            }
-            let variant_ident = kind_variant(kind).expect("reference kind");
-            let base = quote!(::bstack_raii::rtti::Shape::#variant_ident(
-                <#inner as ::bstack_raii::BStackCast>::eightcc()
-            ));
-            let shape = if nullable {
-                quote!(::bstack_raii::rtti::Shape::Option(::std::boxed::Box::new(#base)))
-            } else {
-                base
-            };
-            vec![quote! {
-                ::bstack_raii::rtti::RttiField {
-                    name: ::std::string::String::from("0"),
-                    offset: 0u32,
-                    shape: #shape,
-                }
-            }]
         }
     };
 
@@ -540,7 +521,9 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
             };
             elems.push(es);
         }
-        return Ok(quote!(::bstack_raii::rtti::Shape::Tuple(::std::vec![#(#elems),*])));
+        return Ok(quote!(::bstack_raii::rtti::Shape::Tuple(
+            ::std::vec![#(#elems),*]
+        )));
     }
     Ok(match kind {
         Kind::Pod => quote!(::bstack_raii::rtti::Shape::Pod {
