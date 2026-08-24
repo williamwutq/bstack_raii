@@ -50,7 +50,8 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::replace::{ReplaceError, finish_handback};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackBTreeMap`]: header, root node pointer (`0` =
 /// empty), and entry count. Non-generic.
@@ -72,6 +73,20 @@ const TREE_SIZE: u64 = size_of::<TreeOnDisk>() as u64;
 /// Minimum degree: a node holds `T-1..=2T-1` keys (the root may hold fewer).
 const T: usize = 8;
 const MAXKEYS: usize = 2 * T - 1; // 15
+
+/// Structural depth bound for every descent. A `T = 8` B-tree cannot exceed
+/// ~22 levels even at `u64::MAX` entries, so a deeper chain of child pointers
+/// is corruption (or a cycle) and must fail as `InvalidData` — not spin, grow
+/// a frame stack without bound, or overflow the native stack in the recursive
+/// walks.
+const MAX_TREE_DEPTH: u32 = 64;
+
+fn depth_exceeded() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "B-tree deeper than the structural bound (corrupt child pointer or a cycle?)",
+    )
+}
 const MAXCHILDREN: usize = 2 * T; // 16
 
 // Node field offsets (keys/vals/children arrays follow, sized by `K`).
@@ -164,7 +179,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         size_of::<<V as BStackBlock>::OnDisk>() as u64
     }
     fn value_at(off: u64) -> V {
-        <V as BStackBlock>::from_range(BStackRange::new(off, Self::value_size()))
+        unsafe { <V as BStackBlock>::from_range(BStackRange::new(off, Self::value_size())) }
     }
 
     fn read_key(bytes: &[u8]) -> K {
@@ -201,6 +216,16 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         let mut b = vec![0u8; Self::node_size() as usize];
         stack.get_into(off, &mut b)?;
         let nkeys = get_u64(&b[NKEYS_OFF..]) as usize;
+        // `nkeys` is an on-disk field read straight from the node image; a
+        // corrupted value indexes `b` (a fixed `node_size()`-byte buffer) past
+        // its end, panicking on a plain `get`/`contains` read. No real node
+        // (built by this crate) ever exceeds `MAXKEYS`.
+        if nkeys > MAXKEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt B-tree node: key count exceeds capacity",
+            ));
+        }
         let leaf = get_u64(&b[LEAF_OFF..]) != 0;
         let ksize = Self::ksize();
         let vals_off = Self::vals_off();
@@ -327,93 +352,104 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         allocator: &A,
         key: K,
         value: BStackOwned<V>,
-    ) -> io::Result<Option<BStackOwned<V>>> {
+    ) -> Result<Option<BStackOwned<V>>, ReplaceError<BStackOwned<V>>> {
         let handle = self.range.start();
         let stack = allocator.stack();
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
-        let val_ref = value.into_inner().range().start();
+        // Guard the value block: on failure [`finish_handback`] returns it to the
+        // caller rather than freeing it, defused once the tree
+        // commit succeeds.
+        let value = value.auto(allocator);
+        let val_ref = value.range().start();
 
-        let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
+        let outcome: io::Result<Option<BStackOwned<V>>> = (|| {
+            let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
 
-        let mut build = Build {
-            allocator,
-            node_size: Self::node_size(),
-            ksize: Self::ksize(),
-            vals_off: Self::vals_off(),
-            children_off: Self::children_off(),
-            writes: Vec::new(),
-            freed: Vec::new(),
-        };
-
-        let built: io::Result<(u64, bool, Option<u64>)> = (|| {
-            if root == 0 {
-                // Empty tree: a single-entry leaf becomes the root.
-                let leaf = BNode {
-                    leaf: true,
-                    keys: vec![key_bytes.clone()],
-                    vals: vec![val_ref],
-                    children: Vec::new(),
-                };
-                let new_root = build.emit(&leaf)?;
-                return Ok((new_root, true, None));
-            }
-            let (new_root0, split, added, old) =
-                Self::insert_rec(&mut build, stack, root, &key, &key_bytes, val_ref)?;
-            let new_root = if let Some(s) = split {
-                // Root split: a fresh root holds the median over the two halves.
-                let root_node = BNode {
-                    leaf: false,
-                    keys: vec![s.key],
-                    vals: vec![s.val],
-                    children: vec![new_root0, s.right],
-                };
-                build.emit(&root_node)?
-            } else {
-                new_root0
+            let mut build = Build {
+                allocator,
+                node_size: Self::node_size(),
+                ksize: Self::ksize(),
+                vals_off: Self::vals_off(),
+                children_off: Self::children_off(),
+                writes: Vec::new(),
+                freed: Vec::new(),
             };
-            Ok((new_root, added, old))
-        })();
 
-        match built {
-            Ok((new_root, added, old)) => {
-                let new_node_offs: Vec<u64> = build.writes.iter().map(|(o, _)| *o).collect();
-                let mut writes = core::mem::take(&mut build.writes);
-                writes.push(w8(handle + ROOT_OFF, new_root));
-                if added {
-                    writes.push(w8(handle + LEN_OFF, len + 1));
-                }
-                match stack.set_batched(writes) {
-                    Ok(()) => {
-                        // Free the old path nodes (leak-only on crash).
-                        for off in &build.freed {
-                            // SAFETY: replaced by the copy just committed; nothing
-                            // else references it (single-writer).
-                            let _ = unsafe {
-                                dealloc_range(allocator, BStackRange::new(*off, build.node_size))
-                            };
-                        }
-                        Ok(old.map(|o| unsafe { BStackOwned::from_raw(Self::value_at(o)) }))
-                    }
-                    Err(e) => {
-                        // Nothing committed: reclaim the new nodes we allocated.
-                        for off in new_node_offs {
-                            let _ = unsafe {
-                                dealloc_range(allocator, BStackRange::new(off, build.node_size))
-                            };
-                        }
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => {
-                for (off, _) in &build.writes {
-                    let _ = unsafe {
-                        dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+            let built: io::Result<(u64, bool, Option<u64>)> = (|| {
+                if root == 0 {
+                    // Empty tree: a single-entry leaf becomes the root.
+                    let leaf = BNode {
+                        leaf: true,
+                        keys: vec![key_bytes.clone()],
+                        vals: vec![val_ref],
+                        children: Vec::new(),
                     };
+                    let new_root = build.emit(&leaf)?;
+                    return Ok((new_root, true, None));
                 }
-                Err(e)
+                let (new_root0, split, added, old) =
+                    Self::insert_rec(&mut build, stack, root, &key, &key_bytes, val_ref)?;
+                let new_root = if let Some(s) = split {
+                    // Root split: a fresh root holds the median over the two halves.
+                    let root_node = BNode {
+                        leaf: false,
+                        keys: vec![s.key],
+                        vals: vec![s.val],
+                        children: vec![new_root0, s.right],
+                    };
+                    build.emit(&root_node)?
+                } else {
+                    new_root0
+                };
+                Ok((new_root, added, old))
+            })();
+
+            match built {
+                Ok((new_root, added, old)) => {
+                    let new_node_offs: Vec<u64> = build.writes.iter().map(|(o, _)| *o).collect();
+                    let mut writes = core::mem::take(&mut build.writes);
+                    writes.push(w8(handle + ROOT_OFF, new_root));
+                    if added {
+                        writes.push(w8(handle + LEN_OFF, len + 1));
+                    }
+                    match stack.set_batched(writes) {
+                        Ok(()) => {
+                            // Committed: the value is linked into the tree.
+                            // Free the old path nodes (leak-only on crash).
+                            for off in &build.freed {
+                                // SAFETY: replaced by the copy just committed; nothing
+                                // else references it (single-writer).
+                                let _ = unsafe {
+                                    dealloc_range(
+                                        allocator,
+                                        BStackRange::new(*off, build.node_size),
+                                    )
+                                };
+                            }
+                            Ok(old.map(|o| unsafe { BStackOwned::from_raw(Self::value_at(o)) }))
+                        }
+                        Err(e) => {
+                            // Nothing committed: reclaim the new nodes we allocated.
+                            for off in new_node_offs {
+                                let _ = unsafe {
+                                    dealloc_range(allocator, BStackRange::new(off, build.node_size))
+                                };
+                            }
+                            Err(e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    for (off, _) in &build.writes {
+                        let _ = unsafe {
+                            dealloc_range(allocator, BStackRange::new(*off, build.node_size))
+                        };
+                    }
+                    Err(e)
+                }
             }
-        }
+        })();
+        finish_handback(value, outcome)
     }
 
     /// A **borrowed** handle to the value mapped by `key` (no ownership), or
@@ -427,10 +463,21 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         // typical key sizes — see `Scratch`).
         let mut scratch = Scratch::new();
         let node_size = Self::node_size() as usize;
+        let mut depth = 0u32;
         while off != 0 {
+            depth += 1;
+            if depth > MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let buf = scratch.buf(node_size);
             stack.get_into(off, buf)?;
             let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
+            if nkeys > MAXKEYS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupt B-tree node: key count exceeds capacity",
+                ));
+            }
             let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
             let mut i = nkeys;
             let mut exact = false;
@@ -482,7 +529,10 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         }
         let value = f()?;
         let vref = value.handle().range().start();
-        if let Some(old) = self.insert(allocator, key, value)? {
+        if let Some(old) = self
+            .insert(allocator, key, value)
+            .map_err(|e| e.discard_freeing(allocator))?
+        {
             old.bstack_drop(allocator)?;
         }
         Ok((Self::value_at(vref), true))
@@ -501,19 +551,33 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             return Ok((v, false));
         }
         let vref = default.handle().range().start();
-        if let Some(old) = self.insert(allocator, key, default)? {
+        if let Some(old) = self
+            .insert(allocator, key, default)
+            .map_err(|e| e.discard_freeing(allocator))?
+        {
             old.bstack_drop(allocator)?;
         }
         Ok((Self::value_at(vref), true))
     }
 
     /// The number of keys in the node at `off` (reads just the count field).
+    /// `off` comes from a parent node's on-disk `children` array — untrusted.
     fn child_nkeys(stack: &BStack, off: u64) -> io::Result<usize> {
-        Ok(get_u64(&{
+        let pos = off.checked_add(NKEYS_OFF as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "corrupt B-tree child offset")
+        })?;
+        let nkeys = get_u64(&{
             let mut b = [0u8; 8];
-            stack.get_into(off + NKEYS_OFF as u64, &mut b)?;
+            stack.get_into(pos, &mut b)?;
             b
-        }) as usize)
+        }) as usize;
+        if nkeys > MAXKEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt B-tree node: key count exceeds capacity",
+            ));
+        }
+        Ok(nkeys)
     }
 
     /// The rightmost (largest) `(key_bytes, value)` in the subtree at `off`.
@@ -847,10 +911,13 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     /// error surfaces per step. Do not mutate the tree's *structure* while
     /// iterating (mutating a yielded value block is fine).
     pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<BTreeMapIter<'a, K, V>> {
-        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let [root, len] = read_fields::<2>(stack, self.range.start() + ROOT_OFF)?;
         let frames = Self::descend_left(stack, root)?;
         Ok(BTreeMapIter {
             stack,
+            block_off: self.range.start(),
+            root0: root,
+            len0: len,
             frames,
             hi: None,
             _marker: PhantomData,
@@ -859,10 +926,13 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
 
     /// A lazy in-order iterator over the entries with `lo <= key <= hi`, ascending.
     pub fn range<'a>(&self, stack: &'a BStack, lo: K, hi: K) -> io::Result<BTreeMapIter<'a, K, V>> {
-        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let [root, len] = read_fields::<2>(stack, self.range.start() + ROOT_OFF)?;
         let frames = Self::seek(stack, root, &lo)?;
         Ok(BTreeMapIter {
             stack,
+            block_off: self.range.start(),
+            root0: root,
+            len0: len,
             frames,
             hi: Some(hi),
             _marker: PhantomData,
@@ -874,6 +944,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     fn descend_left(stack: &BStack, mut cur: u64) -> io::Result<Vec<(BNode, usize)>> {
         let mut frames = Vec::new();
         while cur != 0 {
+            if frames.len() as u32 >= MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let n = Self::read_node(stack, cur)?;
             let next = if n.leaf { 0 } else { n.children[0] };
             let leaf = n.leaf;
@@ -890,6 +963,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     fn seek(stack: &BStack, mut cur: u64, lo: &K) -> io::Result<Vec<(BNode, usize)>> {
         let mut frames = Vec::new();
         while cur != 0 {
+            if frames.len() as u32 >= MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let n = Self::read_node(stack, cur)?;
             let (i, exact) = Self::search(&n, lo);
             // Descend into child[i] only when it may hold keys `>= lo` — i.e. an
@@ -909,25 +985,23 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         Ok(frames)
     }
 
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the tree was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
-    }
-
     /// Recursively free the subtree at `off` (values then nodes).
     fn drop_subtree<A: BStackRaiiAllocator>(
         stack: &BStack,
         off: u64,
         allocator: &A,
+        depth: u32,
     ) -> io::Result<()> {
         if off == 0 {
             return Ok(());
         }
+        if depth >= MAX_TREE_DEPTH {
+            return Err(depth_exceeded());
+        }
         let nb = Self::read_node(stack, off)?;
         if !nb.leaf {
             for &c in &nb.children {
-                Self::drop_subtree(stack, c, allocator)?;
+                Self::drop_subtree(stack, c, allocator, depth + 1)?;
             }
         }
         for &v in &nb.vals {
@@ -949,13 +1023,23 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         off: u64,
         allocator: &A,
         plan: &mut ClonePlan,
+        depth: u32,
     ) -> io::Result<u64> {
         if off == 0 {
             return Ok(0);
         }
+        if depth >= MAX_TREE_DEPTH {
+            return Err(depth_exceeded());
+        }
         let mut buf = vec![0u8; Self::node_size() as usize];
         stack.get_into(off, &mut buf)?;
         let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
+        if nkeys > MAXKEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt B-tree node: key count exceeds capacity",
+            ));
+        }
         let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
         let vals_off = Self::vals_off();
         let children_off = Self::children_off();
@@ -974,7 +1058,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             for i in 0..=nkeys {
                 let co = children_off + i * 8;
                 let child = get_u64(&buf[co..]);
-                let new_child = Self::clone_subtree(stack, child, allocator, plan)?;
+                let new_child = Self::clone_subtree(stack, child, allocator, plan, depth + 1)?;
                 buf[co..co + 8].copy_from_slice(&new_child.to_le_bytes());
             }
         }
@@ -999,7 +1083,7 @@ impl<K: Pod + Ord, V: BStackBlock> crate::block::BStackEmbeddable for BStackBTre
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     type OnDisk = TreeOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackBTreeMap {
             range,
             _marker: PhantomData,
@@ -1017,7 +1101,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
         allocator: &A,
     ) -> io::Result<()> {
         let root = read_u64(allocator.stack(), range.start() + ROOT_OFF)?;
-        Self::drop_subtree(allocator.stack(), root, allocator)
+        Self::drop_subtree(allocator.stack(), root, allocator, 0)
     }
 
     /// Deep-clone the whole tree into `plan`: every node copied, every value
@@ -1030,7 +1114,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     ) -> io::Result<Self::OnDisk> {
         let handle = self.range.start();
         let [root, len] = read_fields::<2>(allocator.stack(), handle + ROOT_OFF)?;
-        let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan)?;
+        let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan, 0)?;
 
         let od = TreeOnDisk {
             header: BlockHeader {
@@ -1041,14 +1125,6 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
             len,
         };
         Ok(od)
-    }
-}
-
-impl<K: Pod + Ord, V: BStackBlock> BStackDrop for BStackBTreeMap<K, V> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 
@@ -1078,6 +1154,11 @@ impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBTreeMap<K, V> {
 /// generalized to a B-tree.
 pub struct BTreeMapIter<'a, K: Pod + Ord, V: BStackBlock> {
     stack: &'a BStack,
+    /// The tree handle block, re-read each step to detect mutation.
+    block_off: u64,
+    /// The `(root, len)` at construction — a change means it was mutated.
+    root0: u64,
+    len0: u64,
     frames: Vec<(BNode, usize)>,
     hi: Option<K>,
     _marker: PhantomData<fn() -> (K, V)>,
@@ -1087,6 +1168,27 @@ impl<'a, K: Pod + Ord, V: BStackBlock> Iterator for BTreeMapIter<'a, K, V> {
     type Item = io::Result<(K, V)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Fail fast if the tree was mutated during iteration: a path-copying
+        // insert (or a remove) frees the old path and swaps the root, so the cached
+        // `frames` name freed nodes. A changed `(root, len)` means the snapshot is
+        // stale — a clean error instead of decoding freed storage.
+        if !self.frames.is_empty() {
+            match read_fields::<2>(self.stack, self.block_off + ROOT_OFF) {
+                Ok([root, len]) if root == self.root0 && len == self.len0 => {}
+                Ok(_) => {
+                    self.frames.clear();
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "BStackBTreeMap was mutated during iteration (its root changed); \
+                         the iterator is invalidated",
+                    )));
+                }
+                Err(e) => {
+                    self.frames.clear();
+                    return Some(Err(e));
+                }
+            }
+        }
         loop {
             let (node, i) = self.frames.last()?;
             let i = *i;

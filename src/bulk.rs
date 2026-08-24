@@ -23,12 +23,79 @@
 //! * the *set* is not — a crash mid-sequence orphans the blocks done so far (a
 //!   leak, never a torn structure), which the WAL layer reclaims.
 
+use std::error::Error;
+use std::fmt;
 use std::io;
 
 use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
 use crate::teardown::dealloc_range;
+
+/// The error a partial [`free_many`](BStackRaiiAllocator::free_many) returns: the
+/// first underlying failure, plus **every range whose free did not cleanly
+/// complete**.
+///
+/// The sequential fallback frees every range it can and collects the ones whose
+/// `dealloc` returned an error, rather than stopping at the first error and
+/// leaving an unknown suffix allocated. [`unfreed`](Self::unfreed)
+/// is a **superset** of the ranges still allocated: every range genuinely still
+/// live is named (so the caller never silently leaks one), but a single
+/// `dealloc` is not atomic against a mid-operation I/O fault, so a named range
+/// may in fact have been reclaimed before a follow-up step failed. Treat the set
+/// as "needs checking": account for these ranges, and verify liveness before
+/// re-freeing (a blind retry of the whole set could double-free a
+/// freed-but-reported one).
+///
+/// It is wrapped in the returned [`io::Error`] as the source, so a caller that
+/// only propagates keeps the plain error and a caller that wants to recover
+/// downcasts:
+///
+/// ```ignore
+/// if let Some(fme) = err.get_ref().and_then(|e| e.downcast_ref::<FreeManyError>()) {
+///     for r in fme.unfreed() { /* retry / account for r */ }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct FreeManyError {
+    source: io::Error,
+    unfreed: Vec<BStackRange>,
+}
+
+impl FreeManyError {
+    /// Build from the first underlying error and the ranges left unfreed.
+    pub(crate) fn from_parts(source: io::Error, unfreed: Vec<BStackRange>) -> Self {
+        Self { source, unfreed }
+    }
+
+    /// The ranges that were **not** freed and are still allocated.
+    pub fn unfreed(&self) -> &[BStackRange] {
+        &self.unfreed
+    }
+}
+
+impl fmt::Display for FreeManyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "free_many freed all it could; {} range(s) left unfreed: {}",
+            self.unfreed.len(),
+            self.source
+        )
+    }
+}
+
+impl Error for FreeManyError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<FreeManyError> for io::Error {
+    fn from(e: FreeManyError) -> io::Error {
+        io::Error::new(e.source.kind(), e)
+    }
+}
 
 /// Sequential fallback for [`BStackRaiiAllocator::alloc_many`]: allocate one block
 /// per entry in `sizes`, in order. On any failure the blocks already allocated are
@@ -55,15 +122,28 @@ pub(crate) fn seq_alloc_many<A: BStackRaiiAllocator>(
 }
 
 /// Sequential fallback for [`BStackRaiiAllocator::free_many`]: free every range in
-/// turn. Stops and propagates on the first error (the remaining ranges are left
-/// allocated for the caller to handle).
+/// turn, **continuing past a failure** and collecting the ranges it could not
+/// free rather than stopping at the first error. On any failure
+/// it returns a [`FreeManyError`] (wrapped in the [`io::Error`]) naming every
+/// unfreed range, so the caller can retry exactly those without double-freeing
+/// the ones already reclaimed.
 pub(crate) fn seq_free_many<A: BStackRaiiAllocator>(
     allocator: &A,
     ranges: impl IntoIterator<Item = BStackRange>,
 ) -> io::Result<()> {
+    let mut first_err: Option<io::Error> = None;
+    let mut unfreed: Vec<BStackRange> = Vec::new();
     for r in ranges {
         // SAFETY: the caller's contract, as for `dealloc_range`.
-        unsafe { dealloc_range(allocator, r)? };
+        if let Err(e) = unsafe { dealloc_range(allocator, r) } {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+            unfreed.push(r);
+        }
     }
-    Ok(())
+    match first_err {
+        None => Ok(()),
+        Some(source) => Err(FreeManyError { source, unfreed }.into()),
+    }
 }

@@ -196,8 +196,8 @@ pub(super) fn atomic_update<'w, A, R2, W>(
 ) -> io::Result<()>
 where
     A: BStackRaiiAllocator,
-    R2: FnOnce(&[u64]) -> Vec<u64>,
-    W: FnOnce(&[u64], &[u64]) -> &'w [(u64, SmallBuf)],
+    R2: FnOnce(&[u64]) -> io::Result<Vec<u64>>,
+    W: FnOnce(&[u64], &[u64]) -> io::Result<&'w [(u64, SmallBuf)]>,
 {
     // Buffers that must outlive the whole `inplace_gen` call (bstack's documented
     // generator pattern): read-back values and the computed writes.
@@ -206,6 +206,11 @@ where
     let mut offs2: Vec<u64> = Vec::new();
     let mut buf2: Vec<[u8; 8]> = Vec::new();
     let mut writes: &'w [(u64, SmallBuf)] = &[];
+    // `plan` can fail (e.g. an overflowing offset computed from a corrupted
+    // on-disk pointer); the generator closure itself can't return `Result`, so
+    // a failure is captured here, the generator aborts (commits nothing), and
+    // the error surfaces after `inplace_gen` returns.
+    let mut plan_err: Option<io::Error> = None;
 
     let mut reads2 = Some(reads2);
     let mut plan = Some(plan);
@@ -232,7 +237,13 @@ where
         if !did_a {
             did_a = true;
             vals1 = buf1.iter().map(|x| u64::from_le_bytes(*x)).collect();
-            offs2 = (reads2.take().unwrap())(&vals1);
+            match (reads2.take().unwrap())(&vals1) {
+                Ok(offs) => offs2 = offs,
+                Err(e) => {
+                    plan_err = Some(e);
+                    return None; // abort: commit nothing
+                }
+            }
             buf2 = vec![[0u8; 8]; offs2.len()];
         }
         // Round 2 — read the dependent offsets.
@@ -250,7 +261,13 @@ where
         if !did_b {
             did_b = true;
             let vals2: Vec<u64> = buf2.iter().map(|x| u64::from_le_bytes(*x)).collect();
-            writes = (plan.take().unwrap())(&vals1, &vals2);
+            match (plan.take().unwrap())(&vals1, &vals2) {
+                Ok(ws) => writes = ws,
+                Err(e) => {
+                    plan_err = Some(e);
+                    return None; // abort: commit nothing
+                }
+            }
         }
         // Commit phase — emit every write; they land together atomically.
         if w < writes.len() {
@@ -265,7 +282,11 @@ where
             });
         }
         None
-    })
+    })?;
+    match plan_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// A snapshot of an open-addressing table's four handle metadata fields
@@ -283,8 +304,9 @@ pub(super) struct Meta {
 pub(super) enum ProbeStep {
     /// This bucket isn't the target — keep probing.
     Continue,
-    /// Stop here and commit these writes (empty = commit nothing).
-    Stop(Vec<(u64, SmallBuf)>),
+    /// Stop here and commit these writes (empty = commit nothing), or fail
+    /// (e.g. an overflowing bucket offset computed from a corrupted `m.table`).
+    Stop(io::Result<Vec<(u64, SmallBuf)>>),
 }
 
 /// Run an atomic, external-lock-free linear probe over an open-addressing bucket
@@ -308,7 +330,7 @@ pub(super) fn probe_commit<A, I, E>(
 where
     A: BStackRaiiAllocator,
     I: FnMut(&Meta, u64, &[u8]) -> ProbeStep,
-    E: FnOnce(&Meta) -> Vec<(u64, SmallBuf)>,
+    E: FnOnce(&Meta) -> io::Result<Vec<(u64, SmallBuf)>>,
 {
     let mut meta_buf = [0u8; 32];
     let mut bucket_buf = vec![0u8; stride as usize];
@@ -324,6 +346,11 @@ where
     let mut decided = false;
     let mut exhausted = Some(exhausted);
     let mut w = 0usize;
+    // `m.table` is an on-disk pointer that can be corrupted/forged; the
+    // generator closure can't return `Result`, so an overflowing bucket
+    // offset is captured here, the probe aborts (commits nothing), and the
+    // error surfaces after `inplace_gen` returns.
+    let mut probe_err: Option<io::Error> = None;
 
     allocator.stack().inplace_gen(|_feedback| {
         // 1. Read the 32-byte metadata block.
@@ -354,21 +381,45 @@ where
         if probe_pending {
             probe_pending = false;
             if let ProbeStep::Stop(ws) = inspect(m, idx_at_read, &bucket_buf) {
-                writes = ws;
+                match ws {
+                    Ok(ws) => writes = ws,
+                    Err(e) => {
+                        probe_err = Some(e);
+                        return None; // abort: commit nothing
+                    }
+                }
                 decided = true;
             }
         }
         // 3b. Issue the next probe, or finish by exhaustion.
         if !decided {
             if m.cap == 0 || probed >= m.cap {
-                writes = (exhausted.take().unwrap())(m);
+                match (exhausted.take().unwrap())(m) {
+                    Ok(ws) => writes = ws,
+                    Err(e) => {
+                        probe_err = Some(e);
+                        return None; // abort: commit nothing
+                    }
+                }
                 decided = true;
             } else {
                 idx_at_read = cur;
                 probe_pending = true;
                 probed += 1;
                 cur = (cur + 1) & mask;
-                let off = m.table + idx_at_read * stride;
+                let off = match idx_at_read
+                    .checked_mul(stride)
+                    .and_then(|d| m.table.checked_add(d))
+                {
+                    Some(off) => off,
+                    None => {
+                        probe_err = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "corrupt bucket table offset",
+                        ));
+                        return None; // abort: commit nothing
+                    }
+                };
                 // SAFETY: `bucket_buf` outlives the call; each read completes
                 // (and is inspected) before the next is issued.
                 let b: &mut [u8] =
@@ -392,7 +443,11 @@ where
             });
         }
         None
-    })
+    })?;
+    match probe_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Grow an open-addressing bucket table to at least double its capacity,
@@ -417,12 +472,20 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
     min_cap: u64,
 ) -> io::Result<()> {
     let cap0 = read_u64(allocator.stack(), handle + HEADER_SIZE + 8)?;
-    let newcap = if cap0 == 0 { min_cap } else { cap0 * 2 };
+    let newcap = if cap0 == 0 {
+        min_cap
+    } else {
+        cap0.saturating_mul(2)
+    };
+    let overflow_err =
+        || io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table capacity");
     // Allocate the new bucket block up front (an orphan until the swap).
-    let newtable = allocator.alloc(newcap * stride)?.as_range().start();
+    let new_size = newcap.checked_mul(stride).ok_or_else(overflow_err)?;
+    let newtable = allocator.alloc(new_size)?.as_range().start();
 
     let mut meta_buf = [0u8; 32];
-    let mut old_buf = vec![0u8; (cap0 * stride) as usize];
+    let old_size = cap0.checked_mul(stride).ok_or_else(overflow_err)?;
+    let mut old_buf = vec![0u8; old_size as usize];
     let mut new_image: Vec<u8> = Vec::new();
     let grown = Cell::new(false);
     let old_table = Cell::new(0u64);
@@ -435,6 +498,11 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
     let mut built = false;
     let mut writes: WriteBuf<4> = WriteBuf::new();
     let mut w = 0usize;
+    // `m.table` is an on-disk pointer that can be corrupted/forged; the
+    // generator closure can't return `Result`, so an overflowing bucket
+    // offset is captured here, the generator aborts (commits nothing), and
+    // the error surfaces after `inplace_gen` returns.
+    let mut grow_err: Option<io::Error> = None;
 
     allocator.stack().inplace_gen(|_feedback| {
         if !meta_issued {
@@ -470,11 +538,32 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
             read_i += 1;
             let lo = (i * stride) as usize;
             let hi = lo + stride as usize;
+            if hi > old_buf.len() {
+                // `m.cap` (read fresh, under the lock) exceeds `cap0` (read
+                // before this generator started) — either a concurrent grow
+                // the abort check above didn't catch, or a corrupted `cap`;
+                // either way `old_buf` (sized for `cap0`) can't hold slot `i`.
+                grow_err = Some(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bucket table capacity changed during grow",
+                ));
+                return None;
+            }
+            let off = match i.checked_mul(stride).and_then(|d| m.table.checked_add(d)) {
+                Some(off) => off,
+                None => {
+                    grow_err = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "corrupt bucket table offset",
+                    ));
+                    return None; // abort: commit nothing
+                }
+            };
             // SAFETY: `old_buf` outlives the call; each slice read once.
             let b: &mut [u8] =
                 unsafe { core::mem::transmute::<&mut [u8], _>(&mut old_buf[lo..hi]) };
             return Some(BStackGenOp::Read {
-                offset: m.table + i * stride,
+                offset: off,
                 buf: b,
             });
         }
@@ -486,7 +575,7 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
             old_table.set(m.table);
             old_cap.set(m.cap);
 
-            new_image = vec![0u8; (newcap * stride) as usize]; // all EMPTY (0)
+            new_image = vec![0u8; new_size as usize]; // all EMPTY (0)
             let newmask = newcap - 1;
             for j in 0..m.cap {
                 let lo = (j * stride) as usize;
@@ -530,6 +619,11 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
         }
         None
     })?;
+    if let Some(e) = grow_err {
+        // SAFETY: `newtable` was never linked into the descriptor.
+        let _ = unsafe { dealloc_range(allocator, BStackRange::new(newtable, new_size)) };
+        return Err(e);
+    }
 
     if grown.get() {
         if old_cap.get() > 0 {
@@ -537,13 +631,13 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
             let _ = unsafe {
                 dealloc_range(
                     allocator,
-                    BStackRange::new(old_table.get(), old_cap.get() * stride),
+                    BStackRange::new(old_table.get(), old_cap.get().saturating_mul(stride)),
                 )
             };
         }
     } else {
         // SAFETY: `newtable` was never linked into the descriptor.
-        let _ = unsafe { dealloc_range(allocator, BStackRange::new(newtable, newcap * stride)) };
+        let _ = unsafe { dealloc_range(allocator, BStackRange::new(newtable, new_size)) };
     }
     Ok(())
 }

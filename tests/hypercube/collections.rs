@@ -1445,6 +1445,60 @@ fn stdlib_hashset_basic() {
     set.bstack_drop(&alloc).unwrap();
 }
 
+// A post-commit Bloom-decrement failure must not turn a completed removal into `Err`:
+// `remove` removes from the table first (a durable commit), then decrements the filter
+// best-effort. Faulting the decrement must still report `Ok(true)` for the vanished key.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn stdlib_hashset_remove_reports_success_when_bloom_decrement_faults() {
+    use bstack::fault::FaultPolicy;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Both the table removal (`probe_commit`) and the Bloom decrement run under an
+    // `inplace_gen`; the table's is first, the filter's second. Fail the *second* to
+    // model a post-commit filter failure while leaving the durable table removal intact.
+    struct FailNthInplaceGen {
+        seen: AtomicU64,
+        target: u64,
+    }
+    impl FaultPolicy for FailNthInplaceGen {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "inplace_gen" && self.seen.fetch_add(1, Ordering::SeqCst) == self.target {
+                Some(io::Error::other("injected bloom-decrement fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let set = BStackHashSet::<u32>::new(&alloc).unwrap();
+    set.insert(&alloc, 42).unwrap();
+
+    stack.set_fault_policy(Some(Arc::new(FailNthInplaceGen {
+        seen: AtomicU64::new(0),
+        target: 1, // the second inplace_gen of `remove` — the Bloom decrement
+    })));
+    let r = set.remove(&alloc, &42);
+    stack.set_fault_policy(None);
+
+    assert!(
+        r.unwrap(),
+        "a completed removal must be reported Ok(true), not Err, on a Bloom-decrement fault"
+    );
+    // The table removal committed, so the key is genuinely gone.
+    assert!(
+        !set.contains(stack, &42).unwrap(),
+        "key should be absent after remove"
+    );
+
+    set.bstack_drop(&alloc).unwrap();
+}
+
 #[test]
 fn stdlib_hashset_deep_clone_is_independent() {
     let tmp = TempStack::new();
@@ -2536,7 +2590,7 @@ fn embed_collection_build_read_teardown() {
     assert_eq!(h.handle().get_tag(stack).unwrap(), 7);
 
     // Read: the accessor yields a deque handle into the inline region.
-    let got = h.handle().get_dq();
+    let got = h.handle().get_dq().unwrap();
     assert_eq!(deque_values(&got, stack), vec![1, 2]);
 
     // Teardown: frees the ring + both elements *in place* via
@@ -2581,13 +2635,13 @@ fn embed_collection_clone_is_independent() {
     let stack = alloc.stack();
 
     let h = build_emb_collection_holder(&alloc);
-    let got = h.handle().get_dq();
+    let got = h.handle().get_dq().unwrap();
 
     // A deep clone of the holder must carry an INDEPENDENT copy of the embedded
     // deque — a fresh ring and fresh element blocks, not aliases of the
     // original's out-of-line storage.
     let c = h.handle().try_clone_in(&alloc).unwrap();
-    let cdq = c.handle().get_dq();
+    let cdq = c.handle().get_dq().unwrap();
     assert_ne!(
         c.handle().range().start(),
         h.handle().range().start(),
@@ -2648,4 +2702,33 @@ fn embed_list_clone_is_independent() {
         base,
         "embedded list clone aliased the source's out-of-line nodes/elements"
     );
+}
+
+#[test]
+fn stdlib_hashset_no_false_negatives_after_bloom_saturation() {
+    // A counting-bloom counter that saturated (255) must be PINNED — never
+    // decremented — else removals of other keys drive it to 0 while survivors still map
+    // to it, and the set's bloom-absent skip reports a present key as absent.
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A deliberately tiny filter → many keys share a few counters, saturating them.
+    let set = BStackHashSet::<u32>::with_capacity(&alloc, 1, 0.5).unwrap();
+    for k in 0..600u32 {
+        set.insert(&alloc, k).unwrap();
+    }
+    for k in 0..520u32 {
+        assert!(set.remove(&alloc, &k).unwrap());
+    }
+
+    // 520..600 were never removed → still in the table. Each must be found (a bloom
+    // false negative here would skip the table probe and wrongly report absent).
+    for k in 520..600u32 {
+        assert!(
+            set.contains(stack, &k).unwrap(),
+            "false negative for surviving key {k}"
+        );
+    }
+    set.bstack_drop(&alloc).unwrap();
 }

@@ -7,11 +7,11 @@
 #![allow(dead_code)] // some fixtures are inspected only via RTTI, never instantiated
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
-use bstack_raii::registry::{self, FileId};
+use bstack_raii::registry;
 use bstack_raii::rtti::{self, AnyRef, ForeignKind, ForeignPtr, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
     BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr,
-    bstack_class, rtti_path,
+    TryClone, bstack_class, rtti_path,
 };
 
 #[bstack_class]
@@ -89,6 +89,12 @@ struct WeakHolder {
     tag: u32,
     #[bstack_weak]
     w: WCell,
+}
+
+#[bstack_class]
+struct WArr {
+    #[bstack_weak]
+    ws: [WCell; 2],
 }
 
 #[bstack_class]
@@ -191,6 +197,23 @@ struct EmbArr {
 struct NestArr {
     #[bstack_owned]
     grid: [[Point; 2]; 2],
+    n: u32,
+}
+
+// A nullable cross-file foreign — its Option niche is the offset word (byte 8).
+#[bstack_class]
+struct FOpt {
+    #[bstack_owned]
+    maybe: Option<Foreign<Point>>,
+    n: u32,
+}
+
+// An owned vector of child blocks — its teardown reads a `u64` child offset per
+// element, so a forged length would read neighbor blocks as offsets and free them.
+#[bstack_class]
+struct OVec {
+    #[bstack_owned]
+    kids: Vec<Point>,
     n: u32,
 }
 
@@ -399,6 +422,26 @@ fn interpret_reads_pod_struct() {
 }
 
 #[test]
+fn interpret_read_value_rejects_offset_overflow() {
+    // Found by fuzzing (`fuzz/fuzz_targets/rtti_interpret.rs`): a caller-controlled
+    // root offset near `u64::MAX`, combined with a nonzero field offset, must fail
+    // cleanly via a checked add rather than panic with "attempt to add with overflow".
+    let schema = temp_path("ovf_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("ovf_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+
+    let err = reg
+        .read_value(alloc.stack(), ord, u64::MAX - 2)
+        .unwrap_err();
+    assert!(err.to_string().contains("BSTACK081A"), "got: {err}");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
 fn interpret_reads_nested_and_via_pointer() {
     let schema = temp_path("read2_schema");
     let reg = rtti::sync(&schema).unwrap();
@@ -538,9 +581,9 @@ fn interpret_teardown_reclaims_owned_tree() {
     // Leak oracle: warm once (allocator high-water settles), snapshot, then do an
     // identical build + RTTI teardown and assert the stack returned to baseline —
     // so teardown reclaimed the root *and* the owned child, with nothing leaked.
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     let base = alloc.stack().len().unwrap();
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     assert_eq!(alloc.stack().len().unwrap(), base, "RTTI teardown leaked");
 
     drop(reg);
@@ -563,9 +606,9 @@ fn interpret_teardown_strong_rc() {
         BStackBlock::range(h.handle()).start()
     };
 
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     let base = alloc.stack().len().unwrap();
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     assert_eq!(
         alloc.stack().len().unwrap(),
         base,
@@ -592,9 +635,9 @@ fn interpret_teardown_strong_rc_weak() {
         BStackBlock::range(h.handle()).start()
     };
 
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     let base = alloc.stack().len().unwrap();
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     assert_eq!(
         alloc.stack().len().unwrap(),
         base,
@@ -626,7 +669,7 @@ fn interpret_teardown_weak_field() {
         let off = BStackBlock::range(h.handle()).start();
         // Frees the holder root and decrements the cell's weak (2 -> 1); the cell
         // and its control survive because a strong owner is still live.
-        reg.teardown(&alloc, ord, off).unwrap();
+        unsafe { reg.teardown(&alloc, ord, off) }.unwrap();
         // `cell` (BStackRc) drops here: strong 1 -> 0 frees the data, weak 1 -> 0
         // frees the control.
     };
@@ -664,9 +707,9 @@ fn interpret_teardown_reclaims_vec_array_and_option() {
         BStackBlock::range(v.handle()).start()
     };
 
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     let base = alloc.stack().len().unwrap();
-    reg.teardown(&alloc, ord, build()).unwrap();
+    unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     assert_eq!(alloc.stack().len().unwrap(), base, "RTTI teardown leaked");
 
     drop(reg);
@@ -698,17 +741,13 @@ fn interpret_set_pod_field() {
     let off = BStackBlock::range(p.handle()).start();
 
     // Overwrite `x`; `y` is untouched.
-    reg.set(alloc.stack(), ord, off, &["x"], &42u32.to_le_bytes())
-        .unwrap();
+    unsafe { reg.set(alloc.stack(), ord, off, &["x"], &42u32.to_le_bytes()) }.unwrap();
     assert_eq!(p.handle().get_x(alloc.stack()).unwrap(), 42);
     assert_eq!(p.handle().get_y(alloc.stack()).unwrap(), 9);
 
     // Wrong width and unknown field are rejected.
-    assert!(reg.set(alloc.stack(), ord, off, &["x"], &[1, 2]).is_err());
-    assert!(
-        reg.set(alloc.stack(), ord, off, &["z"], &0u32.to_le_bytes())
-            .is_err()
-    );
+    assert!(unsafe { reg.set(alloc.stack(), ord, off, &["x"], &[1, 2]) }.is_err());
+    assert!(unsafe { reg.set(alloc.stack(), ord, off, &["z"], &0u32.to_le_bytes()) }.is_err());
 
     p.bstack_drop(&alloc).unwrap();
     drop(reg);
@@ -728,20 +767,19 @@ fn interpret_clone_equal_and_independent() {
     let src = BStackBlock::range(w.handle()).start();
 
     // Clone → a distinct, detached root whose Value tree equals the source's.
-    let dst = reg.clone_value(&alloc, ord, src).unwrap();
+    let dst = unsafe { reg.clone_value(&alloc, ord, src) }.unwrap();
     assert_ne!(dst, src);
     let src_val = reg.read_value(alloc.stack(), ord, src).unwrap();
     assert_eq!(reg.read_value(alloc.stack(), ord, dst).unwrap(), src_val);
 
     // The owned child was deep-copied: mutating the source leaves the clone intact.
-    reg.set(alloc.stack(), ord, src, &["n"], &99u32.to_le_bytes())
-        .unwrap();
+    unsafe { reg.set(alloc.stack(), ord, src, &["n"], &99u32.to_le_bytes()) }.unwrap();
     assert_eq!(reg.read_value(alloc.stack(), ord, dst).unwrap(), src_val);
     assert_ne!(reg.read_value(alloc.stack(), ord, src).unwrap(), src_val);
 
     // Both trees tear down independently (no shared blocks, no double free).
-    reg.teardown(&alloc, ord, src).unwrap();
-    reg.teardown(&alloc, ord, dst).unwrap();
+    unsafe { reg.teardown(&alloc, ord, src) }.unwrap();
+    unsafe { reg.teardown(&alloc, ord, dst) }.unwrap();
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -766,9 +804,9 @@ fn interpret_clone_then_teardown_reclaims() {
         )
         .unwrap();
         let src = BStackBlock::range(v.handle()).start();
-        let dst = reg.clone_value(&alloc, ord, src).unwrap();
-        reg.teardown(&alloc, ord, src).unwrap();
-        reg.teardown(&alloc, ord, dst).unwrap();
+        let dst = unsafe { reg.clone_value(&alloc, ord, src) }.unwrap();
+        unsafe { reg.teardown(&alloc, ord, src) }.unwrap();
+        unsafe { reg.teardown(&alloc, ord, dst) }.unwrap();
     };
 
     cycle();
@@ -796,15 +834,15 @@ fn interpret_clone_shares_strong() {
         let cell = RCell::new(&alloc, 5).unwrap();
         let h = RcHolder::new(&alloc, cell).unwrap();
         let src = BStackBlock::range(h.handle()).start();
-        let dst = reg.clone_value(&alloc, ord, src).unwrap();
+        let dst = unsafe { reg.clone_value(&alloc, ord, src) }.unwrap();
         // The strong field points at the *same* cell in both holders (shared).
         assert_eq!(
             read_u64(alloc.stack(), src + soff),
             read_u64(alloc.stack(), dst + soff),
             "strong clone must share the target, not copy it"
         );
-        reg.teardown(&alloc, ord, src).unwrap(); // refcount 2 -> 1 (cell alive)
-        reg.teardown(&alloc, ord, dst).unwrap(); // refcount 1 -> 0 (cell freed)
+        unsafe { reg.teardown(&alloc, ord, src) }.unwrap(); // refcount 2 -> 1 (cell alive)
+        unsafe { reg.teardown(&alloc, ord, dst) }.unwrap(); // refcount 1 -> 0 (cell freed)
     };
 
     cycle();
@@ -882,21 +920,22 @@ fn interpret_path_get_and_set_nested() {
     assert_eq!(tag, <Point as BStackCast>::eightcc());
 
     // Set a nested POD field, then a top-level one.
-    reg.set(
-        alloc.stack(),
-        ord,
-        off,
-        rtti_path!(inner.x),
-        &42u32.to_le_bytes(),
-    )
+    unsafe {
+        reg.set(
+            alloc.stack(),
+            ord,
+            off,
+            rtti_path!(inner.x),
+            &42u32.to_le_bytes(),
+        )
+    }
     .unwrap();
     assert_eq!(
         reg.get(alloc.stack(), ord, off, rtti_path!(inner.x))
             .unwrap(),
         pod(&42u32.to_le_bytes())
     );
-    reg.set(alloc.stack(), ord, off, rtti_path!(n), &7u32.to_le_bytes())
-        .unwrap();
+    unsafe { reg.set(alloc.stack(), ord, off, rtti_path!(n), &7u32.to_le_bytes()) }.unwrap();
     assert_eq!(
         reg.get(alloc.stack(), ord, off, rtti_path!(n)).unwrap(),
         pod(&7u32.to_le_bytes())
@@ -904,12 +943,9 @@ fn interpret_path_get_and_set_nested() {
 
     // Cannot descend through a POD leaf, and cannot `set` an owning reference.
     assert!(reg.get(alloc.stack(), ord, off, rtti_path!(n.x)).is_err());
-    assert!(
-        reg.set(alloc.stack(), ord, off, rtti_path!(inner), &[0u8; 8])
-            .is_err()
-    );
+    assert!(unsafe { reg.set(alloc.stack(), ord, off, rtti_path!(inner), &[0u8; 8]) }.is_err());
 
-    reg.teardown(&alloc, ord, off).unwrap();
+    unsafe { reg.teardown(&alloc, ord, off) }.unwrap();
     drop(reg);
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
@@ -931,13 +967,9 @@ fn interpret_swap_reference() {
     let np = Point::new(&alloc, 8, 9).unwrap();
     let np_off = BStackBlock::range(np.handle()).start();
     let old = reg
-        .swap(
-            alloc.stack(),
-            ord,
-            off,
-            &["inner"],
-            AnyRef::new(point_tag, np_off),
-        )
+        .swap(alloc.stack(), ord, off, &["inner"], unsafe {
+            AnyRef::new(point_tag, np_off)
+        })
         .unwrap()
         .expect("field was non-null");
     assert_eq!(old.tag(), point_tag);
@@ -951,29 +983,21 @@ fn interpret_swap_reference() {
     // Rejections: wrong eightcc, and a POD target.
     let wrap_tag = <Wrap as BStackCast>::eightcc();
     assert!(
-        reg.swap(
-            alloc.stack(),
-            ord,
-            off,
-            &["inner"],
+        reg.swap(alloc.stack(), ord, off, &["inner"], unsafe {
             AnyRef::new(wrap_tag, off)
-        )
+        })
         .is_err()
     );
     assert!(
-        reg.swap(
-            alloc.stack(),
-            ord,
-            off,
-            &["n"],
+        reg.swap(alloc.stack(), ord, off, &["n"], unsafe {
             AnyRef::new(point_tag, np_off)
-        )
+        })
         .is_err()
     );
 
     // The old target and the wrap (now owning the new target) both reclaim cleanly.
-    reg.teardown(&alloc, pord, old.offset()).unwrap();
-    reg.teardown(&alloc, ord, off).unwrap();
+    unsafe { reg.teardown(&alloc, pord, old.offset()) }.unwrap();
+    unsafe { reg.teardown(&alloc, ord, off) }.unwrap();
     drop(reg);
     std::fs::remove_file(&schema).ok();
     std::fs::remove_file(&dpath).ok();
@@ -1002,7 +1026,7 @@ fn interpret_move_out_owned() {
 
     // Disassemble: the Wrap shell is freed; `n` comes out by value, `inner` as an
     // AnyRef the caller now owns (the Point block survives).
-    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
     assert_eq!(moved.len(), 2);
     let Moved::Pod(n) = &moved["n"] else {
         panic!("n should be POD");
@@ -1017,18 +1041,18 @@ fn interpret_move_out_owned() {
     assert_eq!(pt.get_x(alloc.stack()).unwrap(), 1);
     assert_eq!(pt.get_y(alloc.stack()).unwrap(), 2);
     // The caller owns it: tear it down.
-    reg.teardown(&alloc, pord, inner.offset()).unwrap();
+    unsafe { reg.teardown(&alloc, pord, inner.offset()) }.unwrap();
 
     // Leak oracle: a full build → move_out (frees shell) → teardown-child cycle
     // returns to baseline (shell reclaimed, child reclaimed, nothing leaked).
     let cycle = || {
         let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
         let off = BStackBlock::range(w.handle()).start();
-        let moved = reg.move_out(&alloc, ord, off).unwrap();
+        let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
         let Moved::Ref(Some(inner)) = &moved["inner"] else {
             panic!()
         };
-        reg.teardown(&alloc, pord, inner.offset()).unwrap();
+        unsafe { reg.teardown(&alloc, pord, inner.offset()) }.unwrap();
     };
     cycle();
     let base = alloc.stack().len().unwrap();
@@ -1052,7 +1076,7 @@ fn interpret_move_out_embed_materializes() {
     let off = BStackBlock::range(em.handle()).start();
     let embed_inline = off + field_offset(&reg, ord, "e");
 
-    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
     let Moved::Ref(Some(e)) = &moved["e"] else {
         panic!("embed should materialize into a reference");
     };
@@ -1061,17 +1085,17 @@ fn interpret_move_out_embed_materializes() {
     let pt = e.downcast::<Point>().expect("downcast");
     assert_eq!(pt.get_x(alloc.stack()).unwrap(), 3);
     assert_eq!(pt.get_y(alloc.stack()).unwrap(), 4);
-    reg.teardown(&alloc, pord, e.offset()).unwrap();
+    unsafe { reg.teardown(&alloc, pord, e.offset()) }.unwrap();
 
     // Leak oracle over the whole cycle (materialized copy + shell both reclaimed).
     let cycle = || {
         let em = Embedder::new(&alloc, Point::new(&alloc, 3, 4).unwrap(), 9).unwrap();
         let off = BStackBlock::range(em.handle()).start();
-        let moved = reg.move_out(&alloc, ord, off).unwrap();
+        let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
         let Moved::Ref(Some(e)) = &moved["e"] else {
             panic!()
         };
-        reg.teardown(&alloc, pord, e.offset()).unwrap();
+        unsafe { reg.teardown(&alloc, pord, e.offset()) }.unwrap();
     };
     cycle();
     let base = alloc.stack().len().unwrap();
@@ -1100,7 +1124,7 @@ fn interpret_move_out_vec_array_option() {
     .unwrap();
     let off = BStackBlock::range(v.handle()).start();
 
-    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
 
     // The whole POD vector transfers as one VecRef (its data block untouched).
     let Moved::Vec(Some(vr)) = &moved["labels"] else {
@@ -1135,7 +1159,7 @@ fn interpret_move_out_vec_array_option() {
     );
 
     // Reclaim the transferred parts (the shell is already gone).
-    reg.teardown(&alloc, pord, maybe.offset()).unwrap();
+    unsafe { reg.teardown(&alloc, pord, maybe.offset()) }.unwrap();
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -1208,8 +1232,7 @@ fn class_variable_via_path() {
     assert_eq!(&b[..], &0u64.to_le_bytes());
 
     // set a mutable class variable by path; it routes to the schema-side write.
-    reg.set(data, ord, 0, rtti_path!(counter), &99u64.to_le_bytes())
-        .unwrap();
+    unsafe { reg.set(data, ord, 0, rtti_path!(counter), &99u64.to_le_bytes()) }.unwrap();
     let Value::Class(b) = reg.get(data, ord, 0, rtti_path!(counter)).unwrap() else {
         panic!()
     };
@@ -1221,13 +1244,12 @@ fn class_variable_via_path() {
     );
 
     // A const class variable rejects `set`; `swap` rejects any class variable.
+    assert!(unsafe { reg.set(data, ord, 0, rtti_path!(version), &1u32.to_le_bytes()) }.is_err());
     assert!(
-        reg.set(data, ord, 0, rtti_path!(version), &1u32.to_le_bytes())
-            .is_err()
-    );
-    assert!(
-        reg.swap(data, ord, 0, rtti_path!(counter), AnyRef::new(ctag, 0))
-            .is_err()
+        reg.swap(data, ord, 0, rtti_path!(counter), unsafe {
+            AnyRef::new(ctag, 0)
+        })
+        .is_err()
     );
 
     drop(reg);
@@ -1304,8 +1326,8 @@ fn interpret_reads_foreign_pointer() {
     let p2_off = BStackBlock::range(p2.handle()).start();
     let fm = FModel::new(
         &alloc,
-        Foreign::at(FileId::SELF, p1.handle()),
-        Foreign::at(FileId::SELF, p2.handle()),
+        unsafe { Foreign::at(p1.handle()) },
+        unsafe { Foreign::at(p2.handle()) },
         5,
     )
     .unwrap();
@@ -1354,10 +1376,19 @@ fn interpret_teardown_foreign_owned_across_files() {
     let (foreign, fpath) = data_alloc("ftd_foreign");
 
     // Allocate the owned target in the foreign file.
+    // Warm the foreign file's WAL block once (a fixed one-time cost) so the length
+    // oracle below is not confounded by the persistent block the now-WAL-backed
+    // foreign teardown leaves behind.
+    Point::new(&foreign, 0, 0)
+        .unwrap()
+        .bstack_drop(&foreign)
+        .unwrap();
     let base = foreign.stack().len().unwrap();
     let leaf = Point::new(&foreign, 88, 99).unwrap();
     let leaf_off = BStackBlock::range(leaf.handle()).start();
-    assert!(foreign.stack().len().unwrap() > base);
+    // The leaf reuses the slot the WAL warmup above freed, so the file need not
+    // grow past `base`; it must not shrink.
+    assert!(foreign.stack().len().unwrap() >= base);
 
     // Attach the foreign file to the process-wide registry (tolerant of a prior init).
     let reg_file = temp_path("ftd_reg");
@@ -1370,14 +1401,14 @@ fn interpret_teardown_foreign_owned_across_files() {
     let fm = FModel::new(
         &home,
         unsafe { Foreign::<Point>::new(fid, leaf_off) },
-        Foreign::at(FileId::SELF, hp.handle()),
+        unsafe { Foreign::at(hp.handle()) },
         7,
     )
     .unwrap();
     let off = BStackBlock::range(fm.handle()).start();
 
     // Interpret the teardown; the foreign target is reclaimed in the foreign file.
-    reg.teardown(&home, ord, off).unwrap();
+    unsafe { reg.teardown(&home, ord, off) }.unwrap();
     let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
     assert!(
         after <= base,
@@ -1406,11 +1437,20 @@ fn interpret_teardown_foreign_strong_across_files() {
 
     // An rc target in the foreign file at refcount 1, with no live handle to auto-drop
     // it — the strong foreign is its (sole, uncounted-here) owner.
+    // Warm the foreign file's WAL block once (a fixed one-time cost) so the length
+    // oracle below is not confounded by the persistent block the now-WAL-backed
+    // foreign teardown leaves behind.
+    Point::new(&foreign, 0, 0)
+        .unwrap()
+        .bstack_drop(&foreign)
+        .unwrap();
     let base = foreign.stack().len().unwrap();
     let cell = RCell::new(&foreign, 88).unwrap();
     let cell_off = cell.handle().range().start();
     std::mem::forget(cell);
-    assert!(foreign.stack().len().unwrap() > base);
+    // The leaf reuses the slot the WAL warmup above freed, so the file need not
+    // grow past `base`; it must not shrink.
+    assert!(foreign.stack().len().unwrap() >= base);
 
     let reg_file = temp_path("fst_reg");
     let _ = registry::init(&reg_file);
@@ -1419,7 +1459,7 @@ fn interpret_teardown_foreign_strong_across_files() {
     let h = FStrong::new(&home, unsafe { Foreign::<RCell>::new(fid, cell_off) }, 1).unwrap();
     let off = BStackBlock::range(h.handle()).start();
 
-    reg.teardown(&home, ord, off).unwrap();
+    unsafe { reg.teardown(&home, ord, off) }.unwrap();
     let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
     assert!(
         after <= base,
@@ -1459,13 +1499,13 @@ fn interpret_clone_foreign_owned_across_files() {
     let fm = FModel::new(
         &home,
         unsafe { Foreign::<Point>::new(fid, leaf_off) },
-        Foreign::at(FileId::SELF, hp.handle()),
+        unsafe { Foreign::at(hp.handle()) },
         7,
     )
     .unwrap();
     let src = BStackBlock::range(fm.handle()).start();
 
-    let dst = reg.clone_value(&home, ford, src).unwrap();
+    let dst = unsafe { reg.clone_value(&home, ford, src) }.unwrap();
     let Value::Block { fields, .. } = reg.read_value(home.stack(), ford, dst).unwrap() else {
         panic!("clone should be a block");
     };
@@ -1536,13 +1576,13 @@ fn interpret_move_out_foreign() {
     let fm = FModel::new(
         &home,
         unsafe { Foreign::<Point>::new(fid, leaf_off) },
-        Foreign::at(FileId::SELF, hp.handle()),
+        unsafe { Foreign::at(hp.handle()) },
         7,
     )
     .unwrap();
     let off = BStackBlock::range(fm.handle()).start();
 
-    let moved = reg.move_out(&home, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&home, ord, off) }.unwrap();
     assert_eq!(
         moved["owned_f"],
         Moved::Foreign {
@@ -1654,7 +1694,7 @@ fn bstack_class_pod_tuple_field() {
     assert_eq!(items[1], pod(&0x56u8.to_le_bytes()));
 
     // A POD tuple moves out as one opaque blob (cumulative packed bytes).
-    let moved = reg.move_out(&home, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&home, ord, off) }.unwrap();
     let Moved::Pod(bytes) = &moved["pair"] else {
         panic!("pod tuple should move whole");
     };
@@ -1677,13 +1717,22 @@ fn interpret_foreign_vec_teardown_across_files() {
     let (foreign, fpath) = data_alloc("fvect_foreign");
 
     // Baseline BEFORE the targets, then build three owned Points in the foreign file.
+    // Warm the foreign file's WAL block once (a fixed one-time cost) so the length
+    // oracle below is not confounded by the persistent block the now-WAL-backed
+    // foreign teardown leaves behind.
+    Point::new(&foreign, 0, 0)
+        .unwrap()
+        .bstack_drop(&foreign)
+        .unwrap();
     let base = foreign.stack().len().unwrap();
     let mut offs = Vec::new();
     for i in 0..3u32 {
         let p = Point::new(&foreign, 10 + i, 20 + i).unwrap();
         offs.push(BStackBlock::range(p.handle()).start());
     }
-    assert!(foreign.stack().len().unwrap() > base);
+    // The leaf reuses the slot the WAL warmup above freed, so the file need not
+    // grow past `base`; it must not shrink.
+    assert!(foreign.stack().len().unwrap() >= base);
 
     let reg_file = temp_path("fvect_reg");
     let _ = registry::init(&reg_file);
@@ -1696,7 +1745,7 @@ fn interpret_foreign_vec_teardown_across_files() {
     let h = FVec::new(&home, links, 7).unwrap();
     let off = BStackBlock::range(h.handle()).start();
 
-    reg.teardown(&home, ord, off).unwrap();
+    unsafe { reg.teardown(&home, ord, off) }.unwrap();
     let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
     assert!(
         after <= base,
@@ -1740,7 +1789,7 @@ fn interpret_foreign_vec_clone_across_files() {
     let h = FVec::new(&home, links, 7).unwrap();
     let src = BStackBlock::range(h.handle()).start();
 
-    let dst = reg.clone_value(&home, ord, src).unwrap();
+    let dst = unsafe { reg.clone_value(&home, ord, src) }.unwrap();
 
     // Pull each element's foreign offset out of a read of the vec.
     let elem_offs = |root: u64| -> Vec<u64> {
@@ -1829,7 +1878,7 @@ fn interpret_foreign_array_across_files() {
     assert!(matches!(items[0], Value::Foreign { offset, .. } if offset == o0));
 
     // move_out: the array becomes a ForeignList; targets outlive the freed shell.
-    let moved = reg.move_out(&home, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&home, ord, off) }.unwrap();
     assert_eq!(
         moved["links"],
         Moved::ForeignList(vec![
@@ -1869,6 +1918,13 @@ fn interpret_foreign_tuple_across_files() {
     let (home, hpath) = data_alloc("ftup_home");
     let (foreign, fpath) = data_alloc("ftup_foreign");
 
+    // Warm the foreign file's WAL block once (a fixed one-time cost) so the length
+    // oracle below is not confounded by the persistent block the now-WAL-backed
+    // foreign teardown leaves behind.
+    Point::new(&foreign, 0, 0)
+        .unwrap()
+        .bstack_drop(&foreign)
+        .unwrap();
     let base = foreign.stack().len().unwrap();
     let p = Point::new(&foreign, 5, 6).unwrap();
     let po = BStackBlock::range(p.handle()).start();
@@ -1889,7 +1945,7 @@ fn interpret_foreign_tuple_across_files() {
     assert!(matches!(items[0], Value::Foreign { offset, .. } if offset == po));
     assert_eq!(items[1], pod(&42u32.to_le_bytes()));
 
-    let moved = reg.move_out(&home, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&home, ord, off) }.unwrap();
     let Moved::Tuple(parts) = &moved["pair"] else {
         panic!("pair should move as a tuple, got {:?}", moved["pair"]);
     };
@@ -1907,7 +1963,7 @@ fn interpret_foreign_tuple_across_files() {
     // A second holder, torn down: its foreign target is reclaimed in the foreign file.
     let h2 = FTup::new(&home, (unsafe { Foreign::<Point>::new(fid, po) }, 1u32), 0).unwrap();
     let off2 = BStackBlock::range(h2.handle()).start();
-    reg.teardown(&home, ord, off2).unwrap();
+    unsafe { reg.teardown(&home, ord, off2) }.unwrap();
     let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
     assert!(
         after <= base,
@@ -2014,7 +2070,7 @@ fn interpret_enum_owned_vec_variant() {
     };
     assert_eq!(items.len(), 2);
     assert!(matches!(&items[0], Value::Block { .. }));
-    reg.teardown(&alloc, ord, off).unwrap();
+    unsafe { reg.teardown(&alloc, ord, off) }.unwrap();
 
     // Full build+teardown cycle returns to baseline.
     let cycle = || {
@@ -2033,7 +2089,7 @@ fn interpret_enum_owned_vec_variant() {
         )
         .unwrap();
         let o = BStackBlock::range(e.handle()).start();
-        reg.teardown(&alloc, ord, o).unwrap();
+        unsafe { reg.teardown(&alloc, ord, o) }.unwrap();
     };
     cycle();
     let base = alloc.stack().len().unwrap();
@@ -2060,6 +2116,13 @@ fn interpret_enum_foreign_vec_variant_across_files() {
     let (home, hpath) = data_alloc("efv_home");
     let (foreign, fpath) = data_alloc("efv_foreign");
 
+    // Warm the foreign file's WAL block once (a fixed one-time cost) so the length
+    // oracle below is not confounded by the persistent block the now-WAL-backed
+    // foreign teardown leaves behind.
+    Point::new(&foreign, 0, 0)
+        .unwrap()
+        .bstack_drop(&foreign)
+        .unwrap();
     let base = foreign.stack().len().unwrap();
     let mut offs = Vec::new();
     for i in 0..3u32 {
@@ -2078,7 +2141,7 @@ fn interpret_enum_foreign_vec_variant_across_files() {
     let e = FEnum::new(&home, FEnumData::Many(links)).unwrap();
     let off = BStackBlock::range(e.handle()).start();
 
-    reg.teardown(&home, ord, off).unwrap();
+    unsafe { reg.teardown(&home, ord, off) }.unwrap();
     let after = registry::with_host(fid, |host| host.stack().len().unwrap()).unwrap();
     assert!(
         after <= base,
@@ -2115,7 +2178,7 @@ fn interpret_move_out_embed_array() {
     .unwrap();
     let off = BStackBlock::range(e.handle()).start();
 
-    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
     let Moved::List(kids) = &moved["kids"] else {
         panic!("embed array should move as a List, got {:?}", moved["kids"]);
     };
@@ -2162,7 +2225,7 @@ fn interpret_move_out_nested_array() {
     .unwrap();
     let off = BStackBlock::range(e.handle()).start();
 
-    let moved = reg.move_out(&alloc, ord, off).unwrap();
+    let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
     let Moved::Array(rows) = &moved["grid"] else {
         panic!(
             "nested array should move as an Array, got {:?}",
@@ -2187,6 +2250,92 @@ fn interpret_move_out_nested_array() {
             expect += 1;
         }
     }
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+// A `[#[bstack_weak] T; N]` array must come out of `move_out` as a `Moved::WeakList`
+// (control-block offsets), NOT a `Moved::List` (data offsets) — else a caller could
+// `swap` a control offset into a non-weak slot and type-confuse control bytes as `T`.
+#[test]
+fn interpret_move_out_weak_array_is_weaklist() {
+    let schema = temp_path("mvwa_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("mvwa_data");
+    let ord = reg.ordinal_of(<WArr as BStackCast>::eightcc()).unwrap();
+
+    let c1 = WCell::new(&alloc, 1).unwrap();
+    let c2 = WCell::new(&alloc, 2).unwrap();
+    let wa = WArr::new(&alloc).unwrap();
+    wa.handle()
+        .set_ws(&alloc, 0, c1.downgrade().unwrap())
+        .unwrap();
+    wa.handle()
+        .set_ws(&alloc, 1, c2.downgrade().unwrap())
+        .unwrap();
+    let off = wa.handle().range().start();
+
+    let moved = unsafe { reg.move_out(&alloc, ord, off) }.unwrap();
+    // `wa`'s handle owns nothing on drop (its shell is freed by move_out); no forget.
+    let Moved::WeakList(list) = &moved["ws"] else {
+        panic!(
+            "weak array must come out as WeakList, got {:?}",
+            moved["ws"]
+        );
+    };
+    assert_eq!(list.len(), 2);
+    assert!(list[0].is_some() && list[1].is_some());
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+// `move_out` on a `rc` / `(rc, weak)` root is a sole-owner try_unwrap: a shared root is
+// refused ([BSTACK0819]) untouched; the sole owner is disassembled and (for rc,weak) its
+// control block released.
+#[test]
+fn interpret_move_out_rc_try_unwrap() {
+    let schema = temp_path("mvrc_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("mvrc_data");
+    let rord = reg.ordinal_of(<RCell as BStackCast>::eightcc()).unwrap();
+
+    // Shared: strong count 2 → refused, object untouched.
+    let cell = RCell::new(&alloc, 5).unwrap();
+    let cell2 = cell.try_clone().unwrap(); // strong = 2
+    let off = cell.handle().range().start();
+    let err = unsafe { reg.move_out(&alloc, rord, off) }.unwrap_err();
+    assert!(err.to_string().contains("[BSTACK0819]"), "got: {err}");
+
+    // Reduce to the sole owner, then move_out succeeds and hands back `v`.
+    drop(cell2); // strong 2 -> 1
+    let moved = unsafe { reg.move_out(&alloc, rord, off) }.unwrap();
+    std::mem::forget(cell); // ownership consumed by move_out
+    let Moved::Pod(v) = &moved["v"] else {
+        panic!("v should be POD");
+    };
+    assert_eq!(u32::from_le_bytes(v[..4].try_into().unwrap()), 5);
+
+    // `(rc, weak)` sole-owner move_out must free BOTH the data shell and the control
+    // block — a leak would grow the stack across identical cycles.
+    let word = reg.ordinal_of(<WCell as BStackCast>::eightcc()).unwrap();
+    let cycle = |a: &_| {
+        let c = WCell::new(a, 7).unwrap();
+        let o = c.handle().range().start();
+        let _ = unsafe { reg.move_out(a, word, o) }.unwrap();
+        std::mem::forget(c);
+    };
+    cycle(&alloc); // warm
+    let base = alloc.stack().len().unwrap();
+    cycle(&alloc);
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "(rc,weak) move_out leaked the control block"
+    );
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -2227,15 +2376,11 @@ fn interpret_swap_weak() {
     assert_ne!(c1, c2);
 
     let old = reg
-        .swap(
-            alloc.stack(),
-            ord,
-            off1,
-            rtti_path!(w),
-            AnyRef::new(wtag, c2),
-        )
+        .swap(alloc.stack(), ord, off1, rtti_path!(w), unsafe {
+            AnyRef::new(wtag, c2)
+        })
         .unwrap();
-    assert_eq!(old, Some(AnyRef::new(wtag, c1)));
+    assert_eq!(old, Some(unsafe { AnyRef::new(wtag, c1) }));
     assert_eq!(ctrl(off1), c2, "weak now points at cell2's control");
 
     drop(reg);
@@ -2268,7 +2413,7 @@ fn interpret_swap_foreign_across_files() {
     let fm = FModel::new(
         &home,
         unsafe { Foreign::<Point>::new(fid, o1) },
-        Foreign::at(FileId::SELF, hp.handle()),
+        unsafe { Foreign::at(hp.handle()) },
         7,
     )
     .unwrap();
@@ -2308,4 +2453,458 @@ fn interpret_swap_foreign_across_files() {
     std::fs::remove_file(&hpath).ok();
     std::fs::remove_file(&fpath).ok();
     std::fs::remove_file(&reg_file).ok();
+}
+
+#[test]
+fn interpret_option_foreign_self_niche() {
+    // Regression: an `Option<Foreign>` niche lives in the target-offset
+    // word (byte 8), not the leading `file_id|type_index` word. A present SELF-file
+    // foreign (file_id=0, type_index=0) has a zero leading word, so testing that word
+    // would misread the live pointer as `None` → leaked / double-owned target.
+    let schema = temp_path("fopt_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FOpt as BStackCast>::eightcc()).unwrap();
+    let ptag = <Point as BStackCast>::eightcc();
+    let (alloc, dpath) = data_alloc("fopt_data");
+
+    // A present, SELF-file owned foreign target + its holder.
+    let pt = Point::new(&alloc, 88, 99).unwrap();
+    let pt_off = BStackBlock::range(pt.handle()).start();
+    let h = FOpt::new(&alloc, Some(unsafe { Foreign::at(pt.handle()) }), 7).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    // Read: the present `Some` is seen, not `Null`.
+    let Value::Block { fields, .. } = reg.read_value(alloc.stack(), ord, off).unwrap() else {
+        panic!("block");
+    };
+    let Value::Some(inner) = &fields[0].1 else {
+        panic!(
+            "present Option<Foreign> must read as Some, got {:?}",
+            fields[0].1
+        );
+    };
+    let Value::Foreign {
+        file_id,
+        offset,
+        tag,
+        ..
+    } = inner.as_ref()
+    else {
+        panic!("foreign inner");
+    };
+    assert_eq!(*file_id, 0);
+    assert_eq!(*offset, pt_off);
+    assert_eq!(*tag, ptag);
+    unsafe { reg.teardown(&alloc, ord, off) }.unwrap();
+
+    // Teardown reclaims the present target — a full build+teardown cycle returns to
+    // baseline (with the bug the target was skipped and leaked).
+    let cycle = || {
+        let pt = Point::new(&alloc, 1, 2).unwrap();
+        let h = FOpt::new(&alloc, Some(unsafe { Foreign::at(pt.handle()) }), 0).unwrap();
+        let o = BStackBlock::range(h.handle()).start();
+        unsafe { reg.teardown(&alloc, ord, o) }.unwrap();
+    };
+    cycle();
+    let base = alloc.stack().len().unwrap();
+    cycle();
+    assert_eq!(
+        alloc.stack().len().unwrap(),
+        base,
+        "present Option<Foreign> target leaked on teardown"
+    );
+
+    // A `None` reads as `Null` and tears down cleanly.
+    let hn = FOpt::new(&alloc, None, 5).unwrap();
+    let offn = BStackBlock::range(hn.handle()).start();
+    let Value::Block { fields, .. } = reg.read_value(alloc.stack(), ord, offn).unwrap() else {
+        panic!("block");
+    };
+    assert_eq!(fields[0].1, Value::Null);
+    unsafe { reg.teardown(&alloc, ord, offn) }.unwrap();
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_vec_len_bounded_to_block() {
+    // Regression: a corrupt/oversized vec length word must yield a clean
+    // [BSTACK0813] error — never an out-of-block read, petabyte allocation, or a
+    // teardown that frees ranges over neighboring live blocks.
+    let schema = temp_path("veclen_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<VecArr as BStackCast>::eightcc()).unwrap();
+    let (alloc, dpath) = data_alloc("veclen_data");
+
+    let h = VecArr::new(&alloc, &[10u8, 20, 30], [1, 2, 3], None).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    // A clean read/teardown works before corruption (sanity).
+    assert!(reg.read_value(alloc.stack(), ord, off).is_ok());
+
+    // Locate the `labels` vec's data block via the schema's field offset, then forge
+    // its length word to an absurd value.
+    let ty = reg.load_type(ord).unwrap();
+    let RttiBody::Struct(fields) = &ty.body else {
+        panic!("struct");
+    };
+    let labels = fields.iter().find(|f| f.name == "labels").unwrap();
+    let mut b = [0u8; 8];
+    alloc
+        .stack()
+        .get_into(off + labels.offset as u64, &mut b)
+        .unwrap(); // VecDesc.data_off
+    let data_off = u64::from_le_bytes(b);
+    assert_ne!(data_off, 0);
+    alloc
+        .stack()
+        .set(data_off, (1u64 << 45).to_le_bytes())
+        .unwrap(); // forge len word @0
+
+    // Read and teardown both reject it cleanly (no abort, no neighbor free).
+    let re = reg.read_value(alloc.stack(), ord, off).unwrap_err();
+    assert!(re.to_string().contains("BSTACK0813"), "read: {re}");
+    let te = unsafe { reg.teardown(&alloc, ord, off) }.unwrap_err();
+    assert!(te.to_string().contains("BSTACK0813"), "teardown: {te}");
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn interpret_owned_vec_len_bounded() {
+    // Regression (soundness): a forged length on an OWNED vector must not
+    // let teardown read neighboring blocks as child offsets and free them.
+    let schema = temp_path("ovec_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<OVec as BStackCast>::eightcc()).unwrap();
+    let pord = reg.ordinal_of(<Point as BStackCast>::eightcc()).unwrap();
+    let (alloc, dpath) = data_alloc("ovec_data");
+
+    let h = OVec::new(
+        &alloc,
+        vec![
+            Point::new(&alloc, 1, 2).unwrap(),
+            Point::new(&alloc, 3, 4).unwrap(),
+        ],
+        7,
+    )
+    .unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    // A live victim block that must survive a corrupt teardown.
+    let victim = Point::new(&alloc, 0xCAFE, 0xBABE).unwrap();
+    let victim_off = BStackBlock::range(victim.handle()).start();
+
+    // Forge the kids vec's length word.
+    let ty = reg.load_type(ord).unwrap();
+    let RttiBody::Struct(fields) = &ty.body else {
+        panic!("struct");
+    };
+    let kids = fields.iter().find(|f| f.name == "kids").unwrap();
+    let mut b = [0u8; 8];
+    alloc
+        .stack()
+        .get_into(off + kids.offset as u64, &mut b)
+        .unwrap();
+    let data_off = u64::from_le_bytes(b);
+    alloc
+        .stack()
+        .set(data_off, (1u64 << 40).to_le_bytes())
+        .unwrap();
+
+    // Teardown rejects the forged length *before* freeing anything; the victim (and,
+    // incidentally, the whole structure) is untouched.
+    let te = unsafe { reg.teardown(&alloc, ord, off) }.unwrap_err();
+    assert!(te.to_string().contains("BSTACK0813"), "teardown: {te}");
+    let Value::Block { fields, .. } = reg.read_value(alloc.stack(), pord, victim_off).unwrap()
+    else {
+        panic!("victim block");
+    };
+    assert_eq!(fields[0].1, pod(&0xCAFE_u32.to_le_bytes()));
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+#[test]
+fn sync_rejects_layout_change() {
+    // Regression: `sync` must reject a persisted descriptor whose layout
+    // differs from the compiled type sharing its tag+name — not silently keep the stale
+    // one and then misread every instance.
+    let ptag = <Point as BStackCast>::eightcc();
+
+    // The real compiled Point descriptor (from a throwaway sync).
+    let real = {
+        let t = temp_path("sync_ok_schema");
+        let reg = rtti::sync(&t).unwrap();
+        let d = reg.load_type(reg.ordinal_of(ptag).unwrap()).unwrap();
+        drop(reg);
+        std::fs::remove_file(&t).ok();
+        d
+    };
+    let RttiBody::Struct(rf) = &real.body else {
+        panic!("Point is a struct");
+    };
+    assert!(rf.len() >= 2, "Point needs >=2 fields for this test");
+
+    // A fresh schema pre-seeded with a STALE Point descriptor: same tag + name, but one
+    // field removed → a different layout.
+    let schema = temp_path("sync_bad_schema");
+    let mut reg = rtti::RttiRegistry::open(&schema).unwrap();
+    let mut fake = real.clone();
+    if let RttiBody::Struct(fields) = &mut fake.body {
+        fields.pop();
+    }
+    fake.ondisk_size -= 4;
+    assert_ne!(fake, real);
+    reg.append(&fake).unwrap();
+
+    // Syncing the real compiled schema over the stale descriptor is rejected.
+    let e = reg.sync_compiled().unwrap_err();
+    assert!(
+        e.to_string().contains("BSTACK0814"),
+        "expected 0814, got: {e}"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+}
+
+#[test]
+fn interpret_swap_rejects_fabricated_target() {
+    // A safe RTTI mutator must not install a caller-fabricated offset into an
+    // owning slot — it validates the target's on-disk header tag first.
+    let schema = temp_path("swapval_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("swapval_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+    let point_tag = <Point as BStackCast>::eightcc();
+
+    let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
+    let off = BStackBlock::range(w.handle()).start();
+
+    // (a) An out-of-bounds fabricated offset (correct tag) is rejected.
+    let oob = unsafe { AnyRef::new(point_tag, 0xDEAD_BEEF) };
+    let e = reg
+        .swap(alloc.stack(), ord, off, &["inner"], oob)
+        .unwrap_err();
+    assert!(e.to_string().contains("BSTACK0815"), "oob: {e}");
+
+    // (b) An in-bounds but WRONG-TYPE offset is rejected (point the `Point` slot at the
+    // `Wrap` block itself — a real block, but not a `Point`).
+    let wrong = unsafe { AnyRef::new(point_tag, off) };
+    let e = reg
+        .swap(alloc.stack(), ord, off, &["inner"], wrong)
+        .unwrap_err();
+    assert!(e.to_string().contains("BSTACK0815"), "wrong-type: {e}");
+
+    // The field is untouched by the rejected swaps.
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, &["inner", "x"]).unwrap(),
+        pod(&1u32.to_le_bytes())
+    );
+
+    // (c) A real Point still swaps in fine.
+    let np = Point::new(&alloc, 8, 9).unwrap();
+    let np_off = BStackBlock::range(np.handle()).start();
+    let _old = reg
+        .swap(alloc.stack(), ord, off, &["inner"], unsafe {
+            AnyRef::new(point_tag, np_off)
+        })
+        .unwrap()
+        .expect("field was non-null");
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, &["inner", "x"]).unwrap(),
+        pod(&8u32.to_le_bytes())
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+// A self-referential owned foreign — used to build a teardown/clone cycle.
+#[bstack_class]
+struct FCycle {
+    #[bstack_owned]
+    me: Option<Foreign<FCycle>>,
+    n: u32,
+}
+
+#[test]
+fn interpret_foreign_cycle_recursion_bounded() {
+    // A foreign cycle (here a SELF back-edge to the block itself) must error
+    // cleanly (bounded native recursion), not stack-overflow / abort.
+    let schema = temp_path("fcycle_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<FCycle as BStackCast>::eightcc()).unwrap();
+    let ftag = <FCycle as BStackCast>::eightcc();
+    let (alloc, dpath) = data_alloc("fcycle_data");
+
+    let a = FCycle::new(&alloc, None, 7).unwrap();
+    let a_off = BStackBlock::range(a.handle()).start();
+
+    // Point `me` at the block itself → a self-owning foreign cycle. (`swap_foreign`
+    // validates the target — the block really is an `FCycle` at `a_off`.)
+    reg.swap_foreign(
+        alloc.stack(),
+        ord,
+        a_off,
+        rtti_path!(me),
+        ForeignPtr {
+            tag: ftag,
+            kind: ForeignKind::Owned,
+            file_id: 0,
+            offset: a_off,
+        },
+    )
+    .unwrap();
+
+    // Teardown recurses the cycle but returns a clean error instead of overflowing.
+    let e = unsafe { reg.teardown(&alloc, ord, a_off) }.unwrap_err();
+    assert!(e.to_string().contains("BSTACK0807"), "teardown: {e}");
+
+    // Clone likewise (its owned-foreign deep-copy recurses the same edge). Since the
+    // intention-first clone WAL, the clone holds the file's WAL lock for the whole
+    // descent, so the SELF back-edge is rejected as a same-file re-entry (the clean
+    // `WouldBlock` the static `ClonePlan` already gives) before the recursion budget is
+    // reached — either way a clean error, never a stack overflow.
+    let e = unsafe { reg.clone_value(&alloc, ord, a_off) }.unwrap_err();
+    assert!(
+        e.to_string().contains("BSTACK0807") || e.kind() == std::io::ErrorKind::WouldBlock,
+        "clone: {e}"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+// A strong ref + an owned vec, for the deferred-release regression.
+#[bstack_class]
+struct Td12 {
+    #[bstack_owned]
+    v: Vec<Point>,
+    #[bstack_strong]
+    s: RCell,
+}
+
+#[test]
+fn interpret_teardown_defers_shared_release_on_walk_error() {
+    // A mid-walk error (here a corrupt vec length) must NOT have decremented
+    // the shared `strong` refcount — releases are deferred to the commit phase, so a
+    // retry re-does nothing (the bug decremented during the walk → retry double-frees).
+    let schema = temp_path("td12_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<Td12 as BStackCast>::eightcc()).unwrap();
+    let (alloc, dpath) = data_alloc("td12_data");
+
+    // A shared rc cell; the field holds one strong ref, `cell` another → refcount 2.
+    let cell = RCell::new(&alloc, 5).unwrap();
+    let cell_off = cell.handle().range().start();
+    let h = Td12::new(
+        &alloc,
+        vec![Point::new(&alloc, 1, 2).unwrap()],
+        cell.try_clone().unwrap(),
+    )
+    .unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+
+    // Read the cell's inline refcount (RC_REFCOUNT_OFFSET = 16).
+    let refcount = |alloc: &FirstFitBStackAllocator| -> u64 {
+        let mut b = [0u8; 8];
+        alloc.stack().get_into(cell_off + 16, &mut b).unwrap();
+        u64::from_le_bytes(b)
+    };
+    assert_eq!(refcount(&alloc), 2);
+
+    // Corrupt the owned vec's length word → the teardown walk errors mid-way.
+    let ty = reg.load_type(ord).unwrap();
+    let RttiBody::Struct(fields) = &ty.body else {
+        panic!("struct");
+    };
+    let vf = fields.iter().find(|f| f.name == "v").unwrap();
+    let mut b = [0u8; 8];
+    alloc
+        .stack()
+        .get_into(off + vf.offset as u64, &mut b)
+        .unwrap();
+    let data_off = u64::from_le_bytes(b);
+    alloc
+        .stack()
+        .set(data_off, (1u64 << 45).to_le_bytes())
+        .unwrap();
+
+    // Teardown errors — and the strong refcount is untouched (release was deferred).
+    let e = unsafe { reg.teardown(&alloc, ord, off) }.unwrap_err();
+    assert!(e.to_string().contains("BSTACK0813"), "teardown: {e}");
+    assert_eq!(
+        refcount(&alloc),
+        2,
+        "shared strong refcount was decremented during a failed walk"
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
+// POD `Option` fields (bytemuck in-place niche), scalar + array.
+#[bstack_class]
+struct PodOpt {
+    m: Option<std::num::NonZeroU32>,
+    arr: [Option<std::num::NonZeroU32>; 2],
+    n: u32,
+}
+
+#[test]
+fn interpret_pod_option_niche() {
+    // A POD `Option<T>` (T: PodInOption) uses bytemuck's IN-PLACE niche, not
+    // the offset-0 `u64` niche `Shape::Option` denotes. It must lower to opaque POD
+    // (scalar and per array element), else the interpreter reads a `u64` overlapping the
+    // next field and misreads `None` as `Some`.
+    use std::num::NonZeroU32;
+    let schema = temp_path("podopt_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let ord = reg.ordinal_of(<PodOpt as BStackCast>::eightcc()).unwrap();
+
+    // Schema: `m` is opaque POD, `arr` an Array of opaque POD — NOT `Shape::Option`.
+    let ty = reg.load_type(ord).unwrap();
+    let RttiBody::Struct(fields) = &ty.body else {
+        panic!("struct");
+    };
+    let f = |n: &str| &fields.iter().find(|f| f.name == n).unwrap().shape;
+    assert_eq!(*f("m"), Shape::Pod { width: 4 });
+    assert_eq!(
+        *f("arr"),
+        Shape::Array {
+            n: 2,
+            inner: Box::new(Shape::Pod { width: 4 }),
+        }
+    );
+
+    // A `None` scalar reads as the niche bytes (zero), and the neighbor `n` is intact.
+    let (alloc, dpath) = data_alloc("podopt_data");
+    let h = PodOpt::new(&alloc, None, [None, NonZeroU32::new(5)], 7).unwrap();
+    let off = BStackBlock::range(h.handle()).start();
+    let Value::Block { fields, .. } = reg.read_value(alloc.stack(), ord, off).unwrap() else {
+        panic!("block");
+    };
+    assert_eq!(fields[0].1, pod(&0u32.to_le_bytes()), "None scalar");
+    let Value::Array(items) = &fields[1].1 else {
+        panic!("arr array");
+    };
+    assert_eq!(items[0], pod(&0u32.to_le_bytes()), "None element");
+    assert_eq!(items[1], pod(&5u32.to_le_bytes()), "Some(5) element");
+    assert_eq!(fields[2].1, pod(&7u32.to_le_bytes()), "neighbor n intact");
+
+    h.bstack_drop(&alloc).unwrap();
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
 }

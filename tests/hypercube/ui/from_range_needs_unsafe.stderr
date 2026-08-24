@@ -1,0 +1,7 @@
+error[E0133]: call to unsafe function `from_range` is unsafe and requires unsafe block
+  --> tests/hypercube/ui/from_range_needs_unsafe.rs:12:13
+   |
+12 |     let _ = <Leaf as BStackBlock>::from_range(BStackRange::new(0, 8));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

@@ -7,7 +7,7 @@ use syn::{Error, Fields, Ident};
 
 use crate::emit::*;
 use crate::layout;
-use crate::model::VariantParts;
+use crate::model::{VariantCtx, VariantParts};
 use crate::util::*;
 
 /// Implementation of the `#[bstack_enum]` attribute macro.
@@ -167,6 +167,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         let disc = &disc_pats[i];
         let vname = &variant.ident;
         let kind = classify_attrs(&variant.attrs)?;
+        // The invariant inputs every `emit::*_variant` lowering shares, bundled once
+        // (the parallel of `FieldCtx` for the enum path).
+        let vctx = VariantCtx {
+            vname,
+            disc,
+            kind,
+            data: &data,
+            view: &view,
+            on_disk: &on_disk,
+            payload_const: &payload_const,
+        };
 
         match &variant.fields {
             // Annotated single-field tuple `#[..] V(T)`: an owned / strong / weak /
@@ -188,7 +199,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // per-variant mirror of a `#[bstack_owned/strong/weak/ref] Vec<..>`
                 // struct field. A `Vec<[T; N]>` stores its offsets FLAT (like the
                 // struct case), reshaped to `Vec<[[T;..];..]>` on read.
-                if let Some(p) = vec_variant(ty, vname, disc, kind, &data, &view, &payload_const)? {
+                let payload_loc = quote! {
+                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64)?
+                };
+                if let Some(p) = vec_variant(&vctx, ty, &payload_loc)? {
                     vp.merge(p);
                     continue;
                 }
@@ -202,16 +216,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // `[u64; TOTAL]` (TOTAL*8 bytes), the per-element mirror of a
                 // `#[bstack_owned/strong/weak/ref] V(T)`; `#[embed]` stores each
                 // child's whole on-disk form verbatim.
-                if let Some(p) = array_variant(
-                    ty,
-                    vname,
-                    disc,
-                    kind,
-                    &data,
-                    &view,
-                    &on_disk,
-                    &payload_const,
-                )? {
+                if let Some(p) = array_variant(&vctx, ty)? {
                     vp.merge(p);
                     continue;
                 }
@@ -221,9 +226,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // annotation names the target's ownership in its own file (teardown /
                 // clone dispatch cross-file, like a scalar `Foreign` struct field).
                 // Concrete target only for now; container-in-variant is not handled.
-                if let Some(p) =
-                    foreign_variant(ty, vname, disc, kind, &data, &view, &payload_const)?
-                {
+                if let Some(p) = foreign_variant(&vctx, ty)? {
                     vp.merge(p);
                     continue;
                 }
@@ -233,23 +236,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // `ForeignPtr`, all at cumulative byte offsets in the payload (the
                 // per-variant mirror of a `#[ann] (A, Foreign<T>)` struct field). The
                 // annotation names the foreign elements' ownership.
-                if let Some(p) =
-                    foreign_tuple_variant(ty, vname, disc, kind, &data, &view, &payload_const)?
-                {
+                if let Some(p) = foreign_tuple_variant(&vctx, ty)? {
                     vp.merge(p);
                     continue;
                 }
 
-                vp.merge(single_block_variant(
-                    ty,
-                    vname,
-                    disc,
-                    kind,
-                    &data,
-                    &view,
-                    &on_disk,
-                    &payload_const,
-                )?);
+                vp.merge(single_block_variant(&vctx, ty)?);
             }
             // A POD aggregate: unit, an all-POD tuple `V(A, B, ..)`, or an all-POD
             // struct `V { x: A, .. }`. The fields are packed sequentially into the
@@ -257,15 +249,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             // read/written **unaligned**, so field alignment is irrelevant — the
             // packed byte sequence of POD fields is itself just POD bytes.
             _ => {
-                vp.merge(pod_aggregate_variant(
-                    variant,
-                    vname,
-                    disc,
-                    kind,
-                    &data,
-                    &view,
-                    &payload_const,
-                )?);
+                vp.merge(pod_aggregate_variant(&vctx, variant)?);
             }
         }
     }
@@ -278,6 +262,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         read_arms,
         move_arms,
         drop_arms,
+        raw_arms,
         clone_arms,
         payload_sizes,
         pod_types,
@@ -298,31 +283,48 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         |t| t.bytes().collect::<Vec<u8>>(),
     );
     let tag = build_tag(hash, &prefix);
-    let eightcc = eightcc_expr(&tag.bytes);
+    let data_base = eightcc_expr(&tag.bytes);
     // For a generic enum, fold each type argument's tag into the discriminant so
     // distinct instantiations get distinct tags (mixed at runtime in `eightcc()`).
-    let eightcc = if type_params.is_empty() {
-        eightcc
+    let data_mixed = if type_params.is_empty() {
+        data_base
     } else {
         let mixes = type_params
             .iter()
             .map(|p| quote!(.mix(<#p as ::bstack_raii::BStackCast>::eightcc())));
-        quote!(#eightcc #(#mixes)*)
+        quote!(#data_base #(#mixes)*)
     };
+    // Fold the module path so same-named enums in different modules stay distinct
+    // (issue 2). Runtime `module_path!()`, consistent with the on-disk header and
+    // the RTTI registry (both go through this `eightcc()`).
+    let eightcc = quote!(#data_mixed.mix_str(::core::module_path!()));
 
-    // Control-block tag (rc, weak): the data tag with its prefix lowercased, or a
-    // `ctrl_tag` override.
-    let ctrl_prefix = attr.ctrl_tag.as_ref().map_or_else(
-        || {
-            prefix
-                .iter()
-                .map(u8::to_ascii_lowercase)
-                .collect::<Vec<u8>>()
-        },
-        |t| t.bytes().collect::<Vec<u8>>(),
-    );
-    let ctrl_tag = build_tag(hash, &ctrl_prefix);
-    let ctrl_eightcc = eightcc_expr(&ctrl_tag.bytes);
+    // Control-block tag (rc, weak). Default: the data tag with a reserved hash bit
+    // toggled — same readable prefix, structurally distinct (issue 36). Explicit
+    // `ctrl_tag =` override: its own readable prefix, still module-path-folded.
+    let (ctrl_eightcc, ctrl_truncated) = match attr.ctrl_tag.as_ref() {
+        None => (quote!(#eightcc.with_ctrl_bit()), false),
+        Some(t) => {
+            let ctrl_prefix = t.bytes().collect::<Vec<u8>>();
+            let ctrl_tag = build_tag(hash, &ctrl_prefix);
+            // [BSTACK0006] An explicit `ctrl_tag` equal to the data tag collapses
+            // the data/control distinction. The default (`with_ctrl_bit`) can't
+            // reach this, so only the override is checked.
+            if ctrl_tag.bytes == tag.bytes {
+                return Err(Error::new_spanned(
+                    &input.ident,
+                    "[BSTACK0006] the explicit `ctrl_tag` equals the data tag — a \
+                     control block would then pass every data-block identity check; \
+                     choose a distinct `ctrl_tag` (or omit it to auto-derive one)",
+                ));
+            }
+            let ctrl_base = eightcc_expr(&ctrl_tag.bytes);
+            (
+                quote!(#ctrl_base.mix_str(::core::module_path!())),
+                ctrl_tag.truncated,
+            )
+        }
+    };
 
     // Refcount / control machinery, mirroring the struct rc modes: an injected
     // field after the header, `BStackShared` (rc / rc,weak), and (rc, weak) a
@@ -418,6 +420,64 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     } else {
         (quote!(), quote!())
     };
+    // Hand-back for the enum constructor: when a variant owns
+    // children (`drop_arms` non-empty), a failed `new` reconstructs the consumed
+    // `EData` (via the same per-variant `#move_arms` `bstack_move!` uses) and hands
+    // it back through `ConstructError` rather than orphaning it. Excluded for an
+    // enum with an `#[embed]` variant: its payload slot is a zeroed placeholder at
+    // construction time (the child is copied in post-write), so `#move_arms` — which
+    // re-homes from the payload bytes — cannot reconstruct it; such an enum keeps a
+    // plain `io::Result` (it never had failure reclaim, so this is no regression).
+    let enum_has_owning = !drop_arms.is_empty() && !enum_has_embed;
+    let reconstruct_decl = if enum_has_owning {
+        // The `#move_arms` name `bstack_move`'s `'__mv`; re-home them to the
+        // constructor's `'__e` so the reconstruction type-checks inside `new`.
+        let move_arms_e: Vec<TokenStream> = move_arms
+            .iter()
+            .map(|a| rename_lifetime(a, "__mv", "__e"))
+            .collect();
+        quote! {
+            #[allow(unused_variables)]
+            let __alloc = allocator;
+            #[allow(unused_variables)]
+            let __reconstruct = |__disc: #disc_ty, __pl: [u8; #payload_const]|
+                -> ::std::io::Result<#data_ty>
+            {
+                ::std::result::Result::Ok(match __disc {
+                    #(#move_arms_e)*
+                    _ => return ::std::result::Result::Err(::std::io::Error::new(
+                        ::std::io::ErrorKind::InvalidData,
+                        "bstack_enum: invalid discriminant",
+                    )),
+                })
+            };
+        }
+    } else {
+        quote!()
+    };
+    // The failure epilogue (with `__e: io::Error`, `__disc`, `__payload` in scope):
+    // reconstruct the consumed `EData` and hand it back, or `lost` if that itself
+    // faults.
+    let on_fail = if enum_has_owning {
+        quote! {
+            return match __reconstruct(__disc, __payload) {
+                ::std::result::Result::Ok(__hb) =>
+                    ::core::result::Result::Err(::bstack_raii::ConstructError::recovered(__e, __hb)),
+                ::std::result::Result::Err(_) =>
+                    ::core::result::Result::Err(::bstack_raii::ConstructError::lost(__e)),
+            };
+        }
+    } else {
+        quote!(return ::std::result::Result::Err(__e);)
+    };
+    let enum_ret = |ok: &TokenStream| -> TokenStream {
+        if enum_has_owning {
+            quote!(::core::result::Result<#ok, ::bstack_raii::ConstructError<#data_ty>>)
+        } else {
+            quote!(::std::io::Result<#ok>)
+        }
+    };
+
     let enum_new = match mode {
         Mode::Plain | Mode::Rc => {
             let injected_init = if let Mode::Rc = mode {
@@ -439,16 +499,18 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 quote! {
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
-                            <Self as ::bstack_raii::BStackBlock>::from_range(__data),
+                            unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__data) },
                         )
                     })
                 }
             };
+            let ret_ty = enum_ret(&new_ret);
             quote! {
                 #vis fn new<'__e, __A: ::bstack_raii::BStackRaiiAllocator>(
                     allocator: &'__e __A,
                     data: #data_ty,
-                ) -> ::std::io::Result<#new_ret> {
+                ) -> #ret_ty {
+                    #reconstruct_decl
                     #embed_decl
                     let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
                         #(#new_arms)*
@@ -459,13 +521,18 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         __bstack_disc: __disc,
                         __bstack_payload: __payload,
                     };
-                    let mut __slice = allocator.alloc(#enum_size)?;
+                    let mut __slice = match allocator.alloc(#enum_size) {
+                        ::std::result::Result::Ok(__s) => __s,
+                        // Hand the consumed value back.
+                        ::std::result::Result::Err(__e) => { #on_fail }
+                    };
                     let __data = __slice.as_range();
                     if let ::std::result::Result::Err(__e) =
                         __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
                     {
                         let _ = allocator.dealloc(__slice);
-                        return ::std::result::Result::Err(__e);
+                        // Hand the consumed value back.
+                        #on_fail
                     }
                     #embed_post
                     #finish
@@ -476,16 +543,22 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             let ctrl_size = quote! {
                 ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
             };
+            let ret_ty = enum_ret(&quote!(::bstack_raii::BStackRc<'__e, Self, __A>));
             quote! {
                 #vis fn new<'__e, __A: ::bstack_raii::BStackRaiiAllocator>(
                     allocator: &'__e __A,
                     data: #data_ty,
-                ) -> ::std::io::Result<::bstack_raii::BStackRc<'__e, Self, __A>> {
+                ) -> #ret_ty {
+                    #reconstruct_decl
                     #embed_decl
                     let (__disc, __payload): (#disc_ty, [u8; #payload_const]) = match data {
                         #(#new_arms)*
                     };
-                    let __blocks = ::bstack_raii::BStackRaiiAllocator::alloc_many(allocator, &[#enum_size, #ctrl_size])?;
+                    let __blocks = match ::bstack_raii::BStackRaiiAllocator::alloc_many(allocator, &[#enum_size, #ctrl_size]) {
+                        ::std::result::Result::Ok(__b) => __b,
+                        // Hand the consumed value back.
+                        ::std::result::Result::Err(__e) => { #on_fail }
+                    };
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
                     let __on_disk = #on_disk {
@@ -494,7 +567,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         __bstack_disc: __disc,
                         __bstack_payload: __payload,
                     };
-                    let __ctrl_payload = ::bstack_raii::build_control_payload(
+                    let __ctrl_payload = ::bstack_raii::__private::build_control_payload(
                         #ctrl_eightcc,
                         __data.start(),
                         #ctrl_size,
@@ -509,8 +582,11 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)
                     {
-                        let _ = ::bstack_raii::BStackRaiiAllocator::free_many(allocator, [__data, __ctrl]);
-                        return ::std::result::Result::Err(__e);
+                        // SAFETY (emitted): `__data` / `__ctrl` are the two blocks this
+                        // constructor just allocated and failed to initialize.
+                        let _ = unsafe { ::bstack_raii::BStackRaiiAllocator::free_many(allocator, [__data, __ctrl]) };
+                        // Hand the consumed value back.
+                        #on_fail
                     }
                     #embed_post
                     ::std::result::Result::Ok(unsafe {
@@ -533,10 +609,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     } else {
         quote!()
     };
-    let weakable_items = weakable_items(mode, name, &control, vis);
+    let weakable_items = weakable_items(mode, name, &control, &ctrl_eightcc, vis);
 
     let allow_deprecated = input.attrs.iter().any(is_allow_deprecated);
-    let ctrl_truncated = mode == Mode::RcWeak && ctrl_tag.truncated;
+    let ctrl_truncated = mode == Mode::RcWeak && ctrl_truncated;
     let overlong_warning = if (tag.truncated || ctrl_truncated)
         && !(attr.allow_overlong || allow_deprecated)
     {
@@ -579,7 +655,17 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             let __pl = __od.__bstack_payload;
             match __disc {
                 #(#drop_arms)*
-                _ => {}
+                // A known discriminant whose variant owns nothing: nothing to free.
+                #(#disc_pats)|* => {}
+                // An unknown discriminant is corruption. `read` and `bstack_move!`
+                // already reject it; silently returning `Ok` here would report a
+                // successful teardown that freed nothing (a hidden leak).
+                _ => {
+                    return ::std::result::Result::Err(::std::io::Error::new(
+                        ::std::io::ErrorKind::InvalidData,
+                        "bstack_enum: invalid discriminant",
+                    ));
+                }
             }
         }
     };
@@ -608,7 +694,18 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 let mut __pl = __od.__bstack_payload;
                 match __disc {
                     #(#clone_arms)*
-                    _ => {}
+                    // A known discriminant whose variant owns nothing: the verbatim
+                    // byte copy is the correct clone.
+                    #(#disc_pats)|* => {}
+                    // An unknown discriminant must not be byte-copied: whatever the
+                    // payload slot holds would be copied un-repointed, so the clone
+                    // and the original would name one child — two owners.
+                    _ => {
+                        return ::std::result::Result::Err(::std::io::Error::new(
+                            ::std::io::ErrorKind::InvalidData,
+                            "bstack_enum: invalid discriminant",
+                        ));
+                    }
                 }
                 __od.__bstack_payload = __pl;
             }
@@ -648,7 +745,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                     })?;
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
-                            <Self as ::bstack_raii::BStackBlock>::from_range(__dst),
+                            unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__dst) },
                         )
                     })
                 }
@@ -732,8 +829,12 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             // `ReplaceError` "never lose the new value" contract.
             quote! {
                 /// Replace the whole enum value (variant + payload), moving the old
-                /// value out. One crash-atomic `set`; on I/O failure the *new* value
-                /// is handed back through [`ReplaceError`](::bstack_raii::ReplaceError).
+                /// value out. Thread-safe: the read of the old record and the write
+                /// of the new happen together as one [`BStack::swap`], so concurrent
+                /// callers each take the distinct value they displaced — an old
+                /// variant's owned children are never double-owned.
+                /// On I/O failure the *new* value is handed back through
+                /// [`ReplaceError`](::bstack_raii::ReplaceError).
                 #[allow(unused_variables)]
                 #vis fn replace<'__e, __A: ::bstack_raii::BStackRaiiAllocator>(
                     &self,
@@ -755,38 +856,47 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                             )),
                         })
                     };
-                    // 1. Read the old disc + payload before consuming `data`.
-                    let mut __buf = [0u8; ::core::mem::size_of::<#on_disk>()];
-                    let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
-                    let (__old_disc, __old_pl) =
-                        match __r.read_on_disk(allocator.stack(), &mut __buf) {
-                            ::std::result::Result::Ok(__od) =>
-                                (__od.__bstack_disc, __od.__bstack_payload),
-                            ::std::result::Result::Err(__e) =>
-                                return ::core::result::Result::Err(
-                                    ::bstack_raii::ReplaceError::recovered(__e, data)),
-                        };
-                    // 2. Consume the new value into its on-disk image.
+                    // 1. Consume the new value into its on-disk image.
                     #build_image
-                    // 3. Commit (single atomic write of the same-size record).
-                    if let ::std::result::Result::Err(__e) = allocator
+                    // 2. Atomic exchange: install the new record and take the old one
+                    //    in one locked step (same-size record).
+                    let __old_bytes = match allocator
                         .stack()
-                        .set(self.0.start(), ::bstack_raii::bytemuck::bytes_of(&__on_disk))
+                        .swap(self.0.start(), ::bstack_raii::bytemuck::bytes_of(&__on_disk))
                     {
-                        return ::core::result::Result::Err(
-                            match __reconstruct(__disc, __payload) {
-                                ::std::result::Result::Ok(__hb) =>
-                                    ::bstack_raii::ReplaceError::recovered(__e, __hb),
-                                ::std::result::Result::Err(_) =>
-                                    ::bstack_raii::ReplaceError::lost(__e),
-                            },
-                        );
-                    }
-                    // 4. Reconstruct + return the old value (now overwritten on disk).
-                    match __reconstruct(__old_disc, __old_pl) {
+                        ::std::result::Result::Ok(__b) => __b,
+                        ::std::result::Result::Err(__e) => {
+                            return ::core::result::Result::Err(
+                                match __reconstruct(__disc, __payload) {
+                                    ::std::result::Result::Ok(__hb) =>
+                                        ::bstack_raii::ReplaceError::recovered(__e, __hb),
+                                    ::std::result::Result::Err(_) =>
+                                        ::bstack_raii::ReplaceError::lost(__e),
+                                },
+                            );
+                        }
+                    };
+                    // 3. Decode the displaced record and reconstruct the old value.
+                    let __old_od: #on_disk =
+                        ::bstack_raii::bytemuck::pod_read_unaligned(&__old_bytes);
+                    match __reconstruct(__old_od.__bstack_disc, __old_od.__bstack_payload) {
                         ::std::result::Result::Ok(__old) => ::core::result::Result::Ok(__old),
-                        ::std::result::Result::Err(__e) =>
-                            ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e)),
+                        // The only fallible reconstruction is a `#[bstack_strong]`
+                        // variant's `strong_parts` (a control-block read); the new value
+                        // is already installed, but the old variant's strong child block
+                        // is untouched at a known offset. Hand it back as a raw range so
+                        // it stays recoverable (retry `strong_parts` once I/O recovers, or
+                        // reclaim it) rather than leaking.
+                        ::std::result::Result::Err(__e) => {
+                            let __pl = __old_od.__bstack_payload;
+                            let __raw: ::std::vec::Vec<::bstack_raii::BStackRange> =
+                                match __old_od.__bstack_disc {
+                                    #(#raw_arms)*
+                                    _ => ::std::vec![],
+                                };
+                            ::core::result::Result::Err(
+                                ::bstack_raii::ReplaceError::lost_raw(__e, __raw))
+                        }
                     }
                 }
             }
@@ -870,7 +980,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
 
         impl #enum_impl_g ::bstack_raii::BStackBlock for #name #enum_ty_g #enum_where {
             type OnDisk = #on_disk;
-            fn from_range(range: ::bstack_raii::BStackRange) -> Self {
+            unsafe fn from_range(range: ::bstack_raii::BStackRange) -> Self {
                 #name(range #enum_phantom_ctor)
             }
             fn range(&self) -> ::bstack_raii::BStackRange {
@@ -924,15 +1034,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             }
         }
 
-        impl #enum_impl_g ::bstack_raii::BStackDrop for #name #enum_ty_g #enum_where {
-            fn bstack_drop<__A: ::bstack_raii::BStackRaiiAllocator>(
-                self,
-                allocator: &__A,
-            ) -> ::std::io::Result<()> {
-                <Self as ::bstack_raii::BStackBlock>::__bstack_drop_children(self.0, allocator)?;
-                unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
-            }
-        }
+        // The enum handle is a pure view: no `BStackDrop`. Freeing goes through an
+        // affine owner (see `teardown::drop_block`).
 
         impl #enum_impl_g #name #enum_ty_g #enum_where {
             /// Allocate a new enum block holding `data`'s variant + payload.

@@ -129,6 +129,15 @@ A whole array-of-vectors can't be nullable. **Fix:** make each element nullable 
 A whole foreign-array can't be nullable (a null foreign is already `offset 0`). **Fix:**
 use `[Option<Foreign<T>>; N]`.
 
+### BSTACK0112 — zero-length array dimension
+A literal `0` array length (e.g. `[T; 0]`, including as a `Vec<[T; 0]>` element)
+compiles as ordinary Rust but the generated accessor's element-chunking has no valid
+zero-sized chunk, so it would panic on the field's very first read — a legitimate-looking
+type definition failing on ordinary use, not a corrupt-input hazard. **Fix:** the
+dimension is a mistake — use a positive length, or drop the array entirely if the field
+is meant to be empty. (A non-literal, const-generic dimension that resolves to `0` only
+at monomorphization is not caught by this check.)
+
 ---
 
 ## Enum variants & discriminants (`02xx`)
@@ -190,6 +199,12 @@ A `Foreign` must target a block, not an array. (`[Foreign<T>; N]` is fine;
 ### BSTACK0308 — `Foreign` target is a tuple
 A `Foreign` must target a `#[bstack_block]`, not a tuple. **Fix:** bridge with a
 `#[bstack_block]` struct.
+
+### BSTACK0310 — field named `allocator`
+A `#[bstack_block]` field is named `allocator`, which collides with the fixed `allocator`
+parameter of the generated constructor (`X::new(allocator, ..fields..)`) — left to the
+compiler this surfaces as a confusing `E0415`/`E0599`. **Fix:** rename the field (e.g.
+`alloc`, `arena`).
 
 ---
 
@@ -417,3 +432,85 @@ the type, or `set_class_value` targeted a **const** class variable (only a
 `#[bstack_mut]` one is settable) or passed a value of the wrong width (the slot is
 fixed-size). **Fix:** name a `#[bstack_static]` field; write only a `#[bstack_mut]`
 one, with exactly its byte width.
+
+### BSTACK0813 — RTTI vector length exceeds its data block
+A vector data block's on-disk length word (`@0`) is larger than the block's own
+element region (`data_size − header`) — a corrupt or forged length. The interpreter
+rejects it rather than reading elements past the block (which would materialize an
+enormous allocation on `read`, or in `teardown` treat neighboring **live** blocks'
+bytes as owned-child offsets and free ranges over them). **Fix:** the length word is
+corrupt relative to the descriptor — repair the data, or re-`sync` against the correct
+schema.
+
+### BSTACK0814 — RTTI schema mismatch on `sync`
+`sync` found a persisted type descriptor whose tag **and name** match a compiled-in
+type, but whose **layout differs** — a field was added, removed, reordered, or resized
+(or the `rc` / `weak` mode or `ondisk_size` changed). The eightcc is derived from the
+type name only, so an incompatible schema change moves neither the tag nor the name;
+the stored offsets / shapes therefore no longer describe the compiled type, and every
+interpreter op against data written under the old layout would misread (and, for
+teardown / clone, free or patch garbage offsets). `sync` rejects it rather than
+silently keeping the stale descriptor. **Fix:** the on-disk data predates the layout
+change — migrate it, or read it with a build whose type matches the persisted schema.
+
+### BSTACK0815 — RTTI mutator target does not name a live block
+A safe RTTI mutator — `set` on a `ref` field, `swap`, or `swap_foreign` — was handed a
+target offset that does not hold a live block of the field's declared type (the on-disk
+header tag at the offset does not match, or the offset is out of bounds / in a file that
+is not `attach`ed). These mutators install a caller-supplied offset into an *owning*
+slot, so — unlike the `unsafe` `Foreign::new` / `raw_<field>_slice`, whose promise
+can't be checked — they verify it against the on-disk header first, rejecting a
+fabricated [`AnyRef`](AnyRef) / [`ForeignPtr`] that a later teardown would free (or a
+path would descend into). For `swap` on a `weak` field the check follows the control
+block's forward data pointer. **Fix:** pass an offset obtained from a real block (e.g.
+from reading the field, `move_out`, or `AnyRef::from_block`), and `attach` a foreign
+target's file before installing a pointer to it.
+
+### BSTACK0816 — RTTI enum discriminant width exceeds 8 bytes
+A persisted RTTI enum record declares a discriminant `width` larger than 8 bytes, which
+no real discriminant needs (it is read into a `u64`). Such a width can only come from a
+corrupt or hand-forged schema record. `decode_type` rejects it when the record is loaded,
+and the interpreter's `read_disc` refuses it as a backstop, rather than indexing an
+8-byte buffer out of bounds. **Fix:** the schema stack is corrupt — restore the file from
+a good copy; a type compiled by `#[bstack_class]` never emits a width above 8.
+
+### BSTACK0817 — RTTI record component exceeds its on-disk field width
+An RTTI record component is too large to serialize without overflowing the fixed-width
+length field that describes it: a type/field/variant **name** longer than 65535 bytes, a
+struct **field count** or enum **variant count** above 65535, a **tuple arity** above 255,
+a field's encoded **shape length** above 65535 bytes, a **class-variable value** above
+4 GiB, or a whole **record body** above 4 GiB. `append` / `sync` validates every such
+length while encoding and returns this error *before* writing, rather than silently
+truncating it into a permanently unreadable record. **Fix:** the offending
+`#[bstack_class]` type is pathologically large or deeply nested — split it into smaller
+types, shorten the name, or shrink the oversized class-variable value.
+
+### BSTACK0818 — RTTI shape nesting exceeds the maximum depth
+A persisted field shape nests deeper than the decoder accepts (64 levels). Each
+`Option` / `Array` / `Vec` / `Tuple` / `Class` layer is one on-disk nesting tag that
+`Shape::decode` follows recursively, so an unbounded record could overflow the native
+stack while loading. Real `#[bstack_class]` fields nest only a few levels, so this depth
+can only come from a corrupt or hand-forged record; it is rejected during `load_type` /
+`open` rather than recursed into. **Fix:** the schema stack is corrupt — restore the file
+from a good copy.
+
+### BSTACK0819 — RTTI move_out of a shared reference-counted block
+[`move_out`](RttiRegistry::move_out) was asked to disassemble a `rc` / `(rc, weak)` root
+whose strong count is not 1 — i.e. other strong owners still reference it. Like
+`bstack_move!` on a `BStackRc` (a sole-owner `try_unwrap`), the interpreter refuses:
+freeing the shell would be a use-after-free for the other owners, and for `(rc, weak)`
+would leave the control block naming freed data. The block is left untouched. **Fix:**
+release the other strong references first so the caller is the sole owner, or operate on a
+plain (non-`rc`) block.
+
+### BSTACK081A — RTTI offset arithmetic overflow
+`read_value`'s interpreter walk computed a field/element offset by adding a
+schema-declared delta (a field offset, enum payload offset, or array/vec
+element stride × index) to a **root offset that can be entirely
+caller/attacker-controlled** (a fuzzed argument, or a forged pointer resolved
+through `read_ptr`/`any_ref`), and the addition would overflow `u64`. Rather
+than wrap to an unrelated in-bounds offset (silently misreading a neighboring
+block) or panic under `overflow-checks`, the walk rejects the record. **Fix:**
+the root offset is bogus — obtain it from a real block (a constructor, a field
+read, `move_out`, or `AnyRef::from_block`) rather than an arbitrary value.
+

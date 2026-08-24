@@ -1,0 +1,16 @@
+error[E0061]: this function takes 1 argument but 2 arguments were supplied
+  --> tests/hypercube/ui/foreign_at_no_file_arg.rs:11:13
+   |
+11 |     let _ = Foreign::at(other_file, local);
+   |             ^^^^^^^^^^^ ---------- unexpected argument #1 of type `FileId`
+   |
+note: associated function defined here
+  --> src/foreign.rs
+   |
+   |     pub unsafe fn at(target: &T) -> Self {
+   |                   ^^
+help: remove the extra argument
+   |
+11 -     let _ = Foreign::at(other_file, local);
+11 +     let _ = Foreign::at(local);
+   |

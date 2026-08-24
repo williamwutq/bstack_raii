@@ -3,7 +3,21 @@
 //! Both are [`bytemuck::Pod`] so they can be embedded directly in a generated
 //! `XOnDisk` struct and read back with `bytemuck::from_bytes`.
 
+use std::io;
+
 use bytemuck::{Pod, Zeroable};
+
+/// Add a small field-offset constant (`RC_REFCOUNT_OFFSET`/`CTRL_*_OFFSET`, a
+/// stdlib collection's own `N*_OFF` node-field constants, …) to a base offset,
+/// rejecting overflow. The base routinely originates from an on-disk pointer (a
+/// `ctrl` back-pointer, a `Foreign` target, a linked structure's stored
+/// next/prev/child offset) that can be corrupted or forged, so plain `+` would
+/// either panic under `overflow-checks` or silently wrap to an unrelated
+/// in-bounds offset that a later read/write would then corrupt.
+pub fn checked_off(base: u64, delta: u64) -> io::Result<u64> {
+    base.checked_add(delta)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block offset overflow"))
+}
 
 /// Write `val` as a little-endian `u64` at byte offset `off` in `buf`.
 ///
@@ -61,14 +75,29 @@ impl EightCC {
     /// uses this to give each instantiation a distinct-but-related tag — the
     /// readable prefix stays the outer type's, while the type arguments perturb
     /// the hash bytes so `Foo<A>` and `Foo<B>` never share a discriminant (which
-    /// would let `bstack_cast!` confuse them). Deterministic and associative
-    /// enough to compose for nested generics.
+    /// would let `bstack_cast!` confuse them). Deterministic, and composes for
+    /// nested generics.
+    ///
+    /// **Order-sensitive.** The FNV digest is seeded with `self`'s *current* bytes
+    /// before folding `other`, so a later `mix` sees the state a prior one produced:
+    /// `base.mix(A).mix(B) != base.mix(B).mix(A)`. (Folding only `other` would perturb
+    /// via a plain XOR, which is commutative — `Foo<A,B>` and `Foo<B,A>` would then
+    /// collide to one tag, and the tag is the *sole* `bstack_cast!` / on-disk type
+    /// identity, so the cast could not tell them apart.)
     ///
     /// Note: a fully-specified 8-byte explicit `tag = "…"` leaves no hash bytes,
     /// so every instantiation shares it — don't pin an 8-byte tag on a generic.
     pub const fn mix(self, other: EightCC) -> EightCC {
-        // A small FNV-1a digest of `other`'s bytes.
+        // FNV-1a over `self`'s bytes *then* `other`'s — seeding with the running tag
+        // makes the fold order-sensitive (see above), not XOR-commutative.
         let mut d: u64 = 0xcbf2_9ce4_8422_2325;
+        let sb = self.0;
+        let mut i = 0;
+        while i < 8 {
+            d ^= sb[i] as u64;
+            d = d.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
+        }
         let ob = other.0;
         let mut i = 0;
         while i < 8 {
@@ -85,6 +114,55 @@ impl EightCC {
             }
             i += 1;
         }
+        Self(out)
+    }
+
+    /// Fold an arbitrary string into this tag's non-readable (high-bit-set) hash
+    /// bytes, leaving the leading ASCII prefix untouched — the same domain `mix`
+    /// perturbs. The generated `eightcc()` uses this to fold the type's
+    /// `module_path!()` into the tag, so two same-named types in *different
+    /// modules* of one crate get distinct tags (the crate + bare identifier hash
+    /// alone does not). Deterministic; FNV-1a over
+    /// `self`'s current bytes then the string's, matching `mix`'s seeding.
+    pub const fn mix_str(self, s: &str) -> EightCC {
+        let mut d: u64 = 0xcbf2_9ce4_8422_2325;
+        let sb = self.0;
+        let mut i = 0;
+        while i < 8 {
+            d ^= sb[i] as u64;
+            d = d.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
+        }
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            d ^= bytes[i] as u64;
+            d = d.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
+        }
+        let db = d.to_le_bytes();
+        let mut out = self.0;
+        let mut i = 0;
+        while i < 8 {
+            if out[i] & 0x80 != 0 {
+                out[i] = (out[i] ^ db[i]) | 0x80;
+            }
+            i += 1;
+        }
+        Self(out)
+    }
+
+    /// Derive a control-block tag from this (data) tag by toggling one reserved
+    /// bit in the trailing hash byte. The result differs from the data tag in
+    /// exactly that bit, so `data_tag != ctrl_tag` is guaranteed **structurally**,
+    /// regardless of what the readable prefix contains — unlike the old
+    /// prefix-lowercasing, which was the identity on caseless prefixes (digits,
+    /// punctuation) and could collapse the two.
+    /// Bit 6 (`0x40`) is chosen because `mix` / `mix_str` force bit 7 (`0x80`) and
+    /// never touch bit 6, so the toggle survives generic mixing.
+    pub const fn with_ctrl_bit(self) -> EightCC {
+        let mut out = self.0;
+        out[7] ^= 0x40;
         Self(out)
     }
 }

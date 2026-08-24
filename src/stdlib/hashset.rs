@@ -47,7 +47,7 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackHashSet`]: header, bucket-block pointer,
 /// bucket count `cap`, key count `len`, `used` (occupied + tombstone), and the
@@ -95,21 +95,23 @@ fn place_writes(
     target: u64,
     slot_was_empty: bool,
     key_bytes: &[u8],
-) -> Vec<(u64, SmallBuf)> {
+) -> io::Result<Vec<(u64, SmallBuf)>> {
     let mut img = Vec::with_capacity(8 + key_bytes.len());
     img.extend_from_slice(&OCCUPIED.to_le_bytes());
     img.extend_from_slice(key_bytes);
+    // `m.table` is an on-disk pointer that can be corrupted/forged.
+    let off = target
+        .checked_mul(stride)
+        .and_then(|d| m.table.checked_add(d))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table offset"))?;
     let mut w = vec![
-        (
-            m.table + target * stride,
-            SmallBuf::Heap(img.into_boxed_slice()),
-        ),
+        (off, SmallBuf::Heap(img.into_boxed_slice())),
         w8(handle + LEN_OFF, m.len + 1),
     ];
     if slot_was_empty {
         w.push(w8(handle + USED_OFF, m.used + 1));
     }
-    w
+    Ok(w)
 }
 
 /// An owned open-addressing set of `Pod` keys with an embedded Bloom filter.
@@ -129,9 +131,11 @@ impl<K: Pod> BStackHashSet<K> {
     /// The embedded Bloom filter (its handle offset is fixed after construction).
     fn bloom(&self, stack: &BStack) -> io::Result<BStackCountingBloomFilter<K>> {
         let off = read_u64(stack, self.range.start() + BLOOM_OFF)?;
-        Ok(<BStackCountingBloomFilter<K> as BStackBlock>::from_range(
-            BStackRange::new(off, BLOOM_SIZE),
-        ))
+        Ok(unsafe {
+            <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                off, BLOOM_SIZE,
+            ))
+        })
     }
 
     /// Allocate an empty set with a default-sized Bloom filter.
@@ -166,9 +170,11 @@ impl<K: Pod> BStackHashSet<K> {
             Ok(range) => Ok(unsafe { BStackOwned::from_raw(Self::from_range(range)) }),
             Err(e) => {
                 // SAFETY: the Bloom child was just allocated, referenced by nobody.
-                let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(
-                    BStackRange::new(bloom_off, BLOOM_SIZE),
-                );
+                let bloom = unsafe {
+                    <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                        bloom_off, BLOOM_SIZE,
+                    ))
+                };
                 let _ = unsafe { BStackOwned::from_raw(bloom) }.bstack_drop(allocator);
                 Err(e)
             }
@@ -209,7 +215,15 @@ impl<K: Pod> BStackHashSet<K> {
         // for a key that was actually present, per the counting-Bloom contract).
         let was_present = self.table_remove(allocator, &key_bytes, hash)?;
         if was_present {
-            self.bloom(allocator.stack())?.remove(allocator, key)?;
+            // The table removal above is the durable commit — the key is gone. The
+            // Bloom decrement is best-effort filter maintenance: if it (or reading the
+            // filter) fails, the counter stays over-high, which only ever causes extra
+            // false positives — a later `contains` still probes the table and answers
+            // correctly — never a false negative. So a decrement failure must not turn
+            // this completed removal into a reported `Err`.
+            let _ = self
+                .bloom(allocator.stack())
+                .and_then(|b| b.remove(allocator, key));
         }
         Ok(was_present)
     }
@@ -226,11 +240,13 @@ impl<K: Pod> BStackHashSet<K> {
     /// A lazy iterator over all keys in **unspecified** order, yielding
     /// `io::Result`. A read snapshot: do not mutate the set while iterating.
     pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<HashSetIter<'a, K>> {
-        let [table, cap] = read_fields::<2>(stack, self.range.start() + TABLE_OFF)?;
+        let [table, cap, len] = read_fields::<3>(stack, self.range.start() + TABLE_OFF)?;
         Ok(HashSetIter {
             stack,
+            block_off: self.range.start(),
             table,
             cap,
+            len,
             stride: Self::stride(),
             ksz: Self::ksize(),
             idx: 0,
@@ -279,7 +295,7 @@ impl<K: Pod> BStackHashSet<K> {
                             key_bytes,
                         ))
                     } else if state == OCCUPIED && buf[8..8 + ksz] == *key_bytes {
-                        ProbeStep::Stop(Vec::new()) // already present
+                        ProbeStep::Stop(Ok(Vec::new())) // already present
                     } else {
                         if state == TOMBSTONE && first_tomb.get().is_none() {
                             first_tomb.set(Some(idx));
@@ -293,7 +309,7 @@ impl<K: Pod> BStackHashSet<K> {
                         place_writes(handle, stride, m, t, false, key_bytes)
                     } else {
                         need_grow.set(true);
-                        Vec::new()
+                        Ok(Vec::new())
                     }
                 },
             )?;
@@ -325,18 +341,26 @@ impl<K: Pod> BStackHashSet<K> {
             |m, idx, buf| {
                 let state = get_u64(&buf[0..8]);
                 if state == EMPTY {
-                    ProbeStep::Stop(Vec::new())
+                    ProbeStep::Stop(Ok(Vec::new()))
                 } else if state == OCCUPIED && buf[8..8 + ksz] == *key_bytes {
                     found.set(true);
-                    ProbeStep::Stop(vec![
-                        w8(m.table + idx * stride, TOMBSTONE),
-                        w8(handle + LEN_OFF, m.len - 1),
-                    ])
+                    // `m.table` is an on-disk pointer that can be corrupted/forged.
+                    let step = idx
+                        .checked_mul(stride)
+                        .and_then(|d| m.table.checked_add(d))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "corrupt bucket table offset",
+                            )
+                        })
+                        .map(|off| vec![w8(off, TOMBSTONE), w8(handle + LEN_OFF, m.len - 1)]);
+                    ProbeStep::Stop(step)
                 } else {
                     ProbeStep::Continue
                 }
             },
-            |_m| Vec::new(),
+            |_m| Ok(Vec::new()),
         )?;
         Ok(found.get())
     }
@@ -354,7 +378,13 @@ impl<K: Pod> BStackHashSet<K> {
         let mut idx = hash & mask;
         let mut scratch = Scratch::new();
         for _ in 0..cap {
-            let bucket = table + idx * stride;
+            // `table` is an on-disk pointer that can be corrupted/forged.
+            let bucket = idx
+                .checked_mul(stride)
+                .and_then(|d| table.checked_add(d))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table offset")
+                })?;
             let buf = scratch.buf(stride as usize);
             stack.get_into(bucket, buf)?;
             let state = get_u64(&buf[0..8]);
@@ -381,12 +411,6 @@ impl<K: Pod> BStackHashSet<K> {
             MIN_CAP,
         )
     }
-
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the set was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
-    }
 }
 
 impl<K: Pod> BStackCast for BStackHashSet<K> {
@@ -403,7 +427,7 @@ impl<K: Pod> crate::block::BStackEmbeddable for BStackHashSet<K> {}
 impl<K: Pod> BStackBlock for BStackHashSet<K> {
     type OnDisk = HashSetOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackHashSet {
             range,
             _marker: PhantomData,
@@ -429,9 +453,11 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
         }
         if bloom_off != 0 {
             // SAFETY: the set solely owns its embedded Bloom filter.
-            let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(
-                BStackRange::new(bloom_off, BLOOM_SIZE),
-            );
+            let bloom = unsafe {
+                <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                    bloom_off, BLOOM_SIZE,
+                ))
+            };
             unsafe { BStackOwned::from_raw(bloom) }.bstack_drop(allocator)?;
         }
         Ok(())
@@ -450,18 +476,30 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
             read_fields::<5>(allocator.stack(), handle + TABLE_OFF)?;
 
         let new_table = if cap != 0 {
-            let mut image = vec![0u8; (cap * stride) as usize];
+            // Untrusted `cap`: checked math + stack bound before allocating.
+            let table_size = cap.checked_mul(stride).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "hash set capacity overflow")
+            })?;
+            if table_size > allocator.stack().len()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hash set bucket block larger than the stack",
+                ));
+            }
+            let mut image = vec![0u8; table_size as usize];
             allocator.stack().get_into(table, &mut image)?;
-            let dst = plan.alloc_raw(allocator, cap * stride)?;
+            let dst = plan.alloc_raw(allocator, table_size)?;
             plan.write(dst.start(), image);
             dst.start()
         } else {
             0
         };
 
-        let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
-            bloom_off, BLOOM_SIZE,
-        ));
+        let bloom = unsafe {
+            <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                bloom_off, BLOOM_SIZE,
+            ))
+        };
         let new_bloom = bloom.__bstack_clone_into(allocator, plan)?.start();
 
         let od = HashSetOnDisk {
@@ -476,14 +514,6 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
             bloom: new_bloom,
         };
         Ok(od)
-    }
-}
-
-impl<K: Pod> BStackDrop for BStackHashSet<K> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 
@@ -507,8 +537,14 @@ impl<K: Pod> TryCloneIn for BStackHashSet<K> {
 /// `io::Result<K>`. Created by [`BStackHashSet::iter`]; scans the buckets.
 pub struct HashSetIter<'a, K: Pod> {
     stack: &'a BStack,
+    /// The set handle block, re-read each step to detect mutation.
+    block_off: u64,
     table: u64,
     cap: u64,
+    /// Snapshot of the element count; a same-table insert/remove (no rehash)
+    /// leaves `table`/`cap` unchanged but changes `len`, so comparing it too makes
+    /// the mutation check catch every mutation, not only a growth.
+    len: u64,
     stride: u64,
     ksz: usize,
     idx: u64,
@@ -520,6 +556,29 @@ impl<'a, K: Pod> Iterator for HashSetIter<'a, K> {
     type Item = io::Result<K>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Fail fast if the set was mutated during iteration: a growth/rehash
+        // frees the old table and repoints `table`; a same-table insert/remove
+        // leaves `table`/`cap` but changes `len` (a remove's backward-shift can
+        // relocate an unvisited entry into a visited slot, silently skipping it).
+        // Comparing all three catches every mutation.
+        if self.idx < self.cap {
+            match read_fields::<3>(self.stack, self.block_off + TABLE_OFF) {
+                Ok([table, cap, len])
+                    if table == self.table && cap == self.cap && len == self.len => {}
+                Ok(_) => {
+                    self.idx = self.cap;
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "BStackHashSet was mutated during iteration (its table/len \
+                         changed); the iterator is invalidated",
+                    )));
+                }
+                Err(e) => {
+                    self.idx = self.cap;
+                    return Some(Err(e));
+                }
+            }
+        }
         while self.idx < self.cap {
             let i = self.idx;
             self.idx += 1;

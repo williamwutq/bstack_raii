@@ -89,17 +89,21 @@ fn misapplied_item(
 ///
 /// Each block's [`EightCC`](../bstack_raii/struct.EightCC.html) is an 8-byte tag
 /// = a **readable ASCII prefix** over the first bytes, followed by the tail of a
-/// **64-bit FNV-1a hash** of `crate_name ++ "\0" ++ type_name` (little-endian).
-/// Every hash-tail byte has its high bit set, so it lands in the non-printable
-/// range and reads as clearly-not-a-name in a hex dump. The hash keeps distinct
-/// types apart even when their prefixes collide, and is deterministic (stable
-/// across builds/versions) so it is safe as on-disk ABI.
+/// **64-bit FNV-1a hash** of `crate_name ++ "\0" ++ type_name` (little-endian),
+/// with the type's `module_path!()` folded into the tail so two same-named types
+/// in different modules of one crate stay distinct. Every hash-tail byte has its
+/// high bit set, so it lands in the non-printable range and reads as
+/// clearly-not-a-name in a hex dump. The hash keeps distinct types apart even
+/// when their prefixes collide, and is deterministic (stable across
+/// builds/versions) so it is safe as on-disk ABI.
 ///
 /// The prefix is derived from the type name: initials of the camel-case words
-/// (≥ 2 words), or the de-voweled single word, clamped to 2–5 bytes. Override it
+/// (≥ 2 words), or the de-voweled single word, clamped to 2–4 bytes. Override it
 /// with `tag = "PREFIX"` (0–8 bytes; fewer than 8 leaves room for hash, exactly
 /// 8 is a fully manual tag, over 8 warns and truncates). The control block's tag
-/// is the data tag with its prefix **lowercased**, or an explicit `ctrl_tag`.
+/// keeps the **same** readable prefix as the data tag, distinguished by a toggled
+/// reserved hash bit (`EightCC::with_ctrl_bit` — structurally distinct regardless
+/// of the prefix), or is an explicit `ctrl_tag`.
 #[proc_macro_attribute]
 pub fn bstack_block(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = match syn::parse::<syn::ItemStruct>(item.clone()) {

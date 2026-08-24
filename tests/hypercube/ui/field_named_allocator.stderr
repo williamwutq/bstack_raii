@@ -1,0 +1,5 @@
+error: [BSTACK0310] a field named `allocator` collides with the generated constructor's `allocator` parameter; rename the field
+ --> tests/hypercube/ui/field_named_allocator.rs:7:5
+  |
+7 |     allocator: u64,
+  |     ^^^^^^^^^

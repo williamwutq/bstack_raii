@@ -2,7 +2,7 @@
 //! descriptor stored **inline** in the owning struct.
 //!
 //! A block field can only store a fixed-size value, but a vector's backing store
-//! must grow — and `BStackByteVec` **moves** its block on realloc. The fix is a
+//! must grow — and `BStackByteVec` **moves** its block on realloc. The solution is a
 //! small [`VecDesc`] (`{ data_off, data_size }`) that names the current data
 //! block; the field stores it, and on growth only the descriptor is rewritten:
 //!
@@ -25,6 +25,13 @@
 //!
 //! > **Growth reallocates**, so use a realloc-safe allocator (see the crate
 //! > docs) to avoid corruption on a torn realloc.
+//!
+//! **Concurrency:** a field-resident [`push`](BStackVec::push) runs the whole
+//! read → append/grow → commit under the file's WAL lock, re-reading the shared
+//! inline descriptor inside it, so concurrent pushes through independent handles
+//! (each `get_<field>()` mints a fresh one) never write into a freed block or
+//! double-free a displaced ring. A detached vector has no shared
+//! descriptor and appends lock-free.
 
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -40,6 +47,7 @@ use crate::handle::WeakRef;
 use crate::layout::{get_u64, put_u64};
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
+use crate::replace::ReplaceError;
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::{BStackDrop, dealloc_range};
 
@@ -97,12 +105,19 @@ fn read_vecdesc(stack: &BStack, loc: u64) -> io::Result<VecDesc> {
     })
 }
 
-/// Write a [`VecDesc`] to an absolute on-disk offset (its inline field location).
-fn write_vecdesc(stack: &BStack, loc: u64, desc: VecDesc) -> io::Result<()> {
-    let mut buf = [0u8; size_of::<VecDesc>()];
+/// The 16-byte little-endian on-disk image of a [`VecDesc`] (`data_off` then
+/// `data_size`) — the form [`write_vecdesc`] writes and the descriptor CAS in
+/// [`BStackVec::push`] compares against.
+fn vecdesc_bytes(desc: VecDesc) -> [u8; 16] {
+    let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&desc.data_off.to_le_bytes());
     buf[8..16].copy_from_slice(&desc.data_size.to_le_bytes());
-    stack.set(loc, buf)
+    buf
+}
+
+/// Write a [`VecDesc`] to an absolute on-disk offset (its inline field location).
+fn write_vecdesc(stack: &BStack, loc: u64, desc: VecDesc) -> io::Result<()> {
+    stack.set(loc, vecdesc_bytes(desc))
 }
 
 /// A persistent, growable vector of POD elements. Backs un-annotated `Vec<T>`
@@ -159,7 +174,16 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
 
     /// Reconstruct a **detached** handle from a descriptor value (no write-back;
     /// the descriptor lives only in memory). Used by `bstack_move!`.
-    pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `desc` must be a descriptor written by this element type over a live data
+    /// block owned by `allocator` that no other live handle will also free —
+    /// the same contract as [`from_field`](Self::from_field), asserted about the
+    /// descriptor's *contents* rather than its location. A fabricated descriptor
+    /// lets safe methods (`bstack_drop`, element reads) free or reinterpret an
+    /// arbitrary range.
+    pub unsafe fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
             data: BStackRange::new(desc.data_off, desc.data_size),
             writeback: None,
@@ -224,7 +248,15 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
 
     /// Number of elements.
     pub fn len(&self) -> io::Result<u64> {
-        Ok(self.bytes()?.len()? / size_of::<T>() as u64)
+        let size = size_of::<T>() as u64;
+        if size == 0 {
+            // A zero-sized element (`T = ()`) occupies no bytes, so an element count
+            // is not representable in the byte vector — it is definitionally empty.
+            // Guard the division: `byte_len / 0` would panic from a safe, non-misuse
+            // call.
+            return Ok(0);
+        }
+        Ok(self.bytes()?.len()? / size)
     }
 
     /// Whether the vector is empty.
@@ -234,8 +266,13 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
 
     /// Read all elements into a `Vec<T>` (unaligned reads, so any `T` is fine).
     pub fn to_vec(&self) -> io::Result<Vec<T>> {
-        let bytes = self.bytes()?.read_bytes()?;
         let esz = size_of::<T>();
+        if esz == 0 {
+            // Zero-sized elements are definitionally empty (see `len`); guard the
+            // `chunks_exact(0)` panic, matching `len`'s division guard.
+            return Ok(Vec::new());
+        }
+        let bytes = self.bytes()?.read_bytes()?;
         Ok(bytes
             .chunks_exact(esz)
             .map(bytemuck::pod_read_unaligned::<T>)
@@ -244,25 +281,60 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
 
     /// Append an element, growing the data block if needed.
     ///
-    /// When the element fits the current capacity, or this is a **detached** vec
-    /// (no live on-disk descriptor), the ordinary path is used — no block move is
-    /// observable. When a **field-resident** vec must grow (a `realloc` could
-    /// *move* the block, freeing the old one before the inline descriptor is
-    /// rewritten, momentarily leaving the live descriptor pointing at freed
-    /// space), it instead allocates a new larger block, **commits** the descriptor
-    /// to it in one atomic write, then frees the old block — allocate → commit →
-    /// free, so the live descriptor is never observed dangling.
+    /// A **detached** vec (no live on-disk descriptor) appends in place; the
+    /// element is committed atomically (bytes into spare capacity, then one `len`
+    /// bump), so a crash never leaves a partial element.
+    ///
+    /// A **field-resident** vec runs the whole read → append/grow → commit under
+    /// the file's WAL lock. The field's inline descriptor is
+    /// shared on disk — every `get_<field>()` mints a fresh handle over it, so two
+    /// threads can push through independent handles — and without the lock a
+    /// within-capacity append could write into a block a concurrent grow just
+    /// freed, or a stale-snapshot commit could clobber a concurrent grow's
+    /// descriptor (a double free of the displaced block). Holding the lock and
+    /// re-reading the descriptor inside it makes the operation atomic; grow itself
+    /// is allocate → commit descriptor → free old, so a crash mid-grow leaks at
+    /// worst, never dangles.
     pub fn push(&mut self, value: T) -> io::Result<()> {
+        if self.writeback.is_some() {
+            // Serialize field-resident pushes on this file, and re-read the
+            // descriptor inside the lock — our in-memory snapshot may be stale.
+            let lock = crate::wal::wal_lock_for(self.allocator);
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let loc = self.writeback.expect("field-resident vec has a writeback");
+            self.data = read_vecdesc(self.allocator.stack(), loc.start())
+                .map(|d| BStackRange::new(d.data_off, d.data_size))?;
+            self.push_inner(value)
+        } else {
+            self.push_inner(value)
+        }
+    }
+
+    /// The append/grow body of [`push`](Self::push). For a field-resident vec the
+    /// caller holds the WAL lock and has re-read `self.data`; for a detached vec
+    /// there is no shared descriptor to race.
+    fn push_inner(&mut self, value: T) -> io::Result<()> {
         let bytevec = self.bytes()?;
         let elem = size_of::<T>() as u64;
         let len = bytevec.len()?;
         let cap = bytevec.capacity()?;
+        // `len` is an on-disk field; a corrupted value near `u64::MAX` must not
+        // silently wrap the fits-check (which would then size the grow path's new
+        // block from the *wrapped* `new_len` while still `stack.copy`-ing the
+        // original, huge `len` into it below).
+        let new_len = len
+            .checked_add(elem)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "vector length overflow"))?;
 
-        if len + elem <= cap || self.writeback.is_none() {
+        if new_len <= cap || self.writeback.is_none() {
             let mut bytevec = bytevec;
-            for &b in bytemuck::bytes_of(&value) {
-                bytevec.push(b)?;
-            }
+            // Append the whole element as **one** crash-atomic unit:
+            // `extend_from_slice` reserves (writing into unobservable spare capacity),
+            // then commits `len += size_of::<T>()` in a single write — so a crash or
+            // `Err` mid-element never commits a `len` that isn't an element multiple
+            // (which would misalign every later element and, for the offset-storing
+            // block vectors, tear a `u64` child pointer into a garbage range).
+            bytevec.extend_from_slice(bytemuck::bytes_of(&value))?;
             self.data = bytevec.into_raw_block().as_range();
             return self.persist();
         }
@@ -270,7 +342,6 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
         // Field-resident growth: allocate a new block, copy the old elements over
         // with the crash-atomic `BStack::copy` (no materialising), append the new
         // element, commit the descriptor, then free the old block.
-        let new_len = len + elem;
         let new_cap = core::cmp::max(cap.saturating_mul(2), new_len);
         let old = self.data;
 
@@ -297,6 +368,8 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
         }
 
         // Commit: repoint the (in-memory + inline) descriptor at the new block.
+        // Safe under the caller's WAL lock — no concurrent handle can observe the
+        // old descriptor after this and re-free `old`.
         self.data = new_range;
         self.persist()?;
         // Reclaim the old block (a crash before here leaks it; never dangles).
@@ -360,9 +433,15 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
     }
 
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
-    pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// As [`BStackVec::from_desc`]: `desc` must be a descriptor written by this
+    /// element kind over a live data block owned by `allocator` that no other
+    /// live handle will also free.
+    pub unsafe fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
-            offsets: BStackVec::from_desc(desc, allocator),
+            offsets: unsafe { BStackVec::from_desc(desc, allocator) },
             _marker: PhantomData,
         }
     }
@@ -392,7 +471,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
             .offsets
             .to_vec()?
             .into_iter()
-            .map(|off| T::from_range(Self::elem_range(off)))
+            .map(|off| unsafe { T::from_range(Self::elem_range(off)) })
             .collect())
     }
 
@@ -402,29 +481,65 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
             .offsets
             .to_vec()?
             .get(i as usize)
-            .map(|&off| T::from_range(Self::elem_range(off))))
+            .map(|&off| unsafe { T::from_range(Self::elem_range(off)) }))
+    }
+
+    /// Reconstruct the owned children from the offsets a failed build collected,
+    /// so they can be handed back rather than freed.
+    fn recover_owned(offs: &[u64]) -> Vec<BStackOwned<T>> {
+        offs.iter()
+            // SAFETY: each `off` names a live child this vec just consumed and did
+            // not free; reconstructing one owner apiece is sound.
+            .map(|&off| unsafe { BStackOwned::from_raw(T::from_range(Self::elem_range(off))) })
+            .collect()
     }
 
     /// Build a detached vector from a list of owned children (each consumed).
-    pub fn from_handles(allocator: &'a A, children: Vec<BStackOwned<T>>) -> io::Result<Self> {
+    ///
+    /// On failure the children are handed back through
+    /// [`ReplaceError`](crate::ReplaceError) (reconstructed from the offsets the
+    /// build collected) rather than freed, so the caller keeps their subtree data
+    /// to retry or free.
+    pub fn from_handles(
+        allocator: &'a A,
+        children: Vec<BStackOwned<T>>,
+    ) -> Result<Self, ReplaceError<Vec<BStackOwned<T>>>> {
         let offs: Vec<u64> = children
             .into_iter()
             .map(|c| c.into_inner().range().start())
             .collect();
-        Ok(Self {
-            offsets: BStackVec::from_slice(allocator, &offs)?,
-            _marker: PhantomData,
-        })
+        match BStackVec::from_slice(allocator, &offs) {
+            Ok(offsets) => Ok(Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+            Err(e) => Err(ReplaceError::recovered(e, Self::recover_owned(&offs))),
+        }
     }
 
     /// Create an empty detached vector.
     pub fn new(allocator: &'a A) -> io::Result<Self> {
-        Self::from_handles(allocator, Vec::new())
+        // No children to hand back, so a failure is a plain I/O error.
+        Self::from_handles(allocator, Vec::new()).map_err(ReplaceError::into_source)
     }
 
     /// Append an owned child, transferring its ownership into the vector.
-    pub fn push_owned(&mut self, child: BStackOwned<T>) -> io::Result<()> {
-        self.offsets.push(child.into_inner().range().start())
+    ///
+    /// On failure the child is handed back through
+    /// [`ReplaceError`](crate::ReplaceError) rather than freed.
+    pub fn push_owned(
+        &mut self,
+        child: BStackOwned<T>,
+    ) -> Result<(), ReplaceError<BStackOwned<T>>> {
+        let off = child.into_inner().range().start();
+        if let Err(e) = self.offsets.push(off) {
+            // Push failed after `child`'s ownership was moved in (`into_inner`
+            // defused its RAII drop). Hand the child back rather than freeing it.
+            // SAFETY: `off` names the live child whose ownership just moved in.
+            let child = unsafe { BStackOwned::from_raw(T::from_range(Self::elem_range(off))) };
+            return Err(ReplaceError::recovered(e, child));
+        }
+        Ok(())
     }
 
     /// Recursively free every owned child (post-order), then the offset array.
@@ -432,7 +547,8 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
     pub fn bstack_drop(self) -> io::Result<()> {
         let allocator = self.offsets.allocator();
         for off in self.offsets.to_vec()? {
-            T::from_range(Self::elem_range(off)).bstack_drop(allocator)?;
+            // SAFETY: each stored offset names a live child this vec owns.
+            unsafe { crate::teardown::drop_block::<T, A>(Self::elem_range(off), allocator)? };
         }
         self.offsets.bstack_drop()
     }
@@ -493,9 +609,15 @@ impl<'a, T: BStackShared, A: BStackRaiiAllocator> BStackStrongVec<'a, T, A> {
     }
 
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
-    pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// As [`BStackVec::from_desc`]: `desc` must be a descriptor written by this
+    /// element kind over a live data block owned by `allocator` that no other
+    /// live handle will also free.
+    pub unsafe fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
-            offsets: BStackVec::from_desc(desc, allocator),
+            offsets: unsafe { BStackVec::from_desc(desc, allocator) },
             _marker: PhantomData,
         }
     }
@@ -526,7 +648,7 @@ impl<'a, T: BStackShared, A: BStackRaiiAllocator> BStackStrongVec<'a, T, A> {
             .offsets
             .to_vec()?
             .into_iter()
-            .map(|off| T::from_range(Self::elem_range(off)))
+            .map(|off| unsafe { T::from_range(Self::elem_range(off)) })
             .collect())
     }
 
@@ -536,29 +658,68 @@ impl<'a, T: BStackShared, A: BStackRaiiAllocator> BStackStrongVec<'a, T, A> {
             .offsets
             .to_vec()?
             .get(i as usize)
-            .map(|&off| T::from_range(Self::elem_range(off))))
+            .map(|&off| unsafe { T::from_range(Self::elem_range(off)) }))
     }
 
     /// Build a detached vector from a list of strong handles (each consumed, its
     /// strong count moved into the vector).
-    pub fn from_handles(allocator: &'a A, elems: Vec<BStackRc<'a, T, A>>) -> io::Result<Self> {
-        let offs: Vec<u64> = elems
+    ///
+    /// On failure the strong handles are handed back through
+    /// [`ReplaceError`](crate::ReplaceError) (reconstructed from the consumed data
+    /// offset + control range, so no count is dropped) rather than released.
+    pub fn from_handles(
+        allocator: &'a A,
+        elems: Vec<BStackRc<'a, T, A>>,
+    ) -> Result<Self, ReplaceError<Vec<BStackRc<'a, T, A>>>> {
+        // Keep each element's `(data offset, control range)` so a failed build can
+        // reconstruct the exact strong handle it consumed.
+        let parts: Vec<(u64, Option<BStackRange>)> = elems
             .into_iter()
             .map(|rc| {
-                let (data, _ctrl) = rc.into_raw();
-                data.into_range().start()
+                let (data, ctrl) = rc.into_raw();
+                (data.into_range().start(), ctrl)
             })
             .collect();
-        Ok(Self {
-            offsets: BStackVec::from_slice(allocator, &offs)?,
-            _marker: PhantomData,
-        })
+        let offs: Vec<u64> = parts.iter().map(|(off, _)| *off).collect();
+        match BStackVec::from_slice(allocator, &offs) {
+            Ok(offsets) => Ok(Self {
+                offsets,
+                _marker: PhantomData,
+            }),
+            Err(e) => {
+                let recovered = parts
+                    .into_iter()
+                    .map(|(off, ctrl)| {
+                        let data = unsafe { BStackRef::<T>::from_range(Self::elem_range(off)) };
+                        // SAFETY: `data`/`ctrl` name the block whose strong count
+                        // this element still holds (`into_raw` transferred it in).
+                        unsafe { BStackRc::from_raw(data, ctrl, allocator) }
+                    })
+                    .collect();
+                Err(ReplaceError::recovered(e, recovered))
+            }
+        }
     }
 
     /// Append a strong reference (consumed, its count moved into the vector).
-    pub fn push_strong(&mut self, elem: BStackRc<'a, T, A>) -> io::Result<()> {
-        let (data, _ctrl) = elem.into_raw();
-        self.offsets.push(data.into_range().start())
+    ///
+    /// On failure the strong handle is handed back through
+    /// [`ReplaceError`](crate::ReplaceError) rather than released.
+    pub fn push_strong(
+        &mut self,
+        elem: BStackRc<'a, T, A>,
+    ) -> Result<(), ReplaceError<BStackRc<'a, T, A>>> {
+        let (data, ctrl) = elem.into_raw();
+        let off = data.into_range().start();
+        if let Err(e) = self.offsets.push(off) {
+            // Push failed after `elem` was consumed (its count moved in by
+            // `into_raw`). Hand the strong handle back rather than release it.
+            let data = unsafe { BStackRef::<T>::from_range(Self::elem_range(off)) };
+            // SAFETY: `data`/`ctrl` name the block whose strong count `elem` still holds.
+            let rc = unsafe { BStackRc::from_raw(data, ctrl, self.offsets.allocator()) };
+            return Err(ReplaceError::recovered(e, rc));
+        }
+        Ok(())
     }
 
     /// Release every strong reference (freeing children that reach zero), then
@@ -625,9 +786,15 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
     }
 
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
-    pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// As [`BStackVec::from_desc`]: `desc` must be a descriptor written by this
+    /// element kind over a live data block owned by `allocator` that no other
+    /// live handle will also free.
+    pub unsafe fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
-            offsets: BStackVec::from_desc(desc, allocator),
+            offsets: unsafe { BStackVec::from_desc(desc, allocator) },
             _marker: PhantomData,
         }
     }
@@ -670,7 +837,14 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
 
     /// Build a detached vector from a list of weak handles (each consumed, its
     /// weak count moved into the vector).
-    pub fn from_handles(allocator: &'a A, elems: Vec<BStackWeak<'a, T, A>>) -> io::Result<Self> {
+    ///
+    /// On failure the weak handles are handed back through
+    /// [`ReplaceError`](crate::ReplaceError) (reconstructed from the consumed
+    /// control offsets, so no count is dropped) rather than released.
+    pub fn from_handles(
+        allocator: &'a A,
+        elems: Vec<BStackWeak<'a, T, A>>,
+    ) -> Result<Self, ReplaceError<Vec<BStackWeak<'a, T, A>>>> {
         let offs: Vec<u64> = elems
             .into_iter()
             .map(|w| w.into_raw().into_range().start())
@@ -681,26 +855,34 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
                 _marker: PhantomData,
             }),
             Err(e) => {
-                // Building the offset array failed *after* every weak was consumed
-                // (`into_raw` defused each decrement, moving the count in). Release
-                // each so none is orphaned. Best-effort — a nested failure leaves at
-                // most the one-too-high count teardown already tolerates.
-                for off in offs {
-                    let _ = WeakRef::<T>(Self::ctrl_ref(off)).bstack_drop(allocator);
-                }
-                Err(e)
+                let recovered = offs
+                    .iter()
+                    // SAFETY: each `off` carries the weak count its consumed
+                    // `BStackWeak` transferred in above.
+                    .map(|&off| unsafe { BStackWeak::from_raw(Self::ctrl_ref(off), allocator) })
+                    .collect();
+                Err(ReplaceError::recovered(e, recovered))
             }
         }
     }
 
     /// Append a weak reference (consumed, its count moved into the vector).
-    pub fn push_weak(&mut self, elem: BStackWeak<'a, T, A>) -> io::Result<()> {
+    ///
+    /// On failure the weak handle is handed back through
+    /// [`ReplaceError`](crate::ReplaceError) rather than released.
+    pub fn push_weak(
+        &mut self,
+        elem: BStackWeak<'a, T, A>,
+    ) -> Result<(), ReplaceError<BStackWeak<'a, T, A>>> {
         let ctrl = elem.into_raw();
-        if let Err(e) = self.offsets.push(ctrl.into_range().start()) {
+        let off = ctrl.into_range().start();
+        if let Err(e) = self.offsets.push(off) {
             // Push failed after `elem` was consumed (its decrement defused by
-            // `into_raw`). Release its transferred weak count rather than orphan it.
-            let _ = WeakRef::<T>(ctrl).bstack_drop(self.offsets.allocator());
-            return Err(e);
+            // `into_raw`). Hand the weak handle back rather than release its count.
+            // SAFETY: `off` carries the weak count `elem` transferred in.
+            let weak =
+                unsafe { BStackWeak::from_raw(Self::ctrl_ref(off), self.offsets.allocator()) };
+            return Err(ReplaceError::recovered(e, weak));
         }
         Ok(())
     }
@@ -710,7 +892,8 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
     pub fn bstack_drop(self) -> io::Result<()> {
         let allocator = self.offsets.allocator();
         for off in self.offsets.to_vec()? {
-            WeakRef::<T>(Self::ctrl_ref(off)).bstack_drop(allocator)?;
+            // SAFETY: each stored offset carries one weak count owned by this vec.
+            unsafe { WeakRef::<T>::new(Self::ctrl_ref(off)) }.bstack_drop(allocator)?;
         }
         self.offsets.bstack_drop()
     }
@@ -722,7 +905,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
         let allocator = self.offsets.allocator();
         let offs = self.offsets.to_vec()?;
         for &off in &offs {
-            plan.bump_weak(off);
+            plan.bump_weak(off)?;
         }
         build_offset_desc(allocator, &offs, plan)
     }
@@ -763,9 +946,15 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRefVec<'a, T, A> {
     }
 
     /// Reconstruct a detached handle from a descriptor value. Used by `bstack_move!`.
-    pub fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// As [`BStackVec::from_desc`]: `desc` must be a descriptor written by this
+    /// element kind over a live data block owned by `allocator` that no other
+    /// live handle will also free.
+    pub unsafe fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
-            offsets: BStackVec::from_desc(desc, allocator),
+            offsets: unsafe { BStackVec::from_desc(desc, allocator) },
             _marker: PhantomData,
         }
     }
@@ -795,7 +984,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRefVec<'a, T, A> {
             .offsets
             .to_vec()?
             .into_iter()
-            .map(|off| T::from_range(Self::elem_range(off)))
+            .map(|off| unsafe { T::from_range(Self::elem_range(off)) })
             .collect())
     }
 
@@ -805,7 +994,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRefVec<'a, T, A> {
             .offsets
             .to_vec()?
             .get(i as usize)
-            .map(|&off| T::from_range(Self::elem_range(off))))
+            .map(|&off| unsafe { T::from_range(Self::elem_range(off)) }))
     }
 
     /// Build a detached vector from a list of raw references.

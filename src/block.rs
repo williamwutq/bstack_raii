@@ -14,7 +14,6 @@ use crate::clone::ClonePlan;
 use crate::layout::EightCC;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::teardown::BStackDrop;
 
 /// The downcast discriminant. The returned [`EightCC`] must match the tag in a
 /// block's [`crate::BlockHeader`] for a safe downcast to succeed.
@@ -40,12 +39,28 @@ pub trait BStackCast {
             `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple \
             needs its own named `#[bstack_block]` wrapper."
 )]
-pub trait BStackBlock: BStackCast + BStackDrop + Sized {
+pub trait BStackBlock: BStackCast + Sized {
     /// The on-disk payload layout (the generated `XOnDisk`).
     type OnDisk: Pod;
 
     /// Wrap a range as a typed handle (no I/O, no validation).
-    fn from_range(range: BStackRange) -> Self;
+    ///
+    /// The handle itself is a **non-owning view** — `Copy`, no [`BStackDrop`], so
+    /// holding or duplicating one can never free anything. Ownership (and the
+    /// obligation to free exactly once) lives only in the affine wrappers
+    /// [`BStackOwned`](crate::BStackOwned) / [`crate::BStackRc`] / the
+    /// `handle::*Ref` teardown tokens, none of which are `Copy`.
+    ///
+    /// # Safety
+    /// The caller asserts `range` refers to a validly allocated block of type `T`
+    /// (or will, by the time the handle is read). Nothing is checked: every
+    /// accessor reads `range` as `T`'s layout, so a bogus or foreign range
+    /// enables wrong-type reads. It does **not** on its own enable a free — that
+    /// requires wrapping the handle in an affine owner, itself an `unsafe` step
+    /// ([`BStackOwned::from_raw`](crate::BStackOwned::from_raw)). The safe ways to
+    /// obtain a handle — a block constructor, `bstack_cast!`, or reading a
+    /// `#[bstack_block]` field — are all bound to a real allocation.
+    unsafe fn from_range(range: BStackRange) -> Self;
 
     /// The underlying range this handle points at.
     fn range(&self) -> BStackRange;
@@ -189,6 +204,11 @@ pub trait BStackShared: BStackBlock {
 pub trait BStackWeakable: BStackBlock {
     /// The on-disk control-block payload (the generated `XOnDiskRef`).
     type Control: Pod;
+    /// The control block's [`EightCC`] tag — the tag stamped into the control
+    /// (`XOnDiskRef`) header, distinct from the data tag ([`BStackCast::eightcc`]).
+    /// Lets a validator confirm a region *is* this type's control block directly by
+    /// its header, not only indirectly via its forward data pointer.
+    fn control_eightcc() -> EightCC;
 }
 
 /// Marker for a block that may be [`#[embed]`](macro@crate::bstack_block)ded: a

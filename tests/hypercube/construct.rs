@@ -30,7 +30,7 @@ fn block_sink_round_trips() {
         h.handle().get_strong(stack).unwrap().get_v(stack).unwrap(),
         20
     );
-    assert_eq!(h.handle().get_emb().get_v(stack).unwrap(), 30);
+    assert_eq!(h.handle().get_emb().unwrap().get_v(stack).unwrap(), 30);
 
     // Owned containers.
     let vec = h.handle().get_vec_owned(&a).unwrap();
@@ -85,7 +85,7 @@ fn embed_sink_round_trips() {
     // Embedding a whole kitchen-sink block: its inlined child's own fields resolve.
     let h = embed_sink(&a).unwrap();
     assert_eq!(h.handle().get_tag(stack).unwrap(), 9);
-    let child = h.handle().get_child();
+    let child = h.handle().get_child().unwrap();
     assert_eq!(child.get_pod(stack).unwrap(), 7);
     assert_eq!(child.get_owned(stack).unwrap().get_v(stack).unwrap(), 10);
     h.bstack_drop(&a).unwrap();

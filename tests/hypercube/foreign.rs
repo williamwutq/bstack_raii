@@ -41,7 +41,7 @@ fn self_foreign_into_local_resolves() {
         .unwrap()
         .into_local()
         .expect("SELF resolvable");
-    let leaf = <Leaf as BStackBlock>::from_range(r.into_range());
+    let leaf = unsafe { <Leaf as BStackBlock>::from_range(r.into_range()) };
     assert_eq!(leaf.get_v(stack).unwrap(), 10);
     h.bstack_drop(&a).unwrap();
 }

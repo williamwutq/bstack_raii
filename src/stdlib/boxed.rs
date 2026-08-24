@@ -29,7 +29,7 @@ use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackBox<T>`]: the standard [`BlockHeader`] followed
 /// by the boxed value. `#[repr(C, packed)]` (like every generated `XOnDisk`) so
@@ -128,7 +128,7 @@ impl<T: Pod> crate::block::BStackEmbeddable for BStackBox<T> {}
 impl<T: Pod> BStackBlock for BStackBox<T> {
     type OnDisk = BoxOnDisk<T>;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackBox {
             range,
             _marker: PhantomData,
@@ -141,14 +141,6 @@ impl<T: Pod> BStackBlock for BStackBox<T> {
     // A `Pod` box is childless: the `__bstack_drop_children` /
     // `__bstack_clone_*` defaults (free nothing / byte-copy the OnDisk) are
     // exactly correct, so they are deliberately not overridden.
-}
-
-impl<T: Pod> BStackDrop for BStackBox<T> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        // Childless: just free the block.
-        // SAFETY: sole ownership was asserted when this handle was created.
-        unsafe { dealloc_range(allocator, self.range) }
-    }
 }
 
 impl<T: Pod> TryCloneIn for BStackBox<T> {

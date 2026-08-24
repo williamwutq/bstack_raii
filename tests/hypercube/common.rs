@@ -4,7 +4,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bstack::{BStack, FirstFitBStackAllocator, GhostTreeBstackAllocator};
+use bstack::{
+    BStack, CheckedSlabBStackAllocator, DebugCheckingAllocator, FirstFitBStackAllocator,
+    GhostTreeBstackAllocator,
+};
 use bstack_raii::{BStackDrop, BStackRaiiAllocator};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -17,7 +20,13 @@ pub struct TempStack {
 impl TempStack {
     pub fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
+        // `BSTACK_RAII_FUZZ_DIR` redirects backing files to a RAM-backed mount
+        // (tmpfs on Linux, a RAM disk on macOS) so fuzzing isn't fsync-bound —
+        // every committing op pays a real sync in a dependent crate like this one
+        // (see FUZZ.md's "throughput problem"). Falls back to the system temp dir.
+        let mut path = std::env::var_os("BSTACK_RAII_FUZZ_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
         path.push(format!("bstack_raii_hc_{}_{n}.bstack", std::process::id()));
         let _ = std::fs::remove_file(&path);
         TempStack { path }
@@ -37,6 +46,21 @@ impl TempStack {
     /// `BStackBulkAllocator`, exercising the *atomic-bulk* path.
     pub fn ghost_allocator(&self) -> GhostTreeBstackAllocator {
         GhostTreeBstackAllocator::new(self.open()).unwrap()
+    }
+
+    /// FUZZ.md's O2 oracle: FirstFit wrapped in a region-overlap / double-free
+    /// checker that panics on the exact corruption class a forged/torn offset
+    /// produces (see `src/wal.rs`'s `BStackRaiiAllocator` impl for this pairing).
+    pub fn debug_checking_allocator(&self) -> DebugCheckingAllocator<FirstFitBStackAllocator> {
+        DebugCheckingAllocator::new(FirstFitBStackAllocator::new(self.open()).unwrap())
+    }
+
+    /// A `CheckedSlab` allocator: FUZZ.md's "placement diversity" backend — fixed-size
+    /// slots at addresses FirstFit/GhostTree would never produce. `data_size` is generous
+    /// for the small element-library fixtures (`Leaf`, `Shared`); a model that grows to
+    /// wider payloads will need a bigger one.
+    pub fn checked_slab_allocator(&self) -> CheckedSlabBStackAllocator {
+        CheckedSlabBStackAllocator::new(self.open(), 512).unwrap()
     }
 }
 

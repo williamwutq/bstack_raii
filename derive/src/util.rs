@@ -110,6 +110,32 @@ pub(crate) fn vec_inner(ty: &Type) -> Option<&Type> {
     }
 }
 
+/// Whether a generic `param` appears in a position stored **inline** in a field of type
+/// `ty`'s on-disk payload.
+///
+/// A parameter under a `Vec<…>` lowers to a `VecDesc` offset — it is never an inline
+/// value, so it must not make `XOnDisk` generic over that parameter (which would leave the
+/// parameter unused on the generated struct → `E0392`). A parameter reached only through
+/// `Option` / arrays / tuples of non-`Vec` types *is* inline; one that appears solely
+/// inside a `Vec` is not. (The parameter still gets its `Pod` bound elsewhere — this only
+/// governs inline placement in `XOnDisk`.)
+pub(crate) fn param_stored_inline(ty: &Type, param: &Ident) -> bool {
+    if vec_inner(ty).is_some() {
+        // The element is an offset (`VecDesc`), not an inline value.
+        return false;
+    }
+    if let Some(inner) = option_inner(ty) {
+        return param_stored_inline(inner, param);
+    }
+    match ty {
+        Type::Array(a) => param_stored_inline(&a.elem, param),
+        Type::Tuple(t) => t.elems.iter().any(|e| param_stored_inline(e, param)),
+        Type::Paren(p) => param_stored_inline(&p.elem, param),
+        Type::Group(g) => param_stored_inline(&g.elem, param),
+        other => type_mentions_any(other, &[param]),
+    }
+}
+
 /// Directed error for a double `Option` (`Option<Option<T>>`) anywhere in the
 /// container nesting.
 pub(crate) fn err_double_option(ty: &Type) -> Error {
@@ -500,6 +526,24 @@ pub(crate) fn array_shape(ty: &Type) -> syn::Result<(Vec<&Expr>, &Type, bool)> {
     let mut dims: Vec<&Expr> = Vec::new();
     let mut cur = ty;
     while let Type::Array(a) = cur {
+        // A literal zero-length dimension compiles today but makes the
+        // generated `Vec<[T; N]>` accessor's `slice::chunks(#total)` panic
+        // unconditionally (a chunk size of 0 is always invalid), regardless
+        // of the vector's actual — even empty — contents. Reject it here,
+        // at the source, rather than let a legitimate-looking type definition
+        // panic on its very first ordinary use. A non-literal (const-generic)
+        // dimension that resolves to 0 at monomorphization isn't statically
+        // knowable here and isn't caught by this check.
+        if let Expr::Lit(ExprLit {
+            lit: Lit::Int(n), ..
+        }) = &a.len
+            && n.base10_parse::<u64>().ok() == Some(0)
+        {
+            return Err(Error::new_spanned(
+                &a.len,
+                "[BSTACK0112] a zero-length array dimension is not supported",
+            ));
+        }
         dims.push(&a.len);
         cur = &a.elem;
     }
@@ -774,12 +818,14 @@ pub(crate) fn unknown_opt() -> &'static str {
 // ---------------------------------------------------------------------------
 // EightCC tag generation
 //
-// An 8-byte tag = a readable ASCII prefix (2–5 auto, or a `tag =` override) over
+// An 8-byte tag = a readable ASCII prefix (2–4 auto, or a `tag =` override) over
 // the first N bytes, followed by the tail of a 64-bit FNV-1a hash of
-// `crate_name ++ "\0" ++ type_name`. Every tail byte has its high bit set so it
-// lands in the non-printable range and can't be mistaken for the prefix. The
-// control-block tag is the same, with the prefix lowercased. See the
-// `#[bstack_block]` docs.
+// `crate_name ++ "\0" ++ type_name`, with the type's `module_path!()` folded into
+// the tail at runtime (so same-named types in different modules stay distinct).
+// Every tail byte has its high bit set so it lands in the non-printable range and
+// can't be mistaken for the prefix. The control-block tag is the data tag with a
+// reserved hash bit toggled (`EightCC::with_ctrl_bit`) — same readable prefix,
+// structurally distinct. See the `#[bstack_block]` docs.
 // ---------------------------------------------------------------------------
 
 /// The value passed to `EightCC::new([..])` plus whether the prefix was longer
@@ -846,8 +892,10 @@ pub(crate) fn split_words(name: &str) -> Vec<String> {
     words
 }
 
-/// Auto-derive a 2–5 byte uppercase prefix from a type name: initials of the
-/// words if there are ≥ 2, else the de-voweled single word.
+/// Auto-derive a 2–4 byte uppercase prefix from a type name: initials of the
+/// words if there are ≥ 2, else the de-voweled single word. Capped at 4 (not 8)
+/// so at least 4 hash bytes always remain to distinguish types (and generic
+/// instantiations).
 pub(crate) fn auto_prefix(name: &str) -> Vec<u8> {
     let words = split_words(name);
     let prefix: Vec<u8> = if words.len() >= 2 {
@@ -855,7 +903,7 @@ pub(crate) fn auto_prefix(name: &str) -> Vec<u8> {
             .iter()
             .filter_map(|w| w.bytes().next())
             .map(|b| b.to_ascii_uppercase())
-            .take(5)
+            .take(4)
             .collect()
     } else {
         let letters: Vec<u8> = words
@@ -873,7 +921,7 @@ pub(crate) fn auto_prefix(name: &str) -> Vec<u8> {
             if i == 0 || !is_ascii_vowel(b) {
                 v.push(b);
             }
-            if v.len() == 5 {
+            if v.len() == 4 {
                 break;
             }
         }
@@ -900,12 +948,44 @@ pub(crate) fn classify_attrs(attrs: &[syn::Attribute]) -> syn::Result<Kind> {
         let Some(id) = attr.path().get_ident() else {
             continue;
         };
-        let kind = match id.to_string().as_str() {
+        // The macro re-emits fields/variants as bare `name: type`, so a `#[cfg]`
+        // here would NOT be honoured — the item would occupy on-disk layout, a
+        // constructor slot, and an accessor in every configuration. Conditional
+        // layout is unsupported; reject rather than silently materialize.
+        if id == "cfg" || id == "cfg_attr" {
+            return Err(Error::new_spanned(
+                attr,
+                "[BSTACK0004] `#[cfg]` / `#[cfg_attr]` on a bstack block field or \
+                 variant is unsupported: the generated on-disk layout, constructor, \
+                 and accessors cannot be made conditional, so the attribute would be \
+                 silently ignored rather than honoured",
+            ));
+        }
+        let name = id.to_string();
+        let kind = match name.as_str() {
             "bstack_owned" => Kind::Owned,
             "bstack_strong" => Kind::Strong,
             "bstack_weak" => Kind::Weak,
             "bstack_ref" => Kind::Ref,
             "embed" => Kind::Embed,
+            // The non-ownership bstack markers, consumed by their own scanners.
+            "bstack_mut" | "bstack_static" => continue,
+            // An unrecognised `bstack_*`-prefixed (or embed-like) attribute is
+            // almost certainly a typo for one of the above; silently ignoring it
+            // would silently drop the declared ownership (`#[bstack_mutt]`
+            // compiling with no mutator, `#[embedd]` failing over to `Kind::Pod`
+            // with a trait error that never mentions the attribute). Same
+            // reasoning as `[BSTACK0601]`/`[BSTACK0602]`: reject, don't ignore.
+            _ if name.starts_with("bstack_") || name.starts_with("embed") => {
+                return Err(Error::new_spanned(
+                    attr,
+                    format!(
+                        "[BSTACK0003] unrecognised bstack attribute `{name}` — expected one of \
+                         `bstack_owned`, `bstack_strong`, `bstack_weak`, `bstack_ref`, `embed`, \
+                         `bstack_mut`, `bstack_static`"
+                    ),
+                ));
+            }
             _ => continue,
         };
         if found.is_some() {

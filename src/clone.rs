@@ -47,20 +47,19 @@
 //! behaviour (mid-descent crash ⇒ orphan leak).
 
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use bstack::{BStackGenOp, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::block::BStackShared;
+use crate::block::{BStackBlock, BStackShared};
 use crate::layout;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::teardown::dealloc_range;
 use crate::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::wal::{
-    WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc, wal_capacity_of,
-    wal_lock_for, wal_set_idle,
+    HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
+    wal_capacity_of, wal_set_idle,
 };
 
 /// Duplicate `self`, performing any fallible I/O the duplication requires,
@@ -99,7 +98,7 @@ pub trait TryClone: Sized {
 /// `BStackRc::try_clone` / `BStackWeak::try_clone` instead. See [`TryClone`] for
 /// why (in particular, why a weak reference can only ever be cloned as another
 /// weak reference).
-pub trait TryCloneIn: BStackDrop + Sized {
+pub trait TryCloneIn: BStackBlock + Sized {
     fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>>;
 }
 
@@ -171,38 +170,6 @@ struct CloneWal {
     logged: u64,
 }
 
-/// The file's WAL [`Mutex`] held across a whole clone transaction. It owns the
-/// `Arc` so the lifetime-extended guard can never outlive the mutex it borrows;
-/// `Drop` releases the guard *before* the `Arc` is dropped.
-struct HeldLock {
-    /// `Some` while held; taken in `Drop` so the guard releases before `_arc`.
-    guard: Option<MutexGuard<'static, ()>>,
-    /// Keeps the mutex alive for as long as `guard` borrows it.
-    _arc: Arc<Mutex<()>>,
-}
-
-impl HeldLock {
-    fn acquire(arc: Arc<Mutex<()>>) -> Self {
-        let guard = arc.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the guard borrows the `Mutex` owned by `arc`, which this struct
-        // keeps alive; `Drop` releases the guard before `arc` is dropped, so the
-        // borrow never dangles. The transmute only extends the guard's lifetime to
-        // `'static` to store it alongside its owning `Arc`.
-        let guard: MutexGuard<'static, ()> = unsafe { core::mem::transmute(guard) };
-        HeldLock {
-            guard: Some(guard),
-            _arc: arc,
-        }
-    }
-}
-
-impl Drop for HeldLock {
-    fn drop(&mut self) {
-        // Release the guard before `_arc` drops (which would free the `Mutex`).
-        self.guard = None;
-    }
-}
-
 impl Default for ClonePlan {
     fn default() -> Self {
         Self::new()
@@ -225,6 +192,17 @@ impl ClonePlan {
             bumps: Vec::new(),
             wal: None,
         }
+    }
+
+    /// A plan pre-loaded into the two-pass [`Build`](Mode::Build) phase over a fixed
+    /// pool of pre-allocated ranges — test-only, to exercise the Build-mode size guard in
+    /// [`alloc_raw`](Self::alloc_raw) directly.
+    #[cfg(test)]
+    pub(crate) fn for_build_test(allocated: Vec<BStackRange>) -> Self {
+        let mut p = Self::new();
+        p.mode = Mode::Build;
+        p.allocated = allocated;
+        p
     }
 
     /// Whether the plan is in the measure phase of the two-pass bulk clone. Generated
@@ -265,13 +243,24 @@ impl ClonePlan {
             // Two-pass phase 2: hand back the next pre-allocated range (allocated in
             // one atomic bulk by `allocate`), in the same order it was measured.
             Mode::Build => {
-                let range = self.allocated[self.cursor];
+                // Build must hand back exactly the blocks Measure sized, in order. A
+                // count overrun or a size mismatch means the source changed between the
+                // two descents — which the API forbids (the descent must be deterministic
+                // on the unmutated source). Fail hard rather than let `commit` stage an
+                // oversized image past the block: the former `debug_assert_eq!` compiled
+                // out in release, turning a violated precondition into a silent
+                // out-of-bounds write.
+                let range = *self.allocated.get(self.cursor).ok_or_else(|| {
+                    io::Error::other(
+                        "clone build/measure block-count mismatch (source mutated mid-clone?)",
+                    )
+                })?;
                 self.cursor += 1;
-                debug_assert_eq!(
-                    range.len(),
-                    size,
-                    "clone build/measure size mismatch (source mutated mid-clone?)"
-                );
+                if range.len() != size {
+                    return Err(io::Error::other(
+                        "clone build/measure size mismatch (source mutated mid-clone?)",
+                    ));
+                }
                 Ok(range)
             }
             // Single pass: allocate eagerly and log it intention-first, keeping the
@@ -307,7 +296,7 @@ impl ClonePlan {
             None => {
                 // First allocation: take the file's WAL lock for the whole descent
                 // and stage a `Pending` block holding this one entry.
-                let held = HeldLock::acquire(wal_lock_for(allocator));
+                let held = HeldLock::acquire(allocator)?;
                 let mut log = WalLog::with_capacity(1);
                 log.append(WalEntry::alloc(WalStatus::Pending, range));
                 let block = persist_at(allocator, &log, WalStatus::Pending)?;
@@ -400,8 +389,8 @@ impl ClonePlan {
         }
         let (data_ref, ctrl) = T::strong_parts(data, allocator)?;
         let off = match ctrl {
-            None => data_ref.into_range().start() + layout::RC_REFCOUNT_OFFSET,
-            Some(c) => c.start() + layout::CTRL_STRONG_OFFSET,
+            None => layout::checked_off(data_ref.into_range().start(), layout::RC_REFCOUNT_OFFSET)?,
+            Some(c) => layout::checked_off(c.start(), layout::CTRL_STRONG_OFFSET)?,
         };
         self.bumps.push(off);
         Ok(())
@@ -410,10 +399,12 @@ impl ClonePlan {
     /// Record that the weak count of the control block at `ctrl_off` must be
     /// bumped by one — the weak reference this clone's `#[bstack_weak]` field
     /// acquires.
-    pub fn bump_weak(&mut self, ctrl_off: u64) {
+    pub fn bump_weak(&mut self, ctrl_off: u64) -> io::Result<()> {
         if self.mode != Mode::Measure {
-            self.bumps.push(ctrl_off + layout::CTRL_WEAK_OFFSET);
+            self.bumps
+                .push(layout::checked_off(ctrl_off, layout::CTRL_WEAK_OFFSET)?);
         }
+        Ok(())
     }
 
     /// Drive a whole deep clone: run the `descend` closure (a call to the block's
@@ -481,7 +472,7 @@ impl ClonePlan {
     fn allocate<A: BStackRaiiAllocator>(&mut self, allocator: &A) -> io::Result<()> {
         let ranges = allocator.alloc_many(&self.sizes)?;
         if allocator.wal_anchor().is_some() && !ranges.is_empty() {
-            let held = HeldLock::acquire(wal_lock_for(allocator));
+            let held = HeldLock::acquire(allocator)?;
             let mut log = WalLog::with_capacity(ranges.len());
             for &r in &ranges {
                 log.append(WalEntry::alloc(WalStatus::Pending, r));
@@ -499,7 +490,8 @@ impl ClonePlan {
                     // Couldn't stage the WAL: free the fresh blocks and abort. Release
                     // the lock first — `free_many` does no WAL work.
                     drop(held);
-                    let _ = allocator.free_many(ranges);
+                    // SAFETY: `ranges` are this plan's own staged allocations.
+                    let _ = unsafe { allocator.free_many(ranges) };
                     return Err(e);
                 }
             }

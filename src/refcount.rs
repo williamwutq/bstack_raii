@@ -27,6 +27,13 @@ fn underflow_err() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "refcount underflow")
 }
 
+/// A counter offset near `u64::MAX` (so the fixed 8-byte counter range can't be
+/// formed) can only come from a corrupted/forged on-disk pointer — every caller
+/// derives `offset` from a stored back-pointer, `Foreign` target, or field value.
+fn corrupt_offset_err() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "refcount offset overflow")
+}
+
 /// Compare-and-swap the counter at `offset`: set it to `new` iff it currently
 /// equals `expected`. Returns whether the swap happened. The atomic "try-unwrap"
 /// primitive behind [`crate::BStackRc::try_move`].
@@ -45,9 +52,10 @@ pub fn load(stack: &BStack, offset: u64) -> io::Result<u64> {
 /// Atomically add `delta`, returning the previous value. Errors on overflow
 /// rather than wrapping (leaving the counter unchanged in that case).
 pub fn fetch_add(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
+    let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut prev = 0u64;
     let mut overflow = false;
-    stack.process(offset, offset + 8, |buf| {
+    stack.process(offset, end, |buf| {
         let cur = get_u64(buf);
         prev = cur;
         match cur.checked_add(delta) {
@@ -64,9 +72,10 @@ pub fn fetch_add(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
 /// Atomically subtract `delta`, returning the previous value. Errors on
 /// underflow rather than wrapping (leaving the counter unchanged in that case).
 pub fn fetch_sub(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
+    let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut prev = 0u64;
     let mut underflow = false;
-    stack.process(offset, offset + 8, |buf| {
+    stack.process(offset, end, |buf| {
         let cur = get_u64(buf);
         prev = cur;
         match cur.checked_sub(delta) {
@@ -94,9 +103,10 @@ pub fn increment_if_nonzero(stack: &BStack, offset: u64) -> io::Result<Option<u6
     if load(stack, offset)? == 0 {
         return Ok(None);
     }
+    let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut result = None;
     let mut overflow = false;
-    stack.process(offset, offset + 8, |buf| {
+    stack.process(offset, end, |buf| {
         let cur = get_u64(buf);
         if cur == 0 {
             return; // raced to zero after the fast-path read; leave unchanged

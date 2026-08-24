@@ -12,12 +12,13 @@ use bstack::{
     BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator, GhostTreeBstackAllocator,
 };
 
+use crate::construct::{alloc_block, build_control_payload};
 use crate::layout::{self, BlockHeader};
 use crate::{
     AutoDrop, BStackBlock, BStackBlockVec, BStackCast, BStackCastAs, BStackCastInto, BStackDeque,
     BStackDrop, BStackOwned, BStackRaiiAllocator, BStackRc, BStackRef, BStackShared,
-    BStackWeakable, EightCC, TryClone, TryCloneIn, alloc_block, bstack_block, bstack_cast,
-    bstack_enum, bstack_move, build_control_payload, dealloc_range,
+    BStackWeakable, EightCC, TryClone, TryCloneIn, bstack_block, bstack_cast, bstack_enum,
+    bstack_move, dealloc_range,
 };
 
 // --------------------------------------------------------------------------
@@ -131,7 +132,7 @@ impl BStackDrop for TestBlock {
 
 impl BStackBlock for TestBlock {
     type OnDisk = TestOnDisk;
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         TestBlock(range)
     }
     fn range(&self) -> BStackRange {
@@ -141,6 +142,9 @@ impl BStackBlock for TestBlock {
 
 impl BStackWeakable for TestBlock {
     type Control = TestControl;
+    fn control_eightcc() -> EightCC {
+        ctrl_tag()
+    }
 }
 
 fn ctrl_tag() -> EightCC {
@@ -431,11 +435,11 @@ fn autodrop_guard_frees_on_scope_exit() {
     let size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
 
     let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
-    let handle = <MacroLeaf as BStackBlock>::from_range(leaf);
+    let handle = unsafe { <MacroLeaf as BStackBlock>::from_range(leaf) };
 
     // Wrapping a bare `BStackDrop` handle in `AutoDrop` makes it free on scope
     // exit — the single, reusable auto-drop mechanism.
-    let guard = unsafe { AutoDrop::from_raw(handle, &alloc) };
+    let guard = unsafe { AutoDrop::from_raw(BStackOwned::from_raw(handle), &alloc) };
     drop(guard);
 
     // The slot is reclaimed: the guard's `Drop` ran the teardown.
@@ -451,7 +455,7 @@ fn bare_handle_frees_only_when_asked() {
     let size = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
 
     let leaf = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
-    let handle = <MacroLeaf as BStackBlock>::from_range(leaf);
+    let handle = unsafe { <MacroLeaf as BStackBlock>::from_range(leaf) };
 
     // A bare handle is `Copy` and owns nothing — holding one triggers no
     // teardown, so the block stays live and the next alloc lands elsewhere.
@@ -459,7 +463,9 @@ fn bare_handle_frees_only_when_asked() {
     assert_ne!(other.start(), leaf.start());
 
     // Teardown is explicit: invoke `bstack_drop` directly (the "otherwise" path).
-    handle.bstack_drop(&alloc).unwrap();
+    unsafe { BStackOwned::from_raw(handle) }
+        .bstack_drop(&alloc)
+        .unwrap();
     let reused = alloc_block(&alloc, MacroLeaf::eightcc(), size).unwrap();
     assert_eq!(reused.start(), leaf.start());
     unsafe { dealloc_range(&alloc, reused).unwrap() };
@@ -1072,7 +1078,7 @@ fn macro_tag_generation() {
 }
 
 #[test]
-fn macro_control_tag_is_lowercased() {
+fn macro_control_tag_differs_in_reserved_bit() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let stack = alloc.stack();
@@ -1093,9 +1099,14 @@ fn macro_control_tag_is_lowercased() {
 
     let data_tag = TagCtrl::eightcc().0; // prefix "TC"
     assert_eq!(&data_tag[0..2], b"TC");
-    // Control tag = data tag with the prefix lowercased, same hash tail.
-    assert_eq!(&ctrl_tag[0..2], b"tc");
-    assert_eq!(ctrl_tag[2..], data_tag[2..]);
+    // Control tag keeps the SAME readable prefix and hash tail as the data tag,
+    // differing only in the reserved control bit (0x40 in the last byte) — a
+    // structural distinction that can't collapse on a caseless prefix.
+    assert_eq!(&ctrl_tag[0..2], b"TC");
+    assert_eq!(ctrl_tag[2..7], data_tag[2..7]);
+    assert_eq!(ctrl_tag[7], data_tag[7] ^ 0x40);
+    // The two tags are genuinely distinct.
+    assert_ne!(ctrl_tag, data_tag);
 
     drop(rc);
 }
@@ -1317,6 +1328,232 @@ fn bstack_vec_grow_and_free() {
     nums.bstack_drop().unwrap();
 }
 
+// A zero-sized element (`T = ()`, which is `Pod`) must not panic `len()` by dividing
+// the byte length by `size_of::<T>() == 0` — a safe, non-misuse call.
+#[test]
+fn vec_len_zero_sized_element_does_not_divide_by_zero() {
+    use crate::BStackVec;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let v = BStackVec::<(), _>::new(&alloc).unwrap();
+    assert_eq!(v.len().unwrap(), 0);
+    assert!(v.is_empty().unwrap());
+}
+
+// A crash mid-element must never leave a `BStackVec` with a non-element-multiple
+// byte length (regression). The fast path commits each element via
+// `extend_from_slice` (bytes into spare capacity, then ONE `len` bump), not
+// byte-by-byte; a fault therefore either adds a whole element or none — never a
+// partial one that would misalign and splice every later element.
+// Uses bstack's fault injection; requires --features fault-injection + debug.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn vec_push_element_atomic_under_fault() {
+    use crate::BStackVec;
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+
+    // Fail the Nth `set` op once — landing the fault at each point of a push.
+    struct FailNthSet {
+        seen: AtomicU64,
+        target: u64,
+    }
+    impl FaultPolicy for FailNthSet {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "set" && self.seen.fetch_add(1, Ordering::SeqCst) == self.target {
+                Some(io::Error::other("injected mid-push fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    const E: [u64; 3] = [
+        0x1111_1111_1111_1111,
+        0x2222_2222_2222_2222,
+        0x3333_3333_3333_3333,
+    ];
+    const FAULTED: u64 = 0x4444_4444_4444_4444; // the element pushed under the fault
+    const RECOVER: u64 = 0xAAAA_AAAA_AAAA_AAAA; // a distinct clean push afterward
+
+    for target in 0..3u64 {
+        let tmp = TempStack::new();
+        let alloc = tmp.allocator();
+        let stack = alloc.stack();
+
+        // Grow once (doubling capacity) so the faulted push is realloc-free and lands
+        // in the atomic fast path.
+        let mut v = BStackVec::<u64, _>::from_slice(&alloc, &E[..2]).unwrap();
+        v.push(E[2]).unwrap();
+        assert_eq!(v.to_vec().unwrap(), E.to_vec());
+
+        // A push under the fault — may Err (fault) or Ok, but must never persist a
+        // partial element.
+        stack.set_fault_policy(Some(Arc::new(FailNthSet {
+            seen: AtomicU64::new(0),
+            target,
+        })));
+        let _ = v.push(FAULTED);
+        stack.set_fault_policy(None);
+
+        // A subsequent clean push must land element-aligned: with the byte-at-a-time
+        // bug a misaligned `len` would splice `RECOVER` onto the partial `FAULTED`
+        // bytes, producing a value in neither set. Every element read back must be a
+        // known-good whole value.
+        v.push(RECOVER).unwrap();
+        for e in v.to_vec().unwrap() {
+            assert!(
+                e == E[0] || e == E[1] || e == E[2] || e == FAULTED || e == RECOVER,
+                "torn element 0x{e:016x} after fault at set #{target}",
+            );
+        }
+        v.bstack_drop().unwrap();
+    }
+}
+
+// A failing `MacroParent::new` must not orphan the `#[bstack_owned]` child it
+// consumed: it hands the child **back** through `ConstructError`, so the
+// caller can reclaim (or retry with) it. This asserts the bound that
+// makes the hand-back meaningful — once the caller frees each returned child, the
+// file stays bounded across many faults (an orphaning ctor would grow it by ~one
+// child block per fault). Uses fault injection to fail the constructor's own
+// `alloc` / `set` after the child is consumed.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn ctor_failure_hands_back_consumed_child() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+
+    // Fail the Nth op (alloc or set) once, sweeping across the constructor's steps.
+    struct FailNth {
+        seen: AtomicU64,
+        target: u64,
+    }
+    impl FaultPolicy for FailNth {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if (op == "alloc" || op == "set")
+                && self.seen.fetch_add(1, Ordering::SeqCst) == self.target
+            {
+                Some(io::Error::other("injected ctor fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    // If a faulted constructor orphaned its child, repeating it would grow the file
+    // by ~one child block each time; a reclaiming constructor keeps growth bounded
+    // (only the one-time persistent WAL block). Sweep the fault target across the
+    // constructor's steps, repeating each many times, and assert the file stays
+    // bounded.
+    for target in 0..6u64 {
+        let tmp = TempStack::new();
+        let alloc = tmp.allocator();
+
+        // Warm up the WAL machinery once (its persistent block is a fixed cost).
+        let _ = MacroLeaf::new(&alloc, 1).unwrap().bstack_drop(&alloc);
+        let baseline = alloc.stack().len().unwrap();
+
+        let mut faults = 0u32;
+        for _ in 0..40 {
+            let child = MacroLeaf::new(&alloc, 0xABCD).unwrap();
+            alloc.stack().set_fault_policy(Some(Arc::new(FailNth {
+                seen: AtomicU64::new(0),
+                target,
+            })));
+            let result = MacroParent::new(&alloc, child, 7);
+            alloc.stack().set_fault_policy(None);
+            match result {
+                Ok(parent) => {
+                    parent.bstack_drop(&alloc).unwrap();
+                }
+                Err(e) => {
+                    faults += 1;
+                    // The consumed child is handed back, not orphaned — the
+                    // caller reclaims it (here) so the file stays bounded. A failed
+                    // `alloc` / `set` is a primary failure point, so the child is
+                    // always `recovered` (never `lost`).
+                    let (child,) = e.fields.expect("child must be handed back");
+                    child.bstack_drop(&alloc).unwrap();
+                }
+            }
+        }
+
+        if faults == 0 {
+            continue; // this target never landed a fault
+        }
+        // Bounded: dropping each handed-back child (above) reclaims its block, so
+        // the file stays within a small constant of baseline; leaving them (an
+        // orphaning ctor) would be ~40 child blocks of growth.
+        let grown = alloc.stack().len().unwrap().saturating_sub(baseline);
+        let child_sz = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+        assert!(
+            grown < 4 * child_sz,
+            "ctor fault at op #{target} orphaned children: file grew {grown} bytes              over {faults} faults (child = {child_sz} bytes)",
+        );
+    }
+}
+
+// A failed consuming push hands the caller's value **back** rather than freeing
+// it, so a transient I/O failure never destroys the caller's data. Faults the
+// append commit after the child's ownership has moved in, then
+// asserts the handed-back child is intact (its bytes untouched) and freeable
+// exactly once.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn push_owned_hands_child_back_on_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+
+    // Fail the first append-commit op (whichever primitive the vec uses).
+    struct FailFirst {
+        armed: AtomicU64,
+    }
+    impl FaultPolicy for FailFirst {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if matches!(op, "set" | "swap" | "cas" | "realloc" | "set_batched")
+                && self
+                    .armed
+                    .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                Some(io::Error::other("injected push fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let mut v = BStackBlockVec::<MacroLeaf, _>::new(&alloc).unwrap();
+    v.push_owned(MacroLeaf::new(&alloc, 1).unwrap()).unwrap();
+
+    let child = MacroLeaf::new(&alloc, 0xBEEF).unwrap();
+    stack.set_fault_policy(Some(Arc::new(FailFirst {
+        armed: AtomicU64::new(1),
+    })));
+    let result = v.push_owned(child);
+    stack.set_fault_policy(None);
+
+    let err = result.expect_err("faulted push must fail");
+    let child = err
+        .value
+        .expect("a failed push hands the consumed child back, not None");
+    // The child block is intact — its ownership was returned, not freed and reused.
+    assert_eq!(child.handle().get_val(stack).unwrap(), 0xBEEF);
+    // And it is a live, uniquely-owned block: freeable exactly once.
+    child.bstack_drop(&alloc).unwrap();
+
+    // The vector itself is unharmed by the failed push.
+    assert_eq!(v.len().unwrap(), 1);
+    v.bstack_drop().unwrap();
+}
+
 // --------------------------------------------------------------------------
 // Vec<T> / String fields (POD elements) via BStackVec
 // --------------------------------------------------------------------------
@@ -1372,6 +1609,81 @@ fn macro_vec_string_fields() {
         vec![9u32]
     );
     rec2.bstack_drop(&alloc).unwrap();
+}
+
+// A generic parameter used *only* as a `Vec<T>` element lowers to a `VecDesc` (not an
+// inline field), so `XOnDisk` must not be generic over it — else `E0392: T is never
+// used`. This block must compile and round-trip.
+#[bstack_block]
+struct GenVec<T> {
+    data: Vec<T>,
+}
+
+#[test]
+fn macro_generic_vec_element_param_compiles_and_roundtrips() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let h = GenVec::<u32>::new(&alloc, &[10u32, 20, 30]).unwrap();
+    assert_eq!(
+        h.handle().get_data(&alloc).unwrap().to_vec().unwrap(),
+        vec![10u32, 20, 30]
+    );
+    h.bstack_drop(&alloc).unwrap();
+}
+
+// A cross-file clone that re-enters the same file (an owned A→B→A cycle, or a `Foreign`
+// whose explicit id resolves to the home file) would re-acquire the non-reentrant per-file
+// WAL lock the outer clone already holds → self-deadlock. The re-entry is now detected and
+// returns an error instead of hanging (issue F4).
+#[test]
+fn clone_wal_lock_reentry_errs_instead_of_deadlocking() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    // Holding the file's clone lock and re-acquiring it on the same thread must be
+    // rejected — the old code blocked forever on the non-reentrant mutex.
+    assert!(
+        crate::wal::test_reentrant_acquire_is_rejected(&alloc),
+        "same-file clone re-entry must be rejected, not deadlock"
+    );
+    // The outer lock was released (its key removed from the held-set), so a second run
+    // succeeds — no stuck/poisoned state.
+    assert!(
+        crate::wal::test_reentrant_acquire_is_rejected(&alloc),
+        "the held-set must be cleaned up after the outer lock drops"
+    );
+}
+
+// The two-pass bulk clone pre-allocates blocks in the Measure descent and stages their
+// bytes in the Build descent. A Build request that disagrees with what Measure sized (a
+// forbidden mid-clone source mutation) must Err, not silently write past the block — the
+// old guard was a `debug_assert` compiled out in release.
+#[test]
+fn clone_build_size_mismatch_errors_instead_of_oob_write() {
+    use crate::clone::ClonePlan;
+    use bstack::BStackRange;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator(); // unused by Build-mode alloc_raw, but the signature needs it
+
+    // A matching request hands back the pre-allocated block.
+    let mut plan = ClonePlan::for_build_test(vec![BStackRange::new(4096, 24)]);
+    assert_eq!(plan.alloc_raw(&alloc, 24).unwrap().len(), 24);
+
+    // A larger request than Measure allocated (the source grew mid-clone) must Err.
+    let mut plan = ClonePlan::for_build_test(vec![BStackRange::new(4096, 24)]);
+    let err = plan.alloc_raw(&alloc, 192).unwrap_err();
+    assert!(err.to_string().contains("size mismatch"), "got: {err}");
+
+    // Requesting more blocks than were pre-allocated Errs rather than panicking on index.
+    let mut plan = ClonePlan::for_build_test(vec![BStackRange::new(4096, 24)]);
+    plan.alloc_raw(&alloc, 24).unwrap();
+    let err = plan.alloc_raw(&alloc, 24).unwrap_err();
+    assert!(
+        err.to_string().contains("block-count mismatch"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -2619,7 +2931,7 @@ fn macro_embed_struct_and_enum() {
     let child = EmbChild::new(&alloc, leaf, 7).unwrap();
     let holder = EmbHolder::new(&alloc, child, 99).unwrap();
     assert_eq!(holder.handle().get_tag(stack).unwrap(), 99);
-    let c = holder.handle().get_child(); // a handle into the inline region (no I/O)
+    let c = holder.handle().get_child().unwrap(); // a handle into the inline region
     assert_eq!(c.get_n(stack).unwrap(), 7);
     assert_eq!(c.get_leaf(stack).unwrap().get_val(stack).unwrap(), 42);
 
@@ -2678,6 +2990,7 @@ fn macro_clone_embed() {
     let orig_leaf_off = holder
         .handle()
         .get_child()
+        .unwrap()
         .get_leaf(stack)
         .unwrap()
         .range()
@@ -2685,7 +2998,7 @@ fn macro_clone_embed() {
 
     let clone = holder.try_clone_in(&alloc).unwrap();
     assert_eq!(clone.handle().get_tag(stack).unwrap(), 99);
-    let cc = clone.handle().get_child();
+    let cc = clone.handle().get_child().unwrap();
     assert_eq!(cc.get_n(stack).unwrap(), 7);
     assert_eq!(cc.get_leaf(stack).unwrap().get_val(stack).unwrap(), 42);
 
@@ -2700,6 +3013,7 @@ fn macro_clone_embed() {
         holder
             .handle()
             .get_child()
+            .unwrap()
             .get_leaf(stack)
             .unwrap()
             .get_val(stack)
@@ -3282,14 +3596,14 @@ fn macro_embed_array() {
     assert_eq!(h.handle().get_tag(stack).unwrap(), 99);
 
     // Accessor: `[EmbChild; 2]` handles into the inline slots (pure offset math).
-    let kids = h.handle().get_kids();
+    let kids = h.handle().get_kids().unwrap();
     assert_eq!(kids[0].get_n(stack).unwrap(), 1);
     assert_eq!(kids[0].get_leaf(stack).unwrap().get_val(stack).unwrap(), 10);
     assert_eq!(kids[1].get_leaf(stack).unwrap().get_val(stack).unwrap(), 20);
 
     // Clone folds each embedded child inline, deep-cloning its owned leaf.
     let clone = h.try_clone_in(&alloc).unwrap();
-    let ckids = clone.handle().get_kids();
+    let ckids = clone.handle().get_kids().unwrap();
     assert_eq!(
         ckids[1].get_leaf(stack).unwrap().get_val(stack).unwrap(),
         20
@@ -3300,7 +3614,7 @@ fn macro_embed_array() {
     );
     clone.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        h.handle().get_kids()[1]
+        h.handle().get_kids().unwrap()[1]
             .get_leaf(stack)
             .unwrap()
             .get_val(stack)
@@ -3585,12 +3899,12 @@ fn macro_embed_nested_array() {
     let h = EmbGrid::new(&alloc, [[k(10), k(20)]], 5).unwrap();
     assert_eq!(h.handle().get_tag(stack).unwrap(), 5);
 
-    let g = h.handle().get_kids(); // [[EmbChild; 2]; 1]
+    let g = h.handle().get_kids().unwrap(); // [[EmbChild; 2]; 1]
     assert_eq!(g[0][0].get_leaf(stack).unwrap().get_val(stack).unwrap(), 10);
     assert_eq!(g[0][1].get_leaf(stack).unwrap().get_val(stack).unwrap(), 20);
 
     let clone = h.try_clone_in(&alloc).unwrap();
-    let cg = clone.handle().get_kids();
+    let cg = clone.handle().get_kids().unwrap();
     assert_eq!(
         cg[0][1].get_leaf(stack).unwrap().get_val(stack).unwrap(),
         20
@@ -4367,6 +4681,57 @@ fn macro_generic_distinct_tags() {
     );
 }
 
+// A two-type-parameter generic: the per-parameter tag fold must be ORDER-sensitive.
+#[bstack_block]
+struct Pair<A, B> {
+    #[bstack_owned]
+    first: A,
+    #[bstack_owned]
+    second: B,
+}
+
+#[bstack_block]
+struct PairA {
+    a: u32,
+}
+
+#[bstack_block]
+struct PairB {
+    b: u64,
+    c: u64,
+}
+
+#[test]
+fn macro_generic_permuted_tags_distinct() {
+    // `Pair<A,B>` and `Pair<B,A>` must get DISTINCT tags — the `mix` fold is
+    // order-sensitive, not XOR-commutative. The tag is the sole `bstack_cast!` /
+    // on-disk type identity, so a collision would let a cast reinterpret one as the
+    // other (reading a `B` field as an `A`, freeing a mis-typed slot on teardown).
+    assert_ne!(
+        <Pair<PairA, PairB> as BStackCast>::eightcc(),
+        <Pair<PairB, PairA> as BStackCast>::eightcc(),
+    );
+
+    // And the cast gate rejects the permuted type on a real block, while the correct
+    // instantiation still matches.
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let x = Pair::<PairA, PairB>::new(
+        &alloc,
+        PairA::new(&alloc, 1).unwrap(),
+        PairB::new(&alloc, 2, 3).unwrap(),
+    )
+    .unwrap();
+    let sl = x.handle().as_slice(stack);
+    assert!(
+        bstack_cast!(sl as Pair<PairB, PairA>).unwrap().is_none(),
+        "permuted cast must be rejected by the distinct tag"
+    );
+    assert!(bstack_cast!(sl as Pair<PairA, PairB>).unwrap().is_some());
+    x.bstack_drop(&alloc).unwrap();
+}
+
 #[test]
 fn macro_generic_move_cast() {
     let tmp = TempStack::new();
@@ -4594,6 +4959,7 @@ fn macro_generic_emb_box() {
     assert_eq!(
         b.handle()
             .get_item()
+            .unwrap()
             .get_leaf(stack)
             .unwrap()
             .get_val(stack)
@@ -4608,6 +4974,7 @@ fn macro_generic_emb_box() {
         clone
             .handle()
             .get_item()
+            .unwrap()
             .get_leaf(stack)
             .unwrap()
             .get_val(stack)
@@ -4618,12 +4985,14 @@ fn macro_generic_emb_box() {
         clone
             .handle()
             .get_item()
+            .unwrap()
             .get_leaf(stack)
             .unwrap()
             .range()
             .start(),
         b.handle()
             .get_item()
+            .unwrap()
             .get_leaf(stack)
             .unwrap()
             .range()
@@ -5126,13 +5495,13 @@ fn macro_bstack_mut_pod_set_and_raw_slice() {
     assert_eq!(b.handle().get_tag(stack).unwrap(), 7);
 
     // Raw place: read the field's inline bytes back.
-    let slice = unsafe { b.handle().raw_n_slice(stack) };
+    let slice = unsafe { b.handle().raw_n_slice(stack) }.unwrap();
     assert_eq!(slice.len(), 8);
     let bytes = slice.read().unwrap();
     assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 42);
 
     // Raw place: a write through it is observed by the typed getter.
-    let mut w = unsafe { b.handle().raw_n_slice(stack) };
+    let mut w = unsafe { b.handle().raw_n_slice(stack) }.unwrap();
     w.write(99u64.to_le_bytes()).unwrap();
     assert_eq!(b.handle().get_n(stack).unwrap(), 99);
 
@@ -5221,7 +5590,7 @@ fn macro_bstack_mut_ref_replace_returns_old() {
             .unwrap(),
         222
     );
-    let old_leaf = <MacroLeaf as BStackBlock>::from_range(old.into_range());
+    let old_leaf = unsafe { <MacroLeaf as BStackBlock>::from_range(old.into_range()) };
     assert_eq!(old_leaf.get_val(stack).unwrap(), 111);
 
     holder.bstack_drop(&alloc).unwrap();
@@ -5283,7 +5652,9 @@ fn macro_bstack_mut_replace_hands_new_value_back_on_commit_fault() {
     struct FailFirstSet(AtomicBool);
     impl FaultPolicy for FailFirstSet {
         fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
-            if op == "set" && !self.0.swap(true, Ordering::SeqCst) {
+            // The commit is now a single atomic `BStack::swap`,
+            // so the commit fault lands on the `swap` op, not `set`.
+            if op == "swap" && !self.0.swap(true, Ordering::SeqCst) {
                 Some(io::Error::other("injected replace-commit fault"))
             } else {
                 None
@@ -5333,11 +5704,12 @@ fn macro_bstack_mut_replace_hands_new_value_back_on_commit_fault() {
 }
 
 // The weak setter consumes a `BStackWeak` (its decrement defused, count moved into
-// the field). On a commit fault it must RELEASE that count (balancing drop), not
-// orphan it — the `io::Result<()>` analogue of the `replace_` hand-back.
+// the field). On a commit fault it hands that weak **back** to the caller
+//, still holding its count — the caller then retries or drops
+// it. This is the `replace_`-style hand-back applied to the weak setter.
 #[cfg(feature = "fault-injection")]
 #[test]
-fn macro_weak_setter_releases_new_weak_on_commit_fault() {
+fn macro_weak_setter_hands_new_weak_back_on_commit_fault() {
     use bstack::fault::FaultPolicy;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5345,7 +5717,8 @@ fn macro_weak_setter_releases_new_weak_on_commit_fault() {
     struct FailFirstSet(AtomicBool);
     impl FaultPolicy for FailFirstSet {
         fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
-            if op == "set" && !self.0.swap(true, Ordering::SeqCst) {
+            // `set_weak_field` now commits via an atomic `BStack::swap`.
+            if op == "swap" && !self.0.swap(true, Ordering::SeqCst) {
                 Some(io::Error::other("injected weak-setter commit fault"))
             } else {
                 None
@@ -5372,19 +5745,22 @@ fn macro_weak_setter_releases_new_weak_on_commit_fault() {
     stack.set_fault_policy(Some(Arc::new(FailFirstSet(AtomicBool::new(false)))));
     let r = b.handle().set_back(&alloc, w);
     stack.set_fault_policy(None);
-    assert!(
-        r.is_err(),
-        "injected fault must fail the weak-setter commit"
-    );
+    let err = r.expect_err("injected fault must fail the weak-setter commit");
 
-    // The consumed weak was released, not orphaned: a's weak count is back to 1 …
+    // The consumed weak is handed back, still holding its count: a's weak count
+    // stays 2 (the handed-back weak owns the extra count) …
+    let w = err.value.expect("weak setter hands the consumed weak back");
     assert_eq!(
         load(weak_off),
-        1,
-        "weak-setter leaked the consumed weak count on a failed commit"
+        2,
+        "the handed-back weak must still hold its count"
     );
     // … and the field never committed, so it stays unset.
     assert!(b.handle().get_back(&alloc).unwrap().is_none());
+
+    // Dropping the handed-back weak releases the count back to 1.
+    drop(w);
+    assert_eq!(load(weak_off), 1);
 
     drop(a); // strong 1->0 frees data; weak 1->0 frees control — nothing leaked
     drop(b);
@@ -5426,6 +5802,89 @@ fn macro_bstack_mut_strong_replace_moves_count_out() {
     // Dropping the returned rc decrements `a` (1 -> 0) and frees it.
     drop(old_a);
     // Tearing down the holder decrements `b` (1 -> 0), freeing it + the shell.
+    holder.bstack_drop(&alloc).unwrap();
+}
+
+// A `#[bstack_strong]` `replace_` on a `(rc, weak)` target reconstructs the old
+// value *after* the commit, by re-reading the target's control-block pointer — a
+// fallible disk read. When that read fails the old block is NOT lost: its raw
+// offset is handed back in `ReplaceError::raw_old` so it stays recoverable.
+// Faults the post-commit read and asserts recovery.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn macro_strong_replace_hands_old_offset_back_when_recon_reads_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // Arm on the commit `swap`, then fail the next `get` — the strong_parts read
+    // that reconstructs the old value after the swap already committed.
+    struct FailReconRead {
+        swapped: AtomicBool,
+        fired: AtomicBool,
+    }
+    impl FaultPolicy for FailReconRead {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "swap" {
+                self.swapped.store(true, Ordering::SeqCst);
+                return None;
+            }
+            if matches!(op, "get" | "get_into")
+                && self.swapped.load(Ordering::SeqCst)
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                Some(io::Error::other("injected old-recon read fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 111).unwrap(); // (rc, weak), strong = 1
+    let a_data = a.handle().range().start();
+    let holder = MutStrong::new(&alloc, a).unwrap(); // a's count moves into the field
+    let b = MacroStrongChild::new(&alloc, 222).unwrap();
+
+    stack.set_fault_policy(Some(Arc::new(FailReconRead {
+        swapped: AtomicBool::new(false),
+        fired: AtomicBool::new(false),
+    })));
+    let r = holder.handle().replace_s(&alloc, b);
+    stack.set_fault_policy(None);
+
+    let err = match r {
+        ::core::result::Result::Ok(_) => panic!("the post-commit recon read must fault"),
+        ::core::result::Result::Err(e) => e,
+    };
+    // The new value `b` is safely installed (the swap committed) …
+    assert_eq!(
+        holder
+            .handle()
+            .get_s(stack)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .get_val(stack)
+            .unwrap(),
+        222
+    );
+    // … the old value could not be handed back as a typed handle …
+    assert!(err.value.is_none());
+    // … but its raw offset is returned, so it is recoverable, not lost.
+    assert_eq!(err.raw_old.len(), 1);
+    assert_eq!(err.raw_old[0].start(), a_data);
+
+    // Recover `a` from the raw offset: retry the reconstruction now that I/O is
+    // healthy, yielding the strong handle whose count is still held on disk.
+    let a_ref = unsafe { BStackRef::<MacroStrongChild>::from_range(err.raw_old[0]) };
+    let (data, ctrl) =
+        <MacroStrongChild as crate::BStackShared>::strong_parts(a_ref, &alloc).unwrap();
+    let old_a = unsafe { crate::BStackRc::from_raw(data, ctrl, &alloc) };
+    assert_eq!(old_a.handle().get_val(stack).unwrap(), 111);
+    drop(old_a); // strong 1 -> 0 frees a — nothing leaked
+
     holder.bstack_drop(&alloc).unwrap();
 }
 
@@ -5584,7 +6043,7 @@ fn macro_bstack_mut_ref_array_set_and_replace() {
 
     // replace_at: hand the old ref (→ l1) back.
     let old = h.handle().replace_xs_at(&alloc, 1, rng(&l0)).unwrap();
-    let old_leaf = <MacroLeaf as BStackBlock>::from_range(old.into_range());
+    let old_leaf = unsafe { <MacroLeaf as BStackBlock>::from_range(old.into_range()) };
     assert_eq!(old_leaf.get_val(stack).unwrap(), 2);
     assert_eq!(
         h.handle().get_xs(stack).unwrap()[1].get_val(stack).unwrap(),
@@ -5752,6 +6211,137 @@ fn macro_bstack_mut_vec_annotation_is_accepted_noop() {
     h.bstack_drop(&alloc).unwrap();
 }
 
+// `BStackBlockVec::push_owned` consumes the child *before* the offset-array push;
+// if that push fails, the child is handed **back** to the caller (not freed).
+// The caller frees it, so the same slot is reused and the stack
+// stays flat; an orphan would grow it ~200×.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn block_vec_push_owned_hands_child_back_when_offset_push_fails() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // Fail the first `set`/`swap` after arming — the offset vector's element write.
+    struct FailFirstSet {
+        fired: AtomicBool,
+    }
+    impl FaultPolicy for FailFirstSet {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if matches!(op, "set" | "swap") && !self.fired.swap(true, Ordering::SeqCst) {
+                Some(io::Error::other("injected offset-push fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Build a block vec with spare offset capacity so `push_owned` is realloc-free (a
+    // lone `set`), letting the fault land exactly on the offset write.
+    let mut v = BStackBlockVec::from_handles(
+        &alloc,
+        (0..4u32)
+            .map(|i| MacroLeaf::new(&alloc, i).unwrap())
+            .collect(),
+    )
+    .unwrap();
+    v.push_owned(MacroLeaf::new(&alloc, 100).unwrap()).unwrap(); // grow → spare capacity
+
+    // Warm up the teardown WAL machinery once (a fixed, one-time cost) before
+    // measuring, so the baseline includes it.
+    MacroLeaf::new(&alloc, 0)
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
+    let baseline = stack.len().unwrap();
+
+    for i in 0..200u32 {
+        // Create the child *before* arming, so the first faulted `set` is the offset
+        // push (not the leaf's own write).
+        let child = MacroLeaf::new(&alloc, 1000 + i).unwrap();
+        stack.set_fault_policy(Some(Arc::new(FailFirstSet {
+            fired: AtomicBool::new(false),
+        })));
+        let r = v.push_owned(child);
+        stack.set_fault_policy(None);
+        // The child is handed back intact — free it ourselves (the caller's choice).
+        let child = r
+            .expect_err("expected the injected offset-push fault")
+            .value;
+        let child = child.expect("push_owned hands the consumed child back");
+        assert_eq!(child.handle().get_val(stack).unwrap(), 1000 + i);
+        child.bstack_drop(&alloc).unwrap();
+    }
+
+    // Each faulted push handed its child back, and we freed it, so the freed slot is
+    // reused every iteration and the file stays flat. An orphan would grow it ~200×.
+    let grown = stack.len().unwrap().saturating_sub(baseline);
+    let child_sz = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
+    assert!(
+        grown < 4 * child_sz,
+        "push_owned failed to return its consumed child: file grew {grown} bytes over 200 faults",
+    );
+    v.bstack_drop().unwrap();
+}
+
+// A stdlib container `insert`/`push` takes the value block's ownership up front; an
+// I/O error before it is linked hands that block **back** to the caller (not
+// freed). The caller frees it, so its slot is reused. Tested on
+// `BStackLinkedList::push_back` as the representative of the family.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn stdlib_push_hands_value_back_on_commit_error() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // Fail the first `inplace_gen` after arming — the list's commit, which runs after the
+    // value's ownership is taken and the node is allocated.
+    struct FailFirstInplaceGen(AtomicBool);
+    impl FaultPolicy for FailFirstInplaceGen {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "inplace_gen" && !self.0.swap(true, Ordering::SeqCst) {
+                Some(io::Error::other("injected list-commit fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+    let list = crate::BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
+
+    // Create the value first (its own write must not be faulted); note its offset.
+    let value = MacroLeaf::new(&alloc, 7).unwrap();
+    let val_off = value.handle().range().start();
+
+    stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
+    let r = list.push_back(&alloc, value);
+    stack.set_fault_policy(None);
+
+    // The value is handed back intact, not freed or orphaned.
+    let value = r.expect_err("expected the injected commit fault").value;
+    let value = value.expect("push_back hands the consumed value back");
+    assert_eq!(value.handle().range().start(), val_off);
+    assert_eq!(value.handle().get_val(stack).unwrap(), 7);
+    // The caller frees it, so its slot is reused by a fresh same-size block.
+    value.bstack_drop(&alloc).unwrap();
+    let reuse = MacroLeaf::new(&alloc, 8).unwrap();
+    assert_eq!(
+        reuse.handle().range().start(),
+        val_off,
+        "the handed-back value block should be freeable and its slot reusable"
+    );
+    reuse.bstack_drop(&alloc).unwrap();
+    list.bstack_drop(&alloc).unwrap();
+}
+
 // --------------------------------------------------------------------------
 // #[bstack_mut] on a whole `#[bstack_enum]`: `set` (own-nothing) / `replace`
 // (owns children). The annotation goes on the enum itself.
@@ -5906,6 +6496,83 @@ fn macro_bstack_mut_enum_strong_replace_moves_count_out() {
         MutStrongNodeView::Empty
     ));
 
+    e.bstack_drop(&alloc).unwrap();
+}
+
+// A whole-value enum `replace` whose post-commit reconstruction of the OLD strong
+// variant faults (its `strong_parts` read) hands the old child's block back in
+// `ReplaceError::raw_old` — recoverable, not leaked — rather than `lost`ing it, the
+// enum analogue of the scalar/array fix. Faults the post-swap read.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn macro_enum_replace_hands_old_offset_back_when_recon_reads_fault() {
+    use bstack::fault::FaultPolicy;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // Arm on the commit `swap`, then fail the next `get` — the `strong_parts` read
+    // reconstructing the OLD variant after the swap already committed.
+    struct FailReconRead {
+        swapped: AtomicBool,
+        fired: AtomicBool,
+    }
+    impl FaultPolicy for FailReconRead {
+        fn next_fault(&self, op: &'static str, _seq: u64) -> Option<io::Error> {
+            if op == "swap" {
+                self.swapped.store(true, Ordering::SeqCst);
+                return None;
+            }
+            if matches!(op, "get" | "get_into")
+                && self.swapped.load(Ordering::SeqCst)
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                Some(io::Error::other("injected old-recon read fault"))
+            } else {
+                None
+            }
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let a = MacroStrongChild::new(&alloc, 111).unwrap(); // strong = 1
+    let a_data = a.handle().range().start();
+    let e = MutStrongNode::new(&alloc, MutStrongNodeData::Shared(a)).unwrap();
+    let b = MacroStrongChild::new(&alloc, 222).unwrap();
+
+    stack.set_fault_policy(Some(Arc::new(FailReconRead {
+        swapped: AtomicBool::new(false),
+        fired: AtomicBool::new(false),
+    })));
+    let r = e.handle().replace(&alloc, MutStrongNodeData::Shared(b));
+    stack.set_fault_policy(None);
+
+    let err = match r {
+        Ok(_) => panic!("the post-commit old-recon read must fault"),
+        Err(e) => e,
+    };
+    // The new value is installed (swap committed); the old value could not be
+    // reconstructed as a typed handle …
+    assert!(err.value.is_none());
+    // … but the old strong child's block comes back raw, so it is recoverable.
+    assert_eq!(err.raw_old.len(), 1, "the old strong block must be handed back");
+    assert_eq!(err.raw_old[0].start(), a_data);
+
+    // Recover the old child from the raw offset once I/O is healthy.
+    let a_ref = unsafe { BStackRef::<MacroStrongChild>::from_range(err.raw_old[0]) };
+    let (data, ctrl) =
+        <MacroStrongChild as crate::BStackShared>::strong_parts(a_ref, &alloc).unwrap();
+    let old_a = unsafe { crate::BStackRc::from_raw(data, ctrl, &alloc) };
+    assert_eq!(old_a.handle().get_val(stack).unwrap(), 111);
+    drop(old_a); // strong 1 -> 0, frees it — nothing leaked
+
+    // The new value is intact.
+    match e.handle().read(&alloc).unwrap() {
+        MutStrongNodeView::Shared(child) => assert_eq!(child.get_val(stack).unwrap(), 222),
+        _ => panic!("expected Shared(222)"),
+    }
     e.bstack_drop(&alloc).unwrap();
 }
 
@@ -6188,7 +6855,7 @@ fn macro_bstack_mut_foreign_weak_replace_moves_weak_out() {
     old.bstack_drop(&local).unwrap(); // releases the old weak count
 
     h.bstack_drop(&local).unwrap(); // releases the current weak count
-    c.bstack_drop(&local).unwrap(); // releases the strong ref (frees the block)
+    drop(c); // releases the strong ref via Drop (frees the block at count 0)
 }
 
 // --------------------------------------------------------------------------
@@ -6641,7 +7308,7 @@ fn foreign_owned_move_then_bstack_drop_reclaims_across_files() {
     // The RAII dual in action: `bstack_move!` of a `#[bstack_owned] Foreign` hands back
     // a `ForeignOwned`, and its `bstack_drop` frees the target in its own file
     // (registry-resolved) — the safe replacement for the raw `foreign_drop_*` helpers,
-    // and the fix for "moving out an owned foreign leaks / needs unsafe".
+    // so moving out an owned foreign neither leaks nor needs unsafe.
     use crate::Foreign;
     use crate::registry;
 
@@ -6689,6 +7356,69 @@ fn foreign_owned_move_then_bstack_drop_reclaims_across_files() {
 }
 
 #[test]
+fn foreign_self_pointer_resolves_on_read_and_reencodes_on_write() {
+    // A stored SELF pointer read out of a *registered* file is
+    // resolved to that file's explicit id (so it can never be mis-stored into
+    // another file), and a pointer to the home file is re-encoded back to SELF on
+    // write (so the on-disk form stays portable across re-attaches). Two registered
+    // files make the cross-file distinction observable.
+    use crate::foreign::{home_relative_repr, resolve_self_repr};
+    use crate::{Foreign, ForeignRepr, registry};
+    use std::sync::Arc;
+
+    let file_a = TempStack::new();
+    let arc_a = Arc::new(file_a.allocator());
+    let file_b = TempStack::new();
+    let arc_b = Arc::new(file_b.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let id_a = reg.attach(&file_a.path, arc_a.clone()).unwrap();
+    let id_b = reg.attach(&file_b.path, arc_b.clone()).unwrap();
+    assert_ne!(id_a.as_u64(), id_b.as_u64());
+
+    // A live block in A, and the SELF pointer as it sits on disk (`file_id == 0`).
+    let leaf = MacroLeaf::new(&*arc_a, 42).unwrap().into_inner();
+    let off = leaf.range().start();
+    let self_repr = ForeignRepr::new(0, off);
+
+    // READ: SELF resolves to A's explicit id — the escaped pointer names A, not
+    // "whatever file I end up in".
+    let resolved = resolve_self_repr(self_repr, arc_a.stack()).unwrap();
+    assert_eq!(resolved.file_id(), id_a.as_u64());
+    assert_eq!(resolved.offset(), off);
+
+    // WRITE back into A: a home pointer re-encodes to SELF (portable on disk).
+    assert_eq!(home_relative_repr(resolved, arc_a.stack()).file_id(), 0);
+
+    // WRITE into B: A != B, so it stays explicit-A. A `SELF` here would be read by B
+    // as "B's own file" and free the wrong block.
+    let into_b = home_relative_repr(resolved, arc_b.stack());
+    assert_eq!(
+        into_b.file_id(),
+        id_a.as_u64(),
+        "cross-file pointer keeps A's identity"
+    );
+    assert_ne!(into_b.file_id(), 0);
+
+    // End to end through the generated accessor: build a holder in A from an
+    // explicit-A pointer (the ctor re-encodes it to on-disk SELF), then read it back
+    // — the accessor resolves it to explicit-A, never handing out a bare SELF.
+    let explicit_a = unsafe { Foreign::<MacroLeaf>::new(id_a, off) };
+    let holder = MutFornRef::new(&*arc_a, explicit_a).unwrap();
+    let read_back = holder.handle().get_r(arc_a.stack()).unwrap();
+    assert!(
+        !read_back.is_self(),
+        "the accessor resolves a SELF slot to explicit"
+    );
+    assert_eq!(read_back.file_id(), id_a);
+
+    reg.detach(id_a);
+    reg.detach(id_b);
+}
+
+#[test]
 fn foreign_owned_into_local_owned_self_resolves_and_frees() {
     // A SELF `ForeignOwned` resolves to a plain `BStackOwned` in the same file, which
     // reads and frees against the local allocator — the owning analogue of
@@ -6725,7 +7455,7 @@ fn foreign_owned_into_local_owned_self_resolves_and_frees() {
         Option<Foreign<MacroLeaf>>,
     ) = bstack_move!(h, &alloc).unwrap();
     assert!(owned.is_self());
-    let local = owned.into_local();
+    let local = owned.into_local(&alloc).unwrap();
 
     // It reads against the local stack and frees against the local allocator.
     assert_eq!(local.handle().get_val(alloc.stack()).unwrap(), 88);
@@ -6970,7 +7700,10 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
                 let part = part.to_vec();
                 s.spawn(move || {
                     for h in part {
-                        h.bstack_drop(&**arc_a).unwrap();
+                        // Sole owner, distributed to this thread as a Copy handle.
+                        unsafe { BStackOwned::from_raw(h) }
+                            .bstack_drop(&**arc_a)
+                            .unwrap();
                     }
                 });
             }
@@ -6978,7 +7711,9 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
                 let part = part.to_vec();
                 s.spawn(move || {
                     for h in part {
-                        h.bstack_drop(&**arc_b).unwrap();
+                        unsafe { BStackOwned::from_raw(h) }
+                            .bstack_drop(&**arc_b)
+                            .unwrap();
                     }
                 });
             }
@@ -7390,10 +8125,14 @@ fn macro_foreign_concurrent_ab_ba_clone() {
     // is reclaimed ⇒ both files return exactly to baseline (no leak, no double-free);
     // completion ⇒ no deadlock across the two WAL mutexes.
     for h in a_orig.into_iter().chain(a_clones) {
-        h.bstack_drop(&*arc_a).unwrap();
+        unsafe { BStackOwned::from_raw(h) }
+            .bstack_drop(&*arc_a)
+            .unwrap();
     }
     for h in b_orig.into_iter().chain(b_clones) {
-        h.bstack_drop(&*arc_b).unwrap();
+        unsafe { BStackOwned::from_raw(h) }
+            .bstack_drop(&*arc_b)
+            .unwrap();
     }
     assert_eq!(
         arc_a.stack().len().unwrap(),
@@ -7490,6 +8229,83 @@ fn macro_foreign_vec_owned_across_files() {
         arc_b.stack().len().unwrap(),
         base,
         "foreign-vec clone/teardown leaked or double-freed on B"
+    );
+
+    reg.detach(fid);
+}
+
+#[test]
+fn macro_foreign_vec_owned_move_yields_dual_vec() {
+    // `bstack_move!` of a `#[bstack_owned] Vec<Foreign<T>>` field hands back a
+    // `Vec<ForeignOwned<T>>` — the per-element RAII duals, each resolved to an
+    // explicit id — not the raw `BStackVec<ForeignRepr>` store. Dropping each frees
+    // its target on the far side; the storage block is freed by the move itself.
+    use crate::registry;
+    use crate::{Foreign, ForeignOwned};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = home.allocator();
+
+    let foreign = TempStack::new();
+    let arc_b = Arc::new(foreign.allocator());
+
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
+
+    // Warm B's WAL block, then baseline both files.
+    {
+        let l = MacroLeaf::new(&*arc_b, 0).unwrap();
+        let h = ForeignVecHolder::new(
+            &home_alloc,
+            0,
+            vec![unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) }],
+        )
+        .unwrap();
+        let (_, duals): (u32, Vec<ForeignOwned<MacroLeaf>>) = bstack_move!(h, &home_alloc).unwrap();
+        for d in duals {
+            d.bstack_drop(&home_alloc).unwrap();
+        }
+    }
+    let base_b = arc_b.stack().len().unwrap();
+    let base_home = home_alloc.stack().len().unwrap();
+
+    const N: u32 = 4;
+    let mut links = Vec::new();
+    for i in 0..N {
+        let l = MacroLeaf::new(&*arc_b, 200 + i).unwrap();
+        links.push(unsafe { Foreign::<MacroLeaf>::new(fid, l.handle().range().start()) });
+    }
+    let h = ForeignVecHolder::new(&home_alloc, 9, links).unwrap();
+
+    // Move: `(tag, Vec<ForeignOwned<MacroLeaf>>)` — the ergonomic typed handback.
+    let (tag, duals): (u32, Vec<ForeignOwned<MacroLeaf>>) = bstack_move!(h, &home_alloc).unwrap();
+    assert_eq!(tag, 9);
+    assert_eq!(duals.len(), N as usize);
+
+    // Each dual is an explicit foreign pointer (not a bare SELF) and reads the right
+    // value on B; dropping it frees the target there.
+    for (i, d) in duals.into_iter().enumerate() {
+        assert!(!d.is_self());
+        assert_eq!(
+            d.as_foreign()
+                .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
+                .unwrap()
+                .unwrap(),
+            200 + i as u32
+        );
+        d.bstack_drop(&home_alloc).unwrap();
+    }
+
+    // The move freed the parent shell + the `ForeignRepr` storage block; dropping the
+    // duals freed the targets. Both files return to baseline — nothing leaked.
+    assert_eq!(arc_b.stack().len().unwrap(), base_b, "targets leaked on B");
+    assert_eq!(
+        home_alloc.stack().len().unwrap(),
+        base_home,
+        "parent shell or the ForeignRepr storage block leaked on home"
     );
 
     reg.detach(fid);
@@ -8465,4 +9281,371 @@ fn stdlib_foreign_collection_target_clone_and_teardown() {
     );
 
     reg.detach(fid);
+}
+
+// --------------------------------------------------------------------------
+// WAL teardown sink must be scoped to the installing file
+// --------------------------------------------------------------------------
+
+#[bstack_block]
+struct SinkLeaf {
+    v: u32,
+}
+
+// A user type whose safe `BStackDrop` frees a child in a DIFFERENT file (B) with B's
+// own allocator, and another child in the driver's file (A).
+struct SinkCombo<'b, B: BStackRaiiAllocator> {
+    a_leaf: BStackOwned<SinkLeaf>,
+    b_leaf: BStackOwned<SinkLeaf>,
+    alloc_b: &'b B,
+}
+
+impl<'b, B: BStackRaiiAllocator> BStackDrop for SinkCombo<'b, B> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
+        let SinkCombo {
+            a_leaf,
+            b_leaf,
+            alloc_b,
+        } = self;
+        b_leaf.bstack_drop(alloc_b)?; // belongs to file B
+        a_leaf.bstack_drop(allocator)?; // belongs to file A
+        Ok(())
+    }
+}
+
+#[test]
+fn wal_teardown_scopes_sink_to_installing_file() {
+    // Regression: a nested `bstack_drop` against a DIFFERENT file's
+    // allocator during a WAL teardown must free in THAT file — never be misdirected
+    // (tagged `SELF`) into the installing file, which would free a live victim block
+    // sitting at the same offset.
+    let ta = TempStack::new();
+    let alloc_a = ta.allocator();
+    let tb = TempStack::new();
+    let alloc_b = tb.allocator();
+
+    // The sink is only installed when the allocator names a WAL anchor; otherwise the
+    // bug can't arise. Guard so the test actually exercises the scoped path.
+    assert!(
+        alloc_a.wal_anchor().is_some(),
+        "test needs an anchor-bearing allocator"
+    );
+
+    // B: allocate b_leaf first, so it lands at the fresh-file first-alloc offset.
+    let b_leaf = SinkLeaf::new(&alloc_b, 0xBBBB).unwrap();
+    let b_off = b_leaf.handle().range().start();
+
+    // A: a live victim at that same first-alloc offset (leak its owned marker so the
+    // block stays live on disk with nothing scheduled to tear it down).
+    let victim = SinkLeaf::new(&alloc_a, 0xAAAA).unwrap().into_inner();
+    let victim_off = victim.range().start();
+    assert_eq!(
+        victim_off, b_off,
+        "victim and b_leaf must collide for the test"
+    );
+    // The legitimately-in-A child of the combo.
+    let a_leaf = SinkLeaf::new(&alloc_a, 0x00CC).unwrap();
+
+    crate::wal_teardown(
+        SinkCombo {
+            a_leaf,
+            b_leaf,
+            alloc_b: &alloc_b,
+        },
+        &alloc_a,
+    )
+    .unwrap();
+
+    // B's block was freed in B (routed to the right file): a fresh same-size alloc in B
+    // reuses b_leaf's offset. A misdirected free would leave b_off occupied (leak in B).
+    let reuse = SinkLeaf::new(&alloc_b, 0x1234).unwrap();
+    assert_eq!(
+        reuse.handle().range().start(),
+        b_off,
+        "b_leaf must be freed in file B (its offset must be reusable), not misdirected"
+    );
+    reuse.bstack_drop(&alloc_b).unwrap();
+
+    // A's victim is never freed / aliased: reallocate in A repeatedly, victim intact.
+    let intruders: Vec<_> = (0..4)
+        .map(|i| SinkLeaf::new(&alloc_a, 0x9990 + i).unwrap())
+        .collect();
+    assert_eq!(
+        victim.get_v(alloc_a.stack()).unwrap(),
+        0xAAAA,
+        "victim was freed in A and aliased by a later allocation"
+    );
+    for it in intruders {
+        it.bstack_drop(&alloc_a).unwrap();
+    }
+    unsafe { BStackOwned::from_raw(victim) }
+        .bstack_drop(&alloc_a)
+        .unwrap();
+}
+
+// A panic between installing `TEARDOWN_SINK` and taking it (e.g. an explicit
+// `bstack_drop` whose walk panics, caught by an outer `catch_unwind`) must not leave the
+// sink stuck `Some`: the next top-level teardown would misdetect a nested call and
+// silently funnel — never commit — every free, leaking the whole subtree (issue F3).
+#[test]
+fn wal_teardown_restores_sink_after_caught_panic() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    struct PanicDrop;
+    impl BStackDrop for PanicDrop {
+        fn bstack_drop<A: BStackRaiiAllocator>(self, _allocator: &A) -> io::Result<()> {
+            panic!("boom in teardown");
+        }
+    }
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    assert!(
+        alloc.wal_anchor().is_some(),
+        "test needs an anchor-bearing allocator to install the sink"
+    );
+
+    // Warm the persistent WAL block (allocated once, reused) so it stays out of the
+    // offset-reuse check below.
+    SinkLeaf::new(&alloc, 0)
+        .unwrap()
+        .bstack_drop(&alloc)
+        .unwrap();
+
+    // A WAL teardown that panics after the sink is installed (caught by the test).
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        let _ = crate::wal_teardown(PanicDrop, &alloc);
+    }));
+    assert!(caught.is_err(), "expected the injected teardown panic");
+
+    // With the sink restored to `None`, a normal teardown actually FREES its block, so a
+    // same-size allocation reuses that exact offset. A stuck sink makes the teardown look
+    // nested — it collects the free but never commits it, leaving the block live — so the
+    // next allocation lands elsewhere.
+    let leaf = SinkLeaf::new(&alloc, 1).unwrap();
+    let off = leaf.handle().range().start();
+    leaf.bstack_drop(&alloc).unwrap();
+    let reuse = SinkLeaf::new(&alloc, 2).unwrap();
+    let reuse_off = reuse.handle().range().start();
+    assert_eq!(
+        reuse_off, off,
+        "TEARDOWN_SINK stuck after the panic → the block was collected-not-freed (leaked)"
+    );
+    reuse.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// The weak-array setter must bounds-check its index
+// --------------------------------------------------------------------------
+
+#[bstack_block(rc, weak)]
+struct WArrLeaf {
+    v: u32,
+}
+
+#[bstack_block]
+struct WArrHolder {
+    #[bstack_weak]
+    slots: [WArrLeaf; 3],
+    tail: u64,
+}
+
+#[test]
+fn weak_array_setter_bounds_checked() {
+    // An out-of-range `index` must be rejected — never write the control
+    // offset past the array into a neighboring field (and then read a caller-influenced
+    // word back as a control offset to decrement / free).
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    let holder = WArrHolder::new(&alloc, 0u64).unwrap();
+    let target = WArrLeaf::new(&alloc, 7).unwrap(); // BStackRc (strong=1, weak=1)
+
+    // OOB index (== N) is rejected, and the neighbor `tail` field is untouched.
+    assert!(
+        holder
+            .handle()
+            .set_slots(&alloc, 3, target.downgrade().unwrap())
+            .is_err(),
+        "OOB weak-array set must return Err"
+    );
+    assert_eq!(
+        holder.handle().get_tail(stack).unwrap(),
+        0,
+        "OOB set corrupted the neighboring `tail` field"
+    );
+
+    // A valid index still wires the weak.
+    holder
+        .handle()
+        .set_slots(&alloc, 0, target.downgrade().unwrap())
+        .unwrap();
+    let slots = holder.handle().get_slots(&alloc).unwrap();
+    assert!(slots[0].is_some());
+    assert!(slots[1].is_none());
+    drop(slots);
+
+    holder.bstack_drop(&alloc).unwrap();
+    drop(target);
+}
+
+// --------------------------------------------------------------------------
+// `Foreign` must carry `type_index` through a round-trip / clone
+// --------------------------------------------------------------------------
+
+#[test]
+fn foreign_repr_round_trip_preserves_type_index() {
+    // A typed pointer read into a `Foreign` and written back out must keep its RTTI
+    // `type_index` — the bug rebuilt the repr via `ForeignRepr::new`, zeroing it.
+    use crate::{Foreign, ForeignRepr};
+
+    // Explicit (non-SELF) typed pointer.
+    let repr = ForeignRepr::new(3, 4096).with_type_index(1);
+    assert_eq!(repr.type_index(), 1);
+    let f = unsafe { Foreign::<MacroLeaf>::from_repr(repr) };
+    let back = f.repr();
+    assert_eq!(back.type_index(), 1, "type_index wiped on round-trip");
+    assert_eq!(back.offset(), 4096);
+    assert_eq!(back.file_id(), 3);
+
+    // SELF typed pointer.
+    let self_repr = ForeignRepr::new(0, 512).with_type_index(7);
+    let fs = unsafe { Foreign::<MacroLeaf>::from_repr(self_repr) };
+    assert_eq!(fs.repr().type_index(), 7);
+    assert_eq!(fs.repr().offset(), 512);
+    assert_eq!(fs.repr().file_id(), 0);
+
+    // A freshly-constructed raw pointer is untyped (0) — unchanged behavior.
+    let raw = unsafe { Foreign::<MacroLeaf>::new(crate::registry::FileId::SELF, 64) };
+    assert_eq!(raw.repr().type_index(), 0);
+}
+
+#[test]
+fn try_clone_in_preserves_foreign_type_index() {
+    // Clone path: deep-cloning an `#[bstack_owned] Foreign<T>` must keep the
+    // field's RTTI `type_index`, even though the target is copied to a fresh offset.
+    use crate::{Foreign, ForeignRepr, TryCloneIn};
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // A SELF target + a TYPED foreign pointer to it (type_index = 1).
+    let target = MacroLeaf::new(&alloc, 42).unwrap();
+    let toff = target.handle().range().start();
+    let typed =
+        unsafe { Foreign::<MacroLeaf>::from_repr(ForeignRepr::new(0, toff).with_type_index(1)) };
+    let h = GenForeign::<MacroLeaf>::new(&alloc, 9, typed).unwrap();
+
+    // Construction round-tripped the pointer (from_repr -> stored via repr) with its tag.
+    assert_eq!(h.handle().get_link(stack).unwrap().repr().type_index(), 1);
+
+    // Deep clone: a fresh target offset, but the same type_index.
+    let c = h.handle().try_clone_in(&alloc).unwrap();
+    let cl = c.handle().get_link(stack).unwrap();
+    assert_eq!(
+        cl.repr().type_index(),
+        1,
+        "clone wiped the foreign type_index"
+    );
+    assert_ne!(
+        cl.repr().offset(),
+        toff,
+        "owned foreign should deep-copy the target"
+    );
+
+    c.bstack_drop(&alloc).unwrap();
+    h.bstack_drop(&alloc).unwrap();
+    let _ = target;
+}
+
+// --------------------------------------------------------------------------
+// An enum vec-variant `read()` must return a FIELD-bound vec
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+enum VecVarEnum {
+    Empty,
+    Bytes(Vec<u8>),
+}
+
+#[test]
+fn enum_vec_variant_read_persists_growth() {
+    // Reading a vec variant returns a handle whose write-back is bound to the enum's
+    // inline descriptor, so a realloc-on-`push` persists the moved data block. A
+    // detached view would leave the enum pointing at freed space (dangling → double-free).
+    use crate::BStackVec;
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+
+    let e = VecVarEnum::new(
+        &alloc,
+        VecVarEnumData::Bytes(BStackVec::from_slice(&alloc, &[1u8, 2]).unwrap()),
+    )
+    .unwrap();
+
+    // Read the variant and grow it far past its initial 2-byte capacity (forcing
+    // several reallocs, which move + free the data block).
+    {
+        let VecVarEnumView::Bytes(mut v) = e.handle().read(&alloc).unwrap() else {
+            panic!("Bytes variant");
+        };
+        for i in 0..64u8 {
+            v.push(i).unwrap();
+        }
+    }
+
+    // Re-reading the enum sees the GROWN vec — the inline descriptor tracked the move.
+    let VecVarEnumView::Bytes(v2) = e.handle().read(&alloc).unwrap() else {
+        panic!("Bytes variant");
+    };
+    assert_eq!(
+        v2.len().unwrap(),
+        66,
+        "enum descriptor did not track the realloc"
+    );
+    let all = v2.to_vec().unwrap();
+    assert_eq!(&all[..2], &[1u8, 2]);
+    assert_eq!(all[2], 0); // first pushed byte
+
+    // Teardown frees the (current) data block exactly once — no double-free.
+    e.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
+// Re-attach must drop the replaced host's reverse-map entry
+// --------------------------------------------------------------------------
+
+#[test]
+fn registry_reattach_removes_stale_reverse_map_entry() {
+    use crate::registry::FileRegistry;
+    use std::sync::Arc;
+
+    let reg_tmp = TempStack::new();
+    let reg = FileRegistry::open(&reg_tmp.path).unwrap();
+
+    // Two DISTINCT host files, attached under the SAME registry path.
+    let a = TempStack::new();
+    let host_a = Arc::new(a.allocator());
+    let b = TempStack::new();
+    let host_b = Arc::new(b.allocator());
+    let path_p = std::path::Path::new("registry_reattach_test_path.bstack");
+
+    let id1 = reg.attach(path_p, host_a.clone()).unwrap();
+    // Re-attach the SAME path with a DIFFERENT host, without detaching first.
+    let id2 = reg.attach(path_p, host_b.clone()).unwrap();
+    assert_eq!(id1, id2, "same path must resolve to the same id");
+
+    // Only the current host (b) maps to the id; a's stale reverse entry is gone.
+    assert_eq!(reg.id_of_host(host_b.stack()), Some(id2));
+    assert_eq!(
+        reg.id_of_host(host_a.stack()),
+        None,
+        "replaced host's stale by_stack entry not removed (two stacks map to one id)"
+    );
+
+    // Detach fully clears the reverse map (no stale entry survives).
+    reg.detach(id2);
+    assert_eq!(reg.id_of_host(host_b.stack()), None);
+    assert_eq!(reg.id_of_host(host_a.stack()), None);
 }

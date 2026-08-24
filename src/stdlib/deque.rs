@@ -45,7 +45,8 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::replace::{ReplaceError, finish_handback};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackDeque`]: the block header, a pointer to the
 /// ring data block (`0` = none), its capacity in slots, and the circular
@@ -76,6 +77,10 @@ const DEQUE_SIZE: u64 = size_of::<DequeOnDisk>() as u64;
 /// The capacity a freshly grown empty ring starts at.
 const MIN_CAP: u64 = 4;
 
+fn overflow_err() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "deque offset overflow")
+}
+
 /// An owned double-ended queue of `T` blocks.
 ///
 /// A typed handle (a newtype over a [`BStackRange`]); [`new`](Self::new) returns
@@ -98,7 +103,7 @@ impl<T: BStackBlock> BStackDeque<T> {
 
     /// A `T`-value handle over the block at `off` (fixed-size-block model).
     fn value_at(off: u64) -> T {
-        <T as BStackBlock>::from_range(BStackRange::new(off, Self::value_size()))
+        unsafe { <T as BStackBlock>::from_range(BStackRange::new(off, Self::value_size())) }
     }
 
     /// Read the four `(head, len, cap, data)` metadata fields of the handle at
@@ -106,6 +111,33 @@ impl<T: BStackBlock> BStackDeque<T> {
     fn read_meta(stack: &BStack, handle: u64) -> io::Result<(u64, u64, u64, u64)> {
         let [data, cap, head, len] = read_fields::<4>(stack, handle + DATA_OFF)?;
         Ok((head, len, cap, data))
+    }
+
+    /// The ring index for logical position `head + x` (mod `cap`), rejecting
+    /// `cap == 0` — a corrupted on-disk capacity, otherwise a `%` panic
+    /// unconditionally reachable from a pure read (`front`/`back`/`to_vec`/
+    /// iteration) regardless of build mode. `head + x` wrapping before the
+    /// reduction is intentional: only the reduced, `cap`-bounded index is ever
+    /// used for an address.
+    fn ring_index(head: u64, x: u64, cap: u64) -> io::Result<u64> {
+        if cap == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt deque: zero capacity with a nonzero length",
+            ));
+        }
+        Ok(head.wrapping_add(x) % cap)
+    }
+
+    /// The absolute ring-slot address for a (already `cap`-bounded) index,
+    /// rejecting overflow — `data` can originate from a corrupted on-disk
+    /// pointer.
+    fn slot_addr(data: u64, idx: u64) -> io::Result<u64> {
+        let delta = idx
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque offset overflow"))?;
+        data.checked_add(delta)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque offset overflow"))
     }
 
     /// Allocate an empty deque (no ring is allocated until the first push).
@@ -124,12 +156,13 @@ impl<T: BStackBlock> BStackDeque<T> {
         }
         // Allocate the ring first (an orphan); its slots are empty (len == 0), so
         // their contents are never read before being written.
-        let ring = allocator.alloc(cap * 8)?.as_range().start();
+        let size = cap.saturating_mul(8);
+        let ring = allocator.alloc(size)?.as_range().start();
         match Self::with_image(allocator, ring, cap) {
             Ok(owned) => Ok(owned),
             Err(e) => {
                 // SAFETY: the ring was just allocated and linked to nothing.
-                let _ = unsafe { dealloc_range(allocator, BStackRange::new(ring, cap * 8)) };
+                let _ = unsafe { dealloc_range(allocator, BStackRange::new(ring, size)) };
                 Err(e)
             }
         }
@@ -176,38 +209,47 @@ impl<T: BStackBlock> BStackDeque<T> {
         &self,
         allocator: &A,
         value: BStackOwned<T>,
-    ) -> io::Result<()> {
+    ) -> Result<(), ReplaceError<BStackOwned<T>>> {
         let handle = self.range.start();
-        let val_off = value.into_inner().range().start();
-        loop {
-            let full = Cell::new(false);
-            let mut w: WriteBuf<2> = WriteBuf::new();
-            atomic_update(
-                allocator,
-                &[
-                    handle + HEAD_OFF,
-                    handle + LEN_OFF,
-                    handle + CAP_OFF,
-                    handle + DATA_OFF,
-                ],
-                |_v1| Vec::new(),
-                |v1, _v2| {
-                    let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
-                    if len < cap {
-                        let slot = data + ((head + len) % cap) * 8;
-                        w.push(w8(slot, val_off));
-                        w.push(w8(handle + LEN_OFF, len + 1));
-                    } else {
-                        full.set(true);
-                    }
-                    w.as_slice()
-                },
-            )?;
-            if !full.get() {
-                return Ok(());
+        // Guard the value block so a stray return can't orphan it; on a failed
+        // push [`finish_handback`] returns it to the caller rather than freeing it
+        //, and defuses the guard on success once it is linked.
+        let value = value.auto(allocator);
+        let val_off = value.range().start();
+        let outcome: io::Result<()> = (|| {
+            loop {
+                let full = Cell::new(false);
+                let mut w: WriteBuf<2> = WriteBuf::new();
+                atomic_update(
+                    allocator,
+                    &[
+                        handle + HEAD_OFF,
+                        handle + LEN_OFF,
+                        handle + CAP_OFF,
+                        handle + DATA_OFF,
+                    ],
+                    |_v1| Ok(Vec::new()),
+                    |v1, _v2| {
+                        let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
+                        if len < cap {
+                            // `len < cap` (unsigned) already implies `cap > 0`.
+                            let idx = head.wrapping_add(len) % cap;
+                            let slot = Self::slot_addr(data, idx)?;
+                            w.push(w8(slot, val_off));
+                            w.push(w8(handle + LEN_OFF, len + 1));
+                        } else {
+                            full.set(true);
+                        }
+                        Ok(w.as_slice())
+                    },
+                )?;
+                if !full.get() {
+                    return Ok(());
+                }
+                self.grow(allocator)?;
             }
-            self.grow(allocator)?;
-        }
+        })();
+        finish_handback(value, outcome)
     }
 
     /// Prepend a value to the front, taking ownership of its block.
@@ -215,40 +257,48 @@ impl<T: BStackBlock> BStackDeque<T> {
         &self,
         allocator: &A,
         value: BStackOwned<T>,
-    ) -> io::Result<()> {
+    ) -> Result<(), ReplaceError<BStackOwned<T>>> {
         let handle = self.range.start();
-        let val_off = value.into_inner().range().start();
-        loop {
-            let full = Cell::new(false);
-            let mut w: WriteBuf<3> = WriteBuf::new();
-            atomic_update(
-                allocator,
-                &[
-                    handle + HEAD_OFF,
-                    handle + LEN_OFF,
-                    handle + CAP_OFF,
-                    handle + DATA_OFF,
-                ],
-                |_v1| Vec::new(),
-                |v1, _v2| {
-                    let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
-                    if len < cap {
-                        let idx = (head + cap - 1) % cap;
-                        let slot = data + idx * 8;
-                        w.push(w8(slot, val_off));
-                        w.push(w8(handle + HEAD_OFF, idx));
-                        w.push(w8(handle + LEN_OFF, len + 1));
-                    } else {
-                        full.set(true);
-                    }
-                    w.as_slice()
-                },
-            )?;
-            if !full.get() {
-                return Ok(());
+        // Guard the value block so a stray return can't orphan it; on a failed
+        // push [`finish_handback`] returns it to the caller rather than freeing it
+        //, and defuses the guard on success once it is linked.
+        let value = value.auto(allocator);
+        let val_off = value.range().start();
+        let outcome: io::Result<()> = (|| {
+            loop {
+                let full = Cell::new(false);
+                let mut w: WriteBuf<3> = WriteBuf::new();
+                atomic_update(
+                    allocator,
+                    &[
+                        handle + HEAD_OFF,
+                        handle + LEN_OFF,
+                        handle + CAP_OFF,
+                        handle + DATA_OFF,
+                    ],
+                    |_v1| Ok(Vec::new()),
+                    |v1, _v2| {
+                        let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
+                        if len < cap {
+                            // `len < cap` (unsigned) already implies `cap > 0`.
+                            let idx = head.wrapping_add(cap - 1) % cap;
+                            let slot = Self::slot_addr(data, idx)?;
+                            w.push(w8(slot, val_off));
+                            w.push(w8(handle + HEAD_OFF, idx));
+                            w.push(w8(handle + LEN_OFF, len + 1));
+                        } else {
+                            full.set(true);
+                        }
+                        Ok(w.as_slice())
+                    },
+                )?;
+                if !full.get() {
+                    return Ok(());
+                }
+                self.grow(allocator)?;
             }
-            self.grow(allocator)?;
-        }
+        })();
+        finish_handback(value, outcome)
     }
 
     /// Remove and return the last element (as an owned value block), or `None` if
@@ -274,9 +324,12 @@ impl<T: BStackBlock> BStackDeque<T> {
             |v1| {
                 let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
                 if len == 0 {
-                    Vec::new()
+                    Ok(Vec::new())
                 } else {
-                    vec![data + ((head + len - 1) % cap) * 8]
+                    Ok(vec![Self::slot_addr(
+                        data,
+                        Self::ring_index(head, len - 1, cap)?,
+                    )?])
                 }
             },
             |v1, v2| {
@@ -286,7 +339,7 @@ impl<T: BStackBlock> BStackDeque<T> {
                     val.set(v2[0]);
                     w.push(w8(handle + LEN_OFF, len - 1));
                 }
-                w.as_slice()
+                Ok(w.as_slice())
             },
         )?;
         if !got.get() {
@@ -319,9 +372,12 @@ impl<T: BStackBlock> BStackDeque<T> {
             |v1| {
                 let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
                 if len == 0 {
-                    Vec::new()
+                    Ok(Vec::new())
                 } else {
-                    vec![data + (head % cap) * 8]
+                    Ok(vec![Self::slot_addr(
+                        data,
+                        Self::ring_index(head, 0, cap)?,
+                    )?])
                 }
             },
             |v1, v2| {
@@ -329,10 +385,10 @@ impl<T: BStackBlock> BStackDeque<T> {
                 if len != 0 {
                     got.set(true);
                     val.set(v2[0]);
-                    w.push(w8(handle + HEAD_OFF, (head + 1) % cap));
+                    w.push(w8(handle + HEAD_OFF, Self::ring_index(head, 1, cap)?));
                     w.push(w8(handle + LEN_OFF, len - 1));
                 }
-                w.as_slice()
+                Ok(w.as_slice())
             },
         )?;
         if !got.get() {
@@ -350,9 +406,16 @@ impl<T: BStackBlock> BStackDeque<T> {
     fn grow<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let cap0 = read_u64(allocator.stack(), handle + CAP_OFF)?;
-        let newcap = if cap0 == 0 { MIN_CAP } else { cap0 * 2 };
+        let newcap = if cap0 == 0 {
+            MIN_CAP
+        } else {
+            cap0.saturating_mul(2)
+        };
         // Allocate the new ring up front (an orphan until the commit swaps to it).
-        let newring = allocator.alloc(newcap * 8)?.as_range().start();
+        let new_size = newcap
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque capacity overflow"))?;
+        let newring = allocator.alloc(new_size)?.as_range().start();
 
         let grown = Cell::new(false);
         let old_ring = Cell::new(0u64);
@@ -374,10 +437,12 @@ impl<T: BStackBlock> BStackDeque<T> {
             |v1| {
                 let (head, len, cap, data) = (v1[0], v1[1], v1[2], v1[3]);
                 if abort(head, len, cap) {
-                    Vec::new()
+                    Ok(Vec::new())
                 } else {
                     // The live elements, in logical order.
-                    (0..len).map(|i| data + ((head + i) % cap) * 8).collect()
+                    (0..len)
+                        .map(|i| Self::slot_addr(data, Self::ring_index(head, i, cap)?))
+                        .collect::<io::Result<Vec<u64>>>()
                 }
             },
             |v1, v2| {
@@ -389,14 +454,17 @@ impl<T: BStackBlock> BStackDeque<T> {
                     w.reserve(v2.len() + 3);
                     // Copy every live element to the front of the new ring.
                     for (i, &r) in v2.iter().enumerate() {
-                        w.push(w8(newring + (i as u64) * 8, r));
+                        let off = newring
+                            .checked_add((i as u64).checked_mul(8).ok_or_else(overflow_err)?)
+                            .ok_or_else(overflow_err)?;
+                        w.push(w8(off, r));
                     }
                     // Swap the descriptor to the new ring, re-based at head 0.
                     w.push(w8(handle + DATA_OFF, newring));
                     w.push(w8(handle + CAP_OFF, newcap));
                     w.push(w8(handle + HEAD_OFF, 0u64));
                 }
-                w.as_slice()
+                Ok(w.as_slice())
             },
         )?;
 
@@ -407,14 +475,14 @@ impl<T: BStackBlock> BStackDeque<T> {
                 let _ = unsafe {
                     dealloc_range(
                         allocator,
-                        BStackRange::new(old_ring.get(), old_cap.get() * 8),
+                        BStackRange::new(old_ring.get(), old_cap.get().saturating_mul(8)),
                     )
                 };
             }
         } else {
             // Growth was unnecessary; reclaim the unused new ring.
             // SAFETY: `newring` was never linked into the descriptor.
-            let _ = unsafe { dealloc_range(allocator, BStackRange::new(newring, newcap * 8)) };
+            let _ = unsafe { dealloc_range(allocator, BStackRange::new(newring, new_size)) };
         }
         Ok(())
     }
@@ -425,10 +493,8 @@ impl<T: BStackBlock> BStackDeque<T> {
         if len == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(read_u64(
-            stack,
-            data + (head % cap) * 8,
-        )?)))
+        let off = Self::slot_addr(data, Self::ring_index(head, 0, cap)?)?;
+        Ok(Some(Self::value_at(read_u64(stack, off)?)))
     }
 
     /// A **borrowed** handle to the back value (no ownership), or `None` if empty.
@@ -437,10 +503,8 @@ impl<T: BStackBlock> BStackDeque<T> {
         if len == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(read_u64(
-            stack,
-            data + ((head + len - 1) % cap) * 8,
-        )?)))
+        let off = Self::slot_addr(data, Self::ring_index(head, len - 1, cap)?)?;
+        Ok(Some(Self::value_at(read_u64(stack, off)?)))
     }
 
     /// Collect **borrowed** handles to every value, front to back. The handles
@@ -448,12 +512,21 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// deque does.
     pub fn to_vec(&self, stack: &BStack) -> io::Result<Vec<T>> {
         let (head, len, cap, data) = Self::read_meta(stack, self.range.start())?;
+        // Untrusted `len`: each element occupies 8 ring bytes, so bound it by the
+        // stack before sizing an allocation with it (as `string.rs` does).
+        let ring_bytes = len
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque length overflow"))?;
+        if ring_bytes > stack.len()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deque length larger than the stack",
+            ));
+        }
         let mut out = Vec::with_capacity(len as usize);
         for i in 0..len {
-            out.push(Self::value_at(read_u64(
-                stack,
-                data + ((head + i) % cap) * 8,
-            )?));
+            let off = Self::slot_addr(data, Self::ring_index(head, i, cap)?)?;
+            out.push(Self::value_at(read_u64(stack, off)?));
         }
         Ok(out)
     }
@@ -464,6 +537,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         let (head, len, cap, data) = Self::read_meta(stack, self.range.start())?;
         Ok(DequeIter {
             stack,
+            block_off: self.range.start(),
             data,
             cap,
             head,
@@ -471,12 +545,6 @@ impl<T: BStackBlock> BStackDeque<T> {
             pos: 0,
             _marker: PhantomData,
         })
-    }
-
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the deque was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
     }
 }
 
@@ -496,7 +564,7 @@ impl<T: BStackBlock> crate::block::BStackEmbeddable for BStackDeque<T> {}
 impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     type OnDisk = DequeOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackDeque {
             range,
             _marker: PhantomData,
@@ -515,7 +583,8 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     ) -> io::Result<()> {
         let (head, len, cap, data) = Self::read_meta(allocator.stack(), range.start())?;
         for i in 0..len {
-            let r = read_u64(allocator.stack(), data + ((head + i) % cap) * 8)?;
+            let off = Self::slot_addr(data, Self::ring_index(head, i, cap)?)?;
+            let r = read_u64(allocator.stack(), off)?;
             if r != 0 {
                 // SAFETY: the deque solely owns each element block.
                 let owned = unsafe { BStackOwned::from_raw(Self::value_at(r)) };
@@ -523,8 +592,11 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
             }
         }
         if data != 0 {
+            let size = cap.checked_mul(8).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "deque capacity overflow")
+            })?;
             // SAFETY: the deque solely owns its ring block.
-            unsafe { dealloc_range(allocator, BStackRange::new(data, cap * 8))? };
+            unsafe { dealloc_range(allocator, BStackRange::new(data, size))? };
         }
         Ok(())
     }
@@ -540,10 +612,22 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     ) -> io::Result<Self::OnDisk> {
         let (head, len, cap, data) = Self::read_meta(allocator.stack(), self.range.start())?;
 
+        // Untrusted `len`: checked math + stack bound before sizing allocations
+        // (see `to_vec`); `ring_bytes` is also the fresh ring's size below.
+        let ring_bytes = len
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque length overflow"))?;
+        if ring_bytes > allocator.stack().len()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "deque length larger than the stack",
+            ));
+        }
         // Deep-clone each element (in logical order) into the plan.
         let mut dsts = Vec::with_capacity(len as usize);
         for i in 0..len {
-            let r = read_u64(allocator.stack(), data + ((head + i) % cap) * 8)?;
+            let off = Self::slot_addr(data, Self::ring_index(head, i, cap)?)?;
+            let r = read_u64(allocator.stack(), off)?;
             let dst = if r != 0 {
                 Self::value_at(r)
                     .__bstack_clone_into(allocator, plan)?
@@ -556,7 +640,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
 
         // Pack the cloned refs into a fresh, exactly-sized ring.
         let (new_data, new_cap) = if len > 0 {
-            let ring = plan.alloc_raw(allocator, len * 8)?;
+            let ring = plan.alloc_raw(allocator, ring_bytes)?;
             let mut bytes = Vec::with_capacity(dsts.len() * 8);
             for d in &dsts {
                 bytes.extend_from_slice(&d.to_le_bytes());
@@ -585,14 +669,6 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     }
 }
 
-impl<T: BStackBlock> BStackDrop for BStackDeque<T> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
-    }
-}
-
 impl<T: BStackBlock> TryCloneIn for BStackDeque<T> {
     fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
@@ -613,6 +689,8 @@ impl<T: BStackBlock> TryCloneIn for BStackDeque<T> {
 /// value handles. Created by [`BStackDeque::iter`].
 pub struct DequeIter<'a, T: BStackBlock> {
     stack: &'a BStack,
+    /// The deque handle block, re-read each step to detect mutation.
+    block_off: u64,
     data: u64,
     cap: u64,
     head: u64,
@@ -628,7 +706,42 @@ impl<'a, T: BStackBlock> Iterator for DequeIter<'a, T> {
         if self.pos >= self.len {
             return None;
         }
-        let slot = self.data + ((self.head + self.pos) % self.cap) * 8;
+        // Fail fast if the deque was mutated during iteration. A `grow` frees
+        // the old ring and repoints `data`, but a `push`/`pop` mutates *in place*:
+        // it advances `head` / changes `len` and hands out (or frees) an element
+        // block **without moving the ring or clearing the vacated slot**, so
+        // checking `data`/`cap` alone would miss it and later read a stale offset a
+        // `T` handle could then free (use-after-free). Compare all four snapshot
+        // fields — pure iteration never touches them, so any change is a mutation —
+        // and turn it into a clean `InvalidData` error.
+        match BStackDeque::<T>::read_meta(self.stack, self.block_off) {
+            Ok((head, len, cap, data))
+                if data == self.data
+                    && cap == self.cap
+                    && head == self.head
+                    && len == self.len => {}
+            Ok(_) => {
+                self.pos = self.len;
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "BStackDeque was mutated during iteration (its head/len/ring \
+                     changed); the iterator is invalidated",
+                )));
+            }
+            Err(e) => {
+                self.pos = self.len;
+                return Some(Err(e));
+            }
+        }
+        let slot = match BStackDeque::<T>::ring_index(self.head, self.pos, self.cap)
+            .and_then(|idx| BStackDeque::<T>::slot_addr(self.data, idx))
+        {
+            Ok(off) => off,
+            Err(e) => {
+                self.pos = self.len; // stop after an error
+                return Some(Err(e));
+            }
+        };
         self.pos += 1;
         match read_u64(self.stack, slot) {
             Ok(vref) => Some(Ok(BStackDeque::<T>::value_at(vref))),

@@ -87,15 +87,21 @@ mod tests;
 pub use block::{
     BStackBlock, BStackCast, BStackMove, BStackMoveExpr, BStackShared, BStackWeakable,
 };
+pub use bulk::FreeManyError;
 pub use cast::{BStackCastAs, BStackCastInto};
-pub use clone::{ClonePlan, TryClone, TryCloneIn};
-pub use construct::{alloc_block, build_control_payload, set_weak_field, upgrade_weak_field};
+/// Codegen plumbing, re-exported for `#[bstack_block]`-generated code only. It is
+/// named in [`BStackBlock`]'s (hidden) trait-method signatures, so the type must
+/// stay `pub`; the supported way to clone is [`TryClone`] / [`TryCloneIn`].
+#[doc(hidden)]
+pub use clone::ClonePlan;
+pub use clone::{TryClone, TryCloneIn};
 /// The inert on-disk wire form of a [`Foreign`] pointer. Not part of the public API —
 /// generated `#[bstack_block]` code names it through `::bstack_raii::ForeignRepr`; user
 /// code should never use it directly.
 #[doc(hidden)]
 pub use foreign::ForeignRepr;
 pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
+pub use construct::ConstructError;
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};
 pub use owned::BStackOwned;
@@ -197,10 +203,24 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     /// (each `dealloc` individually atomic); a bulk-capable allocator overrides it
     /// to route through the atomic [`dealloc_bulk`](bstack::BStackBulkAllocator::dealloc_bulk).
     ///
-    /// # Safety-adjacent contract
+    /// On a partial failure the fallback **frees every range it can** (rather than
+    /// stopping at the first error and leaving an unknown suffix allocated) and
+    /// returns a [`FreeManyError`](crate::FreeManyError) (wrapped in the
+    /// [`io::Error`]) naming every range whose free did not cleanly complete — a
+    /// superset of those still allocated, so nothing is silently leaked.
+    /// Downcast the error's source to `FreeManyError` to recover
+    /// them.
+    ///
+    /// # Safety
     /// Each range must be a live allocation owned by `self` that no other live
-    /// handle will also free (as for [`crate::teardown`]'s `dealloc_range`).
-    fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> std::io::Result<()> {
+    /// handle will also free (as for [`crate::teardown`]'s `dealloc_range`, whose
+    /// obligation this method carries range-by-range). `BStackRange::new` is a
+    /// safe constructor, so nothing gates the argument but this contract; the safe
+    /// ways to free remain [`BStackDrop`] / [`AutoDrop`].
+    unsafe fn free_many(
+        &self,
+        ranges: impl IntoIterator<Item = BStackRange>,
+    ) -> std::io::Result<()> {
         crate::bulk::seq_free_many(self, ranges)
     }
 
@@ -238,10 +258,26 @@ pub mod __private {
     // it; no downstream code names it, so it lives here rather than in the prelude — the
     // `on_unimplemented` message fires regardless of visibility.
     pub use crate::block::BStackEmbeddable;
+    /// Constructor plumbing for `(rc, weak)` and `#[bstack_weak]` lowerings —
+    /// moved out of the prelude because their raw `field_off` / minted-image
+    /// arguments carry `dealloc_range`-class obligations (`set_weak_field` /
+    /// `upgrade_weak_field` are additionally `unsafe fn`).
+    pub use crate::construct::{build_control_payload, set_weak_field, upgrade_weak_field};
     pub use crate::foreign::{
         foreign_clone_owned, foreign_clone_strong, foreign_clone_weak, foreign_drop_owned,
-        foreign_drop_strong, foreign_drop_weak,
+        foreign_drop_strong, foreign_drop_weak, home_relative_repr, resolve_self_repr,
     };
+    /// Add a compile-time field-offset constant to a block's base offset,
+    /// rejecting overflow. Generated accessors call this instead of a bare
+    /// `+`: the base (`self.0.start()` or similar) can originate from an
+    /// on-disk pointer that is corrupted or forged, and a bare `+` would
+    /// either panic under `overflow-checks` or silently wrap to an unrelated
+    /// in-bounds offset that the accessor would then read or write.
+    pub use crate::layout::checked_off as checked_field_offset;
+    /// Narrow a layout quantity to the `u32` the RTTI wire format uses,
+    /// panicking with a clear diagnostic on overflow rather than silently
+    /// wrapping. Called from `#[bstack_class]`-generated schema builders.
+    pub use crate::rtti::rtti_narrow_u32;
 }
 
 /// `compile_fail` residual for the **trait-bound** illegal inputs — where the error
@@ -293,6 +329,70 @@ pub mod __private {
 /// use bstack_raii::bstack_block;
 /// #[bstack_block]
 /// struct Holder { #[bstack_owned] link: bstack_raii::Foreign<u32> }
+/// # fn main() {}
+/// ```
+///
+/// `[BSTACK0005]` an explicit 8-byte tag on a **generic** block collapses every
+/// instantiation to one tag (`mix` has no hash bytes left to perturb):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block(tag = "EIGHTTAG")]
+/// struct Pinned<T: bstack_raii::Pod> { #[bstack_mut] v: T }
+/// # fn main() {}
+/// ```
+///
+/// `[BSTACK0006]` an `(rc, weak)` block whose explicit `ctrl_tag` equals its data
+/// `tag` collapses the data/control distinction (the auto-derived control tag
+/// toggles a reserved hash bit and so is always distinct — this fires only for an
+/// explicit override):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block(tag = "DUP", ctrl_tag = "DUP", rc, weak)]
+/// struct Dup { v: u32 }
+/// # fn main() {}
+/// ```
+///
+/// `[BSTACK0003]` an unrecognised `bstack_*` field attribute (here a typo) is a
+/// hard error rather than a silently-dropped annotation:
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { #[bstack_mutt] y: u64 }
+/// # fn main() {}
+/// ```
+///
+/// `[BSTACK0004]` `#[cfg]` on a block field is rejected (the generated layout,
+/// constructor, and accessors cannot be made conditional):
+/// ```compile_fail
+/// use bstack_raii::bstack_block;
+/// #[bstack_block]
+/// struct X { x: u64, #[cfg(feature = "nope")] gated: u64 }
+/// # fn main() {}
+/// ```
+///
+/// Affine handle: a bare block handle is a non-owning **view** with no
+/// [`BStackDrop`], so it cannot be freed — freeing requires an affine
+/// [`BStackOwned`] / `*Ref` token:
+/// ```compile_fail
+/// use bstack_raii::{bstack_block, BStackDrop, BStackOwnedSliceAllocator};
+/// #[bstack_block]
+/// struct Cell { v: u32 }
+/// fn f<A: BStackOwnedSliceAllocator>(owned: bstack_raii::BStackOwned<Cell>, a: &A) {
+///     let view: Cell = owned.into_inner(); // a Copy view
+///     let _ = view.bstack_drop(a);         // no `bstack_drop` on a bare handle
+/// }
+/// # fn main() {}
+/// ```
+///
+/// `BStackRc` release: `rc.bstack_drop(&alloc)` no longer resolves through
+/// `Deref` to a raw handle free — release is `drop(rc)`:
+/// ```compile_fail
+/// use bstack_raii::{bstack_block, BStackDrop, BStackOwnedSliceAllocator};
+/// #[bstack_block(rc)]
+/// struct S { v: u32 }
+/// fn f<A: BStackOwnedSliceAllocator>(rc: bstack_raii::BStackRc<'_, S, A>, a: &A) {
+///     let _ = rc.bstack_drop(a); // gone: use `drop(rc)` for a refcount release
+/// }
 /// # fn main() {}
 /// ```
 #[doc(hidden)]

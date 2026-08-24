@@ -55,7 +55,7 @@
 use core::mem::size_of;
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use bstack::{BStackBulkAllocator, BStackOwnedSlice, BStackRange};
 use bytemuck::{Pod, Zeroable};
@@ -77,7 +77,7 @@ use crate::teardown::dealloc_range;
 // currently calls it — no commit path (`bulk`, `clone`, `teardown`) reuses a
 // freed slice for a same-length allocation. Kept `#[cfg(test)]` (exercised by
 // the unit tests below) rather than deleted, since wiring it in is tracked
-// separately (see PROBLEMS.md §1).
+// separately.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AllocReq {
@@ -147,10 +147,16 @@ pub(crate) enum WalOp {
 }
 
 impl WalOp {
-    fn from_u8(v: u8) -> Self {
+    fn from_u8(v: u8) -> Option<Self> {
         match v {
-            1 => WalOp::Dealloc,
-            _ => WalOp::Alloc,
+            0 => Some(WalOp::Alloc),
+            1 => Some(WalOp::Dealloc),
+            // A corrupt byte decodes to *neither* op — the safe sink, matching
+            // `WalStatus`: an unrecognised entry is never acted on, so recovery
+            // can at most leak. (Defaulting to `Alloc` was unsafe on the
+            // abandoned path: a `Dealloc` misread as `Alloc` freed a slice that
+            // was staged-but-never-committed, i.e. still live and linked.)
+            _ => None,
         }
     }
 }
@@ -236,7 +242,9 @@ impl WalEntry {
         WalStatus::from_u8(self.status)
     }
 
-    pub fn op(&self) -> WalOp {
+    /// `None` for a corrupt `op` byte — such an entry is inert on both
+    /// recovery paths (see [`WalOp::from_u8`]).
+    pub fn op(&self) -> Option<WalOp> {
         WalOp::from_u8(self.op)
     }
 
@@ -251,16 +259,16 @@ impl WalEntry {
     /// The recorded slice `S`, if this is an `Alloc` entry (to be freed on abandon).
     pub fn as_alloc(&self) -> Option<BStackRange> {
         match self.op() {
-            WalOp::Alloc => Some(BStackRange::new(self.word_a, self.word_b)),
-            WalOp::Dealloc => None,
+            Some(WalOp::Alloc) => Some(BStackRange::new(self.word_a, self.word_b)),
+            _ => None,
         }
     }
 
     /// The recorded slice `S`, if this is a `Dealloc` entry.
     pub fn as_dealloc(&self) -> Option<BStackRange> {
         match self.op() {
-            WalOp::Dealloc => Some(BStackRange::new(self.word_a, self.word_b)),
-            WalOp::Alloc => None,
+            Some(WalOp::Dealloc) => Some(BStackRange::new(self.word_a, self.word_b)),
+            _ => None,
         }
     }
 }
@@ -390,6 +398,24 @@ const WAL_MAGIC: u64 = 0x6273_7461_636b_5741; // "bstackWA"
 /// it to the next power of two.
 const WAL_MIN_CAP: u64 = 8;
 
+/// Ceiling on a persisted WAL header's `capacity` (and, transitively, `count`)
+/// that this crate will ever trust. `header.capacity`/`header.count` are read
+/// straight from disk with only the `magic` field validating the record, so a
+/// corrupted header could otherwise claim billions of entries — driving an
+/// unbounded allocation in [`load_at`] (`handle_alloc_error` aborts the process)
+/// or, worse, letting [`wal_ensure_block`] skip a real reallocation because a
+/// forged `capacity` looks "already big enough" while the real block stays its
+/// old (small) size, so a later [`wal_append_alloc`] writes past it. No real
+/// transaction logs anywhere near this many allocations.
+const WAL_MAX_CAP: u64 = 1 << 20;
+
+fn corrupt_wal_capacity() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "corrupt persistent WAL block: capacity/count out of range",
+    )
+}
+
 /// On-disk header of the persistent WAL block. `txn_status` is both the
 /// transaction-level commit marker and the idle/in-use flag (`None` = idle);
 /// `capacity` is the number of [`WalEntry`] slots the block was allocated for.
@@ -459,7 +485,10 @@ macro_rules! bulk_raii_methods {
         fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
             bulk_alloc_many(self, sizes)
         }
-        fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
+        unsafe fn free_many(
+            &self,
+            ranges: impl IntoIterator<Item = BStackRange>,
+        ) -> io::Result<()> {
             bulk_free_many(self, ranges)
         }
         fn atomic_bulk(&self) -> bool {
@@ -491,6 +520,20 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
         Some(STD_WAL_ANCHOR)
     }
 }
+// FUZZ.md's O2 oracle (overlap / double-free) needs a checking wrapper around a
+// normal allocator; only this crate can bridge a `bstack`-foreign generic
+// (`DebugCheckingAllocator<A>`) to our foreign `BStackRaiiAllocator` (orphan
+// rules), so it lives here rather than in test code. Pinned to `FirstFit` (the
+// allocator the fuzz/test harness actually wraps) rather than written generic
+// over `A: BStackAllocator`, matching every other impl in this block being
+// per-concrete-type, not blanket.
+unsafe impl BStackRaiiAllocator
+    for bstack::DebugCheckingAllocator<bstack::FirstFitBStackAllocator>
+{
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
 // `LinearBStackAllocator` deliberately does **not** implement `BStackRaiiAllocator`:
 // its `alloc` is a bare `BStack::extend`, so its first allocation hands out payload
 // offset 0 — the crate's null niche — and its `dealloc` is a no-op (teardown would
@@ -518,13 +561,18 @@ fn bulk_free_many<A>(allocator: &A, ranges: impl IntoIterator<Item = BStackRange
 where
     A: BStackRaiiAllocator + BStackBulkAllocator,
 {
+    let ranges: Vec<BStackRange> = ranges.into_iter().collect();
     let handles = ranges
-        .into_iter()
+        .iter()
         // SAFETY: each range is a live allocation owned by `allocator` that no other
         // live handle will also free (the `free_many` contract).
-        .map(|r| unsafe { BStackOwnedSlice::from_raw_range(allocator, r) })
+        .map(|&r| unsafe { BStackOwnedSlice::from_raw_range(allocator, r) })
         .collect::<Vec<_>>();
-    allocator.dealloc_bulk(handles).map_err(|e| e.source)
+    // `dealloc_bulk` is atomic (all-or-nothing), so on failure every range is
+    // still allocated — report them all as unfreed.
+    allocator
+        .dealloc_bulk(handles)
+        .map_err(|e| crate::bulk::FreeManyError::from_parts(e.source, ranges).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +588,10 @@ where
 // ---------------------------------------------------------------------------
 
 /// Per-file WAL mutex registry, keyed by the address of the file's [`BStack`].
-static WAL_LOCKS: OnceLock<Mutex<HashMap<usize, Arc<Mutex<()>>>>> = OnceLock::new();
+/// Stores [`Weak`](std::sync::Weak) so an entry dies with its last outstanding
+/// guard — the map would otherwise grow by one mutex for every distinct `BStack`
+/// address the process ever uses. Dead entries are swept on each insert.
+static WAL_LOCKS: OnceLock<Mutex<HashMap<usize, std::sync::Weak<Mutex<()>>>>> = OnceLock::new();
 
 /// The WAL mutex for `allocator`'s file (created on first use). Hold its guard
 /// across a whole WAL transaction.
@@ -548,9 +599,93 @@ pub(crate) fn wal_lock_for<A: BStackRaiiAllocator>(allocator: &A) -> Arc<Mutex<(
     let key = core::ptr::from_ref(allocator.stack()) as usize;
     let reg = WAL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = reg.lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+    if let Some(live) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return live;
+    }
+    // Miss (or dead entry): sweep expired weaks so the map stays bounded by the
+    // number of *live* locks, then insert a fresh one.
+    map.retain(|_, w| w.strong_count() > 0);
+    let fresh = Arc::new(Mutex::new(()));
+    map.insert(key, Arc::downgrade(&fresh));
+    fresh
+}
+
+thread_local! {
+    /// Stack-pointer keys of the per-file WAL locks this thread currently holds for
+    /// in-flight clone transactions. A clone holds a file's lock for its *whole*
+    /// descent, so a nested clone that re-enters the **same** file — an owned cross-file
+    /// cycle A→B→A, or a `Foreign` with an explicit id that resolves to the home file —
+    /// would re-acquire the same non-reentrant `Mutex` the outer clone still holds, a
+    /// self-deadlock. Detecting the key here turns that hang into a clean error rather
+    /// than progress: the two would otherwise share (and clobber) the one per-file WAL
+    /// block, and an owned cycle is unclonable regardless (issue F4).
+    static HELD_CLONE_LOCKS: core::cell::RefCell<Vec<usize>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The file's WAL [`Mutex`] held across a whole clone / RTTI-clone transaction. It
+/// owns the `Arc` so the lifetime-extended guard can never outlive the mutex it
+/// borrows; `Drop` releases the guard *before* the `Arc` is dropped. Shared by
+/// [`crate::clone::ClonePlan`] and the RTTI `clone_value` interpreter.
+pub(crate) struct HeldLock {
+    /// `Some` while held; taken in `Drop` so the guard releases before `_arc`.
+    guard: Option<MutexGuard<'static, ()>>,
+    /// Keeps the mutex alive for as long as `guard` borrows it.
+    _arc: Arc<Mutex<()>>,
+    /// The file's stack-pointer key, removed from [`HELD_CLONE_LOCKS`] on drop.
+    key: usize,
+}
+
+impl HeldLock {
+    /// Acquire `allocator`'s file WAL lock for a clone. Returns `Err` — instead of
+    /// deadlocking — if this thread already holds it (a same-file clone re-entry).
+    pub(crate) fn acquire<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<Self> {
+        let key = core::ptr::from_ref(allocator.stack()) as usize;
+        if HELD_CLONE_LOCKS.with(|h| h.borrow().contains(&key)) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "clone re-entered a file already being cloned on this thread (an owned \
+                 cross-file cycle, or a `Foreign` that resolves to the home file); this \
+                 would deadlock on the per-file WAL lock",
+            ));
+        }
+        let arc = wal_lock_for(allocator);
+        let guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the guard borrows the `Mutex` owned by `arc`, which this struct
+        // keeps alive; `Drop` releases the guard before `arc` is dropped, so the
+        // borrow never dangles. The transmute only extends the guard's lifetime to
+        // `'static` to store it alongside its owning `Arc`.
+        let guard: MutexGuard<'static, ()> = unsafe { core::mem::transmute(guard) };
+        HELD_CLONE_LOCKS.with(|h| h.borrow_mut().push(key));
+        Ok(HeldLock {
+            guard: Some(guard),
+            _arc: arc,
+            key,
+        })
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        // Release the guard before `_arc` drops (which would free the `Mutex`).
+        self.guard = None;
+        HELD_CLONE_LOCKS.with(|h| {
+            let mut v = h.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|&k| k == self.key) {
+                v.swap_remove(pos);
+            }
+        });
+    }
+}
+
+/// Test-only: hold `alloc`'s clone WAL lock, then attempt to re-acquire it on the same
+/// thread — exactly what a same-file nested clone (owned A→B→A cycle, or a `Foreign`
+/// resolving to the home file) does. The re-entry must return `Err` instead of
+/// deadlocking on the non-reentrant lock (issue F4). Returns whether it was rejected;
+/// the outer lock is released when this returns, so the state is left clean.
+#[cfg(test)]
+pub(crate) fn test_reentrant_acquire_is_rejected<A: BStackRaiiAllocator>(alloc: &A) -> bool {
+    let _outer = HeldLock::acquire(alloc).expect("first acquire should succeed");
+    HeldLock::acquire(alloc).is_err()
 }
 
 /// Read the anchor slot: the persistent WAL block's offset, or `None` if the
@@ -581,18 +716,28 @@ fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::R
     let hsz = size_of::<WalHeader>() as u64;
     let esz = size_of::<WalEntry>() as u64;
 
+    let mut old_to_free: Option<BStackRange> = None;
     if let Some(off) = read_anchor(allocator)? {
         let mut hbuf = [0u8; size_of::<WalHeader>()];
         stack.get_into(off, &mut hbuf)?;
         let header: WalHeader = bytemuck::pod_read_unaligned(&hbuf);
         if header.magic == WAL_MAGIC {
+            // A forged/corrupted `capacity` is never trusted past this bound — used
+            // unchecked it could make `header.capacity >= needed` skip a real
+            // reallocation while the block's real (small) size stays put, so a later
+            // append writes past it; or size `old_to_free`'s dealloc from thin air.
+            // Neither is safe to attempt, so a wildly out-of-range capacity is
+            // reported rather than acted on.
+            if header.capacity > WAL_MAX_CAP {
+                return Err(corrupt_wal_capacity());
+            }
             if header.capacity >= needed {
                 return Ok((off, header.capacity));
             }
-            // Too small: free the old block (its content is not needed across the
-            // grow) and fall through to allocate a bigger one.
-            let old = BStackRange::new(off, hsz + header.capacity * esz);
-            unsafe { dealloc_range(allocator, old)? };
+            // Too small: reclaim the old block *after* the new one is allocated and the
+            // anchor repointed — link-before-free, so a crash never leaves the anchor
+            // naming a freed offset. Its content is transient across the grow.
+            old_to_free = Some(BStackRange::new(off, hsz + header.capacity * esz));
         }
     }
 
@@ -610,7 +755,13 @@ fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::R
         let _ = allocator.dealloc(slice);
         return Err(e);
     }
+    // Commit the new block by repointing the anchor. Before this, a crash leaks the
+    // fresh block and the anchor still names the valid old one; after it, the old block
+    // is safe to reclaim (a crash there merely leaks the old block).
     stack.set(slot, off.to_le_bytes())?;
+    if let Some(old) = old_to_free {
+        unsafe { dealloc_range(allocator, old)? };
+    }
     Ok((off, capacity))
 }
 
@@ -648,6 +799,13 @@ fn load_at<A: BStackRaiiAllocator>(
     let header: WalHeader = bytemuck::pod_read_unaligned(&hbuf);
     if header.magic != WAL_MAGIC {
         return Ok(None);
+    }
+    // `count`/`capacity` are on-disk fields validated only by `magic` above; an
+    // unbounded `count` would size a `Vec` allocation an attacker fully controls
+    // (`handle_alloc_error` aborts the process on failure — worse than a panic),
+    // and this is the recovery path `wal::finish` runs on every open.
+    if header.capacity > WAL_MAX_CAP || header.count > header.capacity {
+        return Err(corrupt_wal_capacity());
     }
     let ebytes = header.count as usize * size_of::<WalEntry>();
     let mut ebuf = vec![0u8; ebytes];
@@ -793,7 +951,8 @@ pub(crate) fn finish_at_locked<A: BStackRaiiAllocator>(allocator: &A) -> io::Res
             }
         }
         if !local.is_empty() {
-            allocator.free_many(local)?;
+            // SAFETY: recovery replays ranges the WAL recorded from owned frees.
+            unsafe { allocator.free_many(local)? };
         }
         for (fid, s) in foreign {
             free_recorded(allocator, fid, s)?;
@@ -856,14 +1015,14 @@ mod tests {
     #[test]
     fn wal_entry_roundtrip() {
         let a = WalEntry::alloc(WalStatus::Pending, BStackRange::new(0x1000, 256));
-        assert_eq!(a.op(), WalOp::Alloc);
+        assert_eq!(a.op(), Some(WalOp::Alloc));
         assert_eq!(a.status(), WalStatus::Pending);
         assert_eq!(a.as_alloc(), Some(BStackRange::new(0x1000, 256)));
         assert_eq!(a.as_dealloc(), None);
         assert_eq!(a.file_id(), 0); // local convenience ctor ⇒ SELF
 
         let d = WalEntry::dealloc(WalStatus::Complete, BStackRange::new(0x6CD4, 256));
-        assert_eq!(d.op(), WalOp::Dealloc);
+        assert_eq!(d.op(), Some(WalOp::Dealloc));
         assert_eq!(d.as_dealloc(), Some(BStackRange::new(0x6CD4, 256)));
         assert_eq!(d.as_alloc(), None);
         assert_eq!(d.file_id(), 0);

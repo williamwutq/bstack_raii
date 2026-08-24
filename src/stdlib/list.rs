@@ -40,8 +40,9 @@ use bytemuck::{Pod, Zeroable};
 use super::util::{SmallBuf, WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
+use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, checked_off};
 use crate::owned::BStackOwned;
+use crate::replace::{ReplaceError, finish_handback};
 use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackLinkedList`]: the block header followed by the
@@ -126,7 +127,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
 
     /// A `T`-value handle over the block at `off` (fixed-size-block model).
     fn value_at(off: u64) -> T {
-        <T as BStackBlock>::from_range(BStackRange::new(off, Self::value_size()))
+        unsafe { <T as BStackBlock>::from_range(BStackRange::new(off, Self::value_size())) }
     }
 
     /// Build a node image with the given links and value ref.
@@ -178,42 +179,54 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         &self,
         allocator: &A,
         value: BStackOwned<T>,
-    ) -> io::Result<()> {
+    ) -> Result<(), ReplaceError<BStackOwned<T>>> {
         let list = self.range.start();
-        let val_off = value.into_inner().range().start();
-        // Allocate the node up front; it stays an orphan until the commit links it.
-        let node = allocator.alloc(NODE_SIZE)?.as_range().start();
-        let mut w: WriteBuf<4> = WriteBuf::new();
+        // Guard the value block: the node `alloc` or the commit can fail *after* the
+        // value's ownership is taken. On failure [`finish_handback`] returns it to
+        // the caller rather than freeing it; on success the guard
+        // is defused once the commit links it in.
+        let value = value.auto(allocator);
+        let val_off = value.range().start();
+        let outcome: io::Result<()> = (|| {
+            // Allocate the node up front; it stays an orphan until the commit links it.
+            let node = allocator.alloc(NODE_SIZE)?.as_range().start();
+            let mut w: WriteBuf<4> = WriteBuf::new();
 
-        let res = atomic_update(
-            allocator,
-            &[list + TAIL_OFF, list + LEN_OFF],
-            |_v1| Vec::new(),
-            |v1, _v2| {
-                let (old_tail, len) = (v1[0], v1[1]);
-                // The node's full image (with `prev` wired to the read tail).
-                let image: [u8; 40] = bytemuck::bytes_of(&Self::node_image(old_tail, 0, val_off))
-                    .try_into()
-                    .unwrap();
-                w.push((node, SmallBuf::Buf40(image)));
-                // Link the old tail (or the head, if the list was empty) to it.
-                let link = if old_tail != 0 {
-                    old_tail + NNEXT_OFF
-                } else {
-                    list + HEAD_OFF
-                };
-                w.push(w8(link, node));
-                w.push(w8(list + TAIL_OFF, node));
-                w.push(w8(list + LEN_OFF, len + 1));
-                w.as_slice()
-            },
-        );
-        if res.is_err() {
-            // The node was never linked in; reclaim the orphan.
-            // SAFETY: freshly allocated, referenced by nobody.
-            let _ = unsafe { dealloc_range(allocator, BStackRange::new(node, NODE_SIZE)) };
-        }
-        res
+            let res = atomic_update(
+                allocator,
+                &[list + TAIL_OFF, list + LEN_OFF],
+                |_v1| Ok(Vec::new()),
+                |v1, _v2| {
+                    let (old_tail, len) = (v1[0], v1[1]);
+                    // The node's full image (with `prev` wired to the read tail).
+                    let image: [u8; 40] =
+                        bytemuck::bytes_of(&Self::node_image(old_tail, 0, val_off))
+                            .try_into()
+                            .unwrap();
+                    w.push((node, SmallBuf::Buf40(image)));
+                    // Link the old tail (or the head, if the list was empty) to it —
+                    // `old_tail` is a node pointer read from disk, so a corrupted
+                    // value near `u64::MAX` must not silently wrap this addition.
+                    let link = if old_tail != 0 {
+                        checked_off(old_tail, NNEXT_OFF)?
+                    } else {
+                        list + HEAD_OFF
+                    };
+                    w.push(w8(link, node));
+                    w.push(w8(list + TAIL_OFF, node));
+                    w.push(w8(list + LEN_OFF, len + 1));
+                    Ok(w.as_slice())
+                },
+            );
+            if res.is_err() {
+                // The node was never linked in; reclaim the orphan (the value block
+                // is handed back to the caller by `finish_handback`).
+                // SAFETY: freshly allocated, referenced by nobody.
+                let _ = unsafe { dealloc_range(allocator, BStackRange::new(node, NODE_SIZE)) };
+            }
+            res
+        })();
+        finish_handback(value, outcome)
     }
 
     /// Prepend a value to the front, taking ownership of its block. Atomic and
@@ -222,38 +235,46 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         &self,
         allocator: &A,
         value: BStackOwned<T>,
-    ) -> io::Result<()> {
+    ) -> Result<(), ReplaceError<BStackOwned<T>>> {
         let list = self.range.start();
-        let val_off = value.into_inner().range().start();
-        let node = allocator.alloc(NODE_SIZE)?.as_range().start();
-        let mut w: WriteBuf<4> = WriteBuf::new();
+        // Guard the value block: on failure [`finish_handback`] returns it to the
+        // caller rather than freeing it, defused once linked.
+        let value = value.auto(allocator);
+        let val_off = value.range().start();
+        let outcome: io::Result<()> = (|| {
+            let node = allocator.alloc(NODE_SIZE)?.as_range().start();
+            let mut w: WriteBuf<4> = WriteBuf::new();
 
-        let res = atomic_update(
-            allocator,
-            &[list + HEAD_OFF, list + LEN_OFF],
-            |_v1| Vec::new(),
-            |v1, _v2| {
-                let (old_head, len) = (v1[0], v1[1]);
-                let image: [u8; 40] = bytemuck::bytes_of(&Self::node_image(0, old_head, val_off))
-                    .try_into()
-                    .unwrap();
-                w.push((node, SmallBuf::Buf40(image)));
-                let link = if old_head != 0 {
-                    old_head + NPREV_OFF
-                } else {
-                    list + TAIL_OFF
-                };
-                w.push(w8(link, node));
-                w.push(w8(list + HEAD_OFF, node));
-                w.push(w8(list + LEN_OFF, len + 1));
-                w.as_slice()
-            },
-        );
-        if res.is_err() {
-            // SAFETY: freshly allocated, referenced by nobody.
-            let _ = unsafe { dealloc_range(allocator, BStackRange::new(node, NODE_SIZE)) };
-        }
-        res
+            let res = atomic_update(
+                allocator,
+                &[list + HEAD_OFF, list + LEN_OFF],
+                |_v1| Ok(Vec::new()),
+                |v1, _v2| {
+                    let (old_head, len) = (v1[0], v1[1]);
+                    let image: [u8; 40] =
+                        bytemuck::bytes_of(&Self::node_image(0, old_head, val_off))
+                            .try_into()
+                            .unwrap();
+                    w.push((node, SmallBuf::Buf40(image)));
+                    let link = if old_head != 0 {
+                        checked_off(old_head, NPREV_OFF)?
+                    } else {
+                        list + TAIL_OFF
+                    };
+                    w.push(w8(link, node));
+                    w.push(w8(list + HEAD_OFF, node));
+                    w.push(w8(list + LEN_OFF, len + 1));
+                    Ok(w.as_slice())
+                },
+            );
+            if res.is_err() {
+                // SAFETY: freshly allocated, referenced by nobody. The value block is
+                // handed back to the caller by `finish_handback`.
+                let _ = unsafe { dealloc_range(allocator, BStackRange::new(node, NODE_SIZE)) };
+            }
+            res
+        })();
+        finish_handback(value, outcome)
     }
 
     /// Remove and return the last element (as an owned value block), or `None`
@@ -280,9 +301,12 @@ impl<T: BStackBlock> BStackLinkedList<T> {
             |v1| {
                 let tail = v1[0];
                 if tail == 0 {
-                    Vec::new()
+                    Ok(Vec::new())
                 } else {
-                    vec![tail + NPREV_OFF, tail + NVAL_OFF]
+                    Ok(vec![
+                        checked_off(tail, NPREV_OFF)?,
+                        checked_off(tail, NVAL_OFF)?,
+                    ])
                 }
             },
             |v1, v2| {
@@ -292,7 +316,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
                     node.set(tail);
                     val.set(value);
                     if prev != 0 {
-                        w.push(w8(prev + NNEXT_OFF, 0u64));
+                        w.push(w8(checked_off(prev, NNEXT_OFF)?, 0u64));
                         w.push(w8(list + TAIL_OFF, prev));
                     } else {
                         w.push(w8(list + HEAD_OFF, 0u64));
@@ -300,7 +324,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
                     }
                     w.push(w8(list + LEN_OFF, len - 1));
                 }
-                w.as_slice()
+                Ok(w.as_slice())
             },
         )?;
 
@@ -334,9 +358,12 @@ impl<T: BStackBlock> BStackLinkedList<T> {
             |v1| {
                 let head = v1[0];
                 if head == 0 {
-                    Vec::new()
+                    Ok(Vec::new())
                 } else {
-                    vec![head + NNEXT_OFF, head + NVAL_OFF]
+                    Ok(vec![
+                        checked_off(head, NNEXT_OFF)?,
+                        checked_off(head, NVAL_OFF)?,
+                    ])
                 }
             },
             |v1, v2| {
@@ -346,7 +373,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
                     node.set(head);
                     val.set(value);
                     if next != 0 {
-                        w.push(w8(next + NPREV_OFF, 0u64));
+                        w.push(w8(checked_off(next, NPREV_OFF)?, 0u64));
                         w.push(w8(list + HEAD_OFF, next));
                     } else {
                         w.push(w8(list + HEAD_OFF, 0u64));
@@ -354,7 +381,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
                     }
                     w.push(w8(list + LEN_OFF, len - 1));
                 }
-                w.as_slice()
+                Ok(w.as_slice())
             },
         )?;
 
@@ -376,7 +403,10 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         if head == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(read_u64(stack, head + NVAL_OFF)?)))
+        Ok(Some(Self::value_at(read_u64(
+            stack,
+            checked_off(head, NVAL_OFF)?,
+        )?)))
     }
 
     /// A **borrowed** handle to the last value (no ownership; frees nothing), or
@@ -386,7 +416,10 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         if tail == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::value_at(read_u64(stack, tail + NVAL_OFF)?)))
+        Ok(Some(Self::value_at(read_u64(
+            stack,
+            checked_off(tail, NVAL_OFF)?,
+        )?)))
     }
 
     /// Collect **borrowed** handles to every value, front to back. The handles
@@ -395,9 +428,20 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     pub fn to_vec(&self, stack: &BStack) -> io::Result<Vec<T>> {
         let mut out = Vec::new();
         let mut cur = read_u64(stack, self.range.start() + HEAD_OFF)?;
+        // Bound the walk by the stored `len` (as the deque bounds by its own
+        // header): a corrupt cyclic `next` must fail as `InvalidData`, not
+        // yield elements forever.
+        let mut remaining = self.len(stack)?;
         while cur != 0 {
+            if remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linked list chain longer than its stored len (a next-pointer cycle?)",
+                ));
+            }
+            remaining -= 1;
             // `next` (@24) and `value` (@32) are adjacent — one read per node.
-            let [next, value] = read_fields::<2>(stack, cur + NNEXT_OFF)?;
+            let [next, value] = read_fields::<2>(stack, checked_off(cur, NNEXT_OFF)?)?;
             out.push(Self::value_at(value));
             cur = next;
         }
@@ -408,20 +452,15 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     /// value handles. A read snapshot: do not mutate the list while iterating.
     pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<ListIter<'a, T>> {
         let head = read_u64(stack, self.range.start() + HEAD_OFF)?;
+        let remaining = self.len(stack)?;
         Ok(ListIter {
             stack,
+            block_off: self.range.start(),
+            len0: remaining,
+            remaining,
             cur: head,
             _marker: PhantomData,
         })
-    }
-
-    /// Attach an allocator to make an auto-freeing [`crate::AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(
-        self,
-        allocator: &A,
-    ) -> crate::teardown::AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the list was created.
-        unsafe { crate::teardown::AutoDrop::from_raw(self, allocator) }
     }
 }
 
@@ -441,7 +480,7 @@ impl<T: BStackBlock> crate::block::BStackEmbeddable for BStackLinkedList<T> {}
 impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     type OnDisk = ListOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackLinkedList {
             range,
             _marker: PhantomData,
@@ -460,9 +499,20 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
         allocator: &A,
     ) -> io::Result<()> {
         let mut cur = read_u64(allocator.stack(), range.start() + HEAD_OFF)?;
+        // Bound the free-as-you-go walk by the stored `len`: on a corrupt cyclic
+        // `next` the second lap would re-free every node — a double free. Erroring
+        // leaves at most a leak, per the corruption-degrades-to-a-leak baseline.
+        let mut remaining = read_u64(allocator.stack(), range.start() + LEN_OFF)?;
         while cur != 0 {
-            let next = read_u64(allocator.stack(), cur + NNEXT_OFF)?;
-            let val = read_u64(allocator.stack(), cur + NVAL_OFF)?;
+            if remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linked list chain longer than its stored len (a next-pointer cycle?)",
+                ));
+            }
+            remaining -= 1;
+            let next = read_u64(allocator.stack(), checked_off(cur, NNEXT_OFF)?)?;
+            let val = read_u64(allocator.stack(), checked_off(cur, NVAL_OFF)?)?;
             if val != 0 {
                 // Recursively free the value block (its own children, then it).
                 // SAFETY: the list solely owns each value block.
@@ -489,9 +539,19 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
         // 1. Gather the source value offsets in order.
         let mut vals = Vec::new();
         let mut cur = read_u64(allocator.stack(), src + HEAD_OFF)?;
+        // Bound by the stored `len` (see `to_vec`): a cycle must error, not grow
+        // `vals` without bound.
+        let mut remaining = read_u64(allocator.stack(), src + LEN_OFF)?;
         while cur != 0 {
-            vals.push(read_u64(allocator.stack(), cur + NVAL_OFF)?);
-            cur = read_u64(allocator.stack(), cur + NNEXT_OFF)?;
+            if remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "linked list chain longer than its stored len (a next-pointer cycle?)",
+                ));
+            }
+            remaining -= 1;
+            vals.push(read_u64(allocator.stack(), checked_off(cur, NVAL_OFF)?)?);
+            cur = read_u64(allocator.stack(), checked_off(cur, NNEXT_OFF)?)?;
         }
         let n = vals.len();
 
@@ -537,14 +597,6 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     }
 }
 
-impl<T: BStackBlock> BStackDrop for BStackLinkedList<T> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the list block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
-    }
-}
-
 impl<T: BStackBlock> TryCloneIn for BStackLinkedList<T> {
     fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
         let mut plan = ClonePlan::new();
@@ -565,7 +617,14 @@ impl<T: BStackBlock> TryCloneIn for BStackLinkedList<T> {
 /// value handles. Created by [`BStackLinkedList::iter`]; walks the `next` links.
 pub struct ListIter<'a, T: BStackBlock> {
     stack: &'a BStack,
+    /// The list handle block, re-read each step to detect mutation.
+    block_off: u64,
+    /// The list's `len` at construction — a change means it was mutated.
+    len0: u64,
     cur: u64,
+    /// Nodes left per the list's stored `len` — the walk bound: a corrupt cyclic
+    /// `next` yields one `InvalidData` and ends, instead of iterating forever.
+    remaining: u64,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -576,8 +635,43 @@ impl<'a, T: BStackBlock> Iterator for ListIter<'a, T> {
         if self.cur == 0 {
             return None;
         }
+        // Fail fast if the list was mutated during iteration: a `pop_front` /
+        // `pop_back` frees a node, so the cached `cur` could name freed storage. A
+        // list only mutates at its ends, so every push/pop changes `len` — a changed
+        // `len` means the snapshot is stale. Conservative (a growing push also trips
+        // it), matching the "do not mutate while iterating" contract.
+        match read_u64(self.stack, self.block_off + LEN_OFF) {
+            Ok(len) if len == self.len0 => {}
+            Ok(_) => {
+                self.cur = 0;
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "BStackLinkedList was mutated during iteration (its length changed); \
+                     the iterator is invalidated",
+                )));
+            }
+            Err(e) => {
+                self.cur = 0;
+                return Some(Err(e));
+            }
+        }
+        if self.remaining == 0 {
+            self.cur = 0;
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "linked list chain longer than its stored len (a next-pointer cycle?)",
+            )));
+        }
+        self.remaining -= 1;
         // `next` (@24) and `value` (@32) are adjacent — one read per node.
-        match read_fields::<2>(self.stack, self.cur + NNEXT_OFF) {
+        let off = match checked_off(self.cur, NNEXT_OFF) {
+            Ok(off) => off,
+            Err(e) => {
+                self.cur = 0;
+                return Some(Err(e));
+            }
+        };
+        match read_fields::<2>(self.stack, off) {
             Ok([next, value]) => {
                 self.cur = next;
                 Some(Ok(BStackLinkedList::<T>::value_at(value)))

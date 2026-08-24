@@ -69,7 +69,7 @@ fn render(expr: &Expr, alloc: &FirstFitBStackAllocator) -> io::Result<String> {
 
 /// Build a literal expression node.
 fn lit(alloc: &FirstFitBStackAllocator, v: i64) -> io::Result<BStackOwned<Expr>> {
-    Expr::new(alloc, ExprData::Lit(v))
+    Expr::new(alloc, ExprData::Lit(v)).map_err(|e| e.into_source())
 }
 
 /// Build a binary-operation expression node from two owned operands.
@@ -79,8 +79,8 @@ fn op(
     lhs: BStackOwned<Expr>,
     rhs: BStackOwned<Expr>,
 ) -> io::Result<BStackOwned<Expr>> {
-    let node = BinOp::new(alloc, operator, lhs, rhs)?;
-    Expr::new(alloc, ExprData::Op(node))
+    let node = BinOp::new(alloc, operator, lhs, rhs).map_err(|e| e.into_source())?;
+    Expr::new(alloc, ExprData::Op(node)).map_err(|e| e.into_source())
 }
 
 fn main() -> io::Result<()> {

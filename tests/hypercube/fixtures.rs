@@ -97,6 +97,7 @@ pub fn block_sink<A: BStackRaiiAllocator>(a: &A) -> io::Result<BStackOwned<Block
             vec![Leaf::new(a, 93)?, Leaf::new(a, 94)?],
         ],
     )
+    .map_err(|e| e.into_source())
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,7 @@ pub fn mut_sink<A: BStackRaiiAllocator>(a: &A) -> io::Result<BStackOwned<MutSink
         Shared::new(a, 20)?,
         [Leaf::new(a, 30)?, Leaf::new(a, 31)?, Leaf::new(a, 32)?],
     )
+    .map_err(|e| e.into_source())
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +148,7 @@ pub struct EmbedSink {
 }
 
 pub fn embed_sink<A: BStackRaiiAllocator>(a: &A) -> io::Result<BStackOwned<EmbedSink>> {
-    EmbedSink::new(a, 9, block_sink(a)?)
+    EmbedSink::new(a, 9, block_sink(a)?).map_err(|e| e.into_source())
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +193,7 @@ pub struct RcSink {
 }
 
 pub fn rc_sink<A: BStackRaiiAllocator>(a: &A) -> io::Result<BStackRc<'_, RcSink, A>> {
-    RcSink::new(a, 7, Leaf::new(a, 10)?)
+    RcSink::new(a, 7, Leaf::new(a, 10)?).map_err(|e| e.into_source())
 }
 
 #[bstack_block(rc, weak)]
@@ -202,7 +204,7 @@ pub struct RcWeakSink {
 }
 
 pub fn rcweak_sink<A: BStackRaiiAllocator>(a: &A) -> io::Result<BStackRc<'_, RcWeakSink, A>> {
-    RcWeakSink::new(a, 7, Leaf::new(a, 10)?)
+    RcWeakSink::new(a, 7, Leaf::new(a, 10)?).map_err(|e| e.into_source())
 }
 
 // ---------------------------------------------------------------------------

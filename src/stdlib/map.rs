@@ -50,7 +50,8 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::replace::{ReplaceError, finish_handback};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackHashMap`]: header, bucket-block pointer (`0` =
 /// none), bucket count `cap`, live-entry count `len`, and `used` (occupied +
@@ -103,23 +104,25 @@ fn new_bucket_writes(
     m: &Meta,
     target: u64,
     slot_was_empty: bool,
-) -> Vec<(u64, SmallBuf)> {
+) -> io::Result<Vec<(u64, SmallBuf)>> {
     let mut img = Vec::with_capacity(16 + e.ksz);
     img.extend_from_slice(&OCCUPIED.to_le_bytes());
     img.extend_from_slice(e.key_bytes);
     img.extend_from_slice(&e.val_ref.to_le_bytes());
 
+    // `m.table` is an on-disk pointer that can be corrupted/forged.
+    let off = target
+        .checked_mul(e.stride)
+        .and_then(|d| m.table.checked_add(d))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table offset"))?;
     let mut w = vec![
-        (
-            m.table + target * e.stride,
-            SmallBuf::Heap(img.into_boxed_slice()),
-        ),
+        (off, SmallBuf::Heap(img.into_boxed_slice())),
         w8(e.handle + LEN_OFF, m.len + 1),
     ];
     if slot_was_empty {
         w.push(w8(e.handle + USED_OFF, m.used + 1));
     }
-    w
+    Ok(w)
 }
 
 /// An owned open-addressing hash map from a `Pod` key to a block value.
@@ -156,7 +159,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
     /// A `V`-value handle over the block at `off`.
     fn value_at(off: u64) -> V {
-        <V as BStackBlock>::from_range(BStackRange::new(off, Self::value_size()))
+        unsafe { <V as BStackBlock>::from_range(BStackRange::new(off, Self::value_size())) }
     }
 
     /// Allocate an empty map (no bucket block until the first insert).
@@ -197,12 +200,17 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         allocator: &A,
         key: K,
         value: BStackOwned<V>,
-    ) -> io::Result<Option<BStackOwned<V>>> {
+    ) -> Result<Option<BStackOwned<V>>, ReplaceError<BStackOwned<V>>> {
         let handle = self.range.start();
         let stride = Self::stride();
         let ksz = Self::ksize();
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
-        let val_ref = value.into_inner().range().start();
+        // Guard the value block: any fallible step below (`read_fields`, `grow`,
+        // `probe_commit`) that errors must not orphan it. On failure
+        // [`finish_handback`] returns it to the caller rather than freeing it
+        //; on success it is defused once linked into the map.
+        let value = value.auto(allocator);
+        let val_ref = value.range().start();
         let hash = fnv1a(&key_bytes);
         let entry = NewEntry {
             handle,
@@ -212,7 +220,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             val_ref,
         };
 
-        loop {
+        let outcome: io::Result<Option<BStackOwned<V>>> = (|| loop {
             // Proactively keep the load factor under 3/4 (also clears tombstones).
             let [cap, _len, used] = read_fields::<3>(allocator.stack(), handle + CAP_OFF)?;
             if cap == 0 || (used + 1) * 4 > cap * 3 {
@@ -241,8 +249,19 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         // Overwrite: replace the value ref, hand back the old one.
                         old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                         is_new.set(false);
-                        let value_off = m.table + idx * stride + 8 + ksz as u64;
-                        ProbeStep::Stop(vec![w8(value_off, val_ref)])
+                        // `m.table` is an on-disk pointer that can be corrupted/forged.
+                        let step = idx
+                            .checked_mul(stride)
+                            .and_then(|d| m.table.checked_add(d))
+                            .and_then(|b| b.checked_add(8 + ksz as u64))
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "corrupt bucket table offset",
+                                )
+                            })
+                            .map(|value_off| vec![w8(value_off, val_ref)]);
+                        ProbeStep::Stop(step)
                     } else {
                         if state == TOMBSTONE && first_tomb.get().is_none() {
                             first_tomb.set(Some(idx));
@@ -256,7 +275,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         new_bucket_writes(&entry, m, t, false)
                     } else {
                         need_grow.set(true);
-                        Vec::new()
+                        Ok(Vec::new())
                     }
                 },
             )?;
@@ -265,6 +284,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 self.grow(allocator)?;
                 continue;
             }
+            // Committed: the value is now linked into the map.
             return if is_new.get() {
                 Ok(None)
             } else {
@@ -273,7 +293,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                     BStackOwned::from_raw(Self::value_at(old_value.get()))
                 }))
             };
-        }
+        })();
+        finish_handback(value, outcome)
     }
 
     /// Remove `key`, returning its value (owned) if present, else `None`. The
@@ -300,19 +321,27 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             |m, idx, buf| {
                 let state = get_u64(&buf[0..8]);
                 if state == EMPTY {
-                    ProbeStep::Stop(Vec::new()) // absent: commit nothing
+                    ProbeStep::Stop(Ok(Vec::new())) // absent: commit nothing
                 } else if state == OCCUPIED && buf[8..8 + ksz] == key_bytes[..] {
                     found.set(true);
                     old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
-                    ProbeStep::Stop(vec![
-                        w8(m.table + idx * stride, TOMBSTONE),
-                        w8(handle + LEN_OFF, m.len - 1),
-                    ])
+                    // `m.table` is an on-disk pointer that can be corrupted/forged.
+                    let step = idx
+                        .checked_mul(stride)
+                        .and_then(|d| m.table.checked_add(d))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "corrupt bucket table offset",
+                            )
+                        })
+                        .map(|off| vec![w8(off, TOMBSTONE), w8(handle + LEN_OFF, m.len - 1)]);
+                    ProbeStep::Stop(step)
                 } else {
                     ProbeStep::Continue
                 }
             },
-            |_m| Vec::new(),
+            |_m| Ok(Vec::new()),
         )?;
 
         if found.get() {
@@ -344,8 +373,15 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         // One read per probed bucket (state + key + value in a single get_into).
         let mut scratch = Scratch::new();
         for _ in 0..cap {
+            // `table` is an on-disk pointer that can be corrupted/forged.
+            let bucket = idx
+                .checked_mul(stride)
+                .and_then(|d| table.checked_add(d))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table offset")
+                })?;
             let buf = scratch.buf(stride as usize);
-            stack.get_into(table + idx * stride, buf)?;
+            stack.get_into(bucket, buf)?;
             let state = get_u64(&buf[0..8]);
             if state == EMPTY {
                 return Ok(None);
@@ -384,7 +420,10 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let vref = value.handle().range().start();
         // Absent per the probe above, so `insert` returns no prior value; reclaim
         // one defensively if a race produced it.
-        if let Some(old) = self.insert(allocator, key, value)? {
+        if let Some(old) = self
+            .insert(allocator, key, value)
+            .map_err(|e| e.discard_freeing(allocator))?
+        {
             old.bstack_drop(allocator)?;
         }
         Ok((Self::value_at(vref), true))
@@ -405,7 +444,10 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             return Ok((v, false));
         }
         let vref = default.handle().range().start();
-        if let Some(old) = self.insert(allocator, key, default)? {
+        if let Some(old) = self
+            .insert(allocator, key, default)
+            .map_err(|e| e.discard_freeing(allocator))?
+        {
             old.bstack_drop(allocator)?;
         }
         Ok((Self::value_at(vref), true))
@@ -415,11 +457,13 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     /// yielding `io::Result`. A read snapshot: do not mutate the map while
     /// iterating (mutating a yielded value block is fine).
     pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<HashMapIter<'a, K, V>> {
-        let [table, cap] = read_fields::<2>(stack, self.range.start() + TABLE_OFF)?;
+        let [table, cap, len] = read_fields::<3>(stack, self.range.start() + TABLE_OFF)?;
         Ok(HashMapIter {
             stack,
+            block_off: self.range.start(),
             table,
             cap,
+            len,
             stride: Self::stride(),
             ksz: Self::ksize(),
             idx: 0,
@@ -441,12 +485,6 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
             MIN_CAP,
         )
     }
-
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the map was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
-    }
 }
 
 impl<K: Pod, V: BStackBlock> BStackCast for BStackHashMap<K, V> {
@@ -466,7 +504,7 @@ impl<K: Pod, V: BStackBlock> crate::block::BStackEmbeddable for BStackHashMap<K,
 impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     type OnDisk = MapOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackHashMap {
             range,
             _marker: PhantomData,
@@ -491,7 +529,19 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             return Ok(());
         }
         // Read the whole bucket block once, then free values from memory.
-        let mut image = vec![0u8; (cap * stride) as usize];
+        // `cap` is an untrusted on-disk field: checked math (a wrap would size the
+        // image and the later `dealloc_range` wrong) and a stack bound (fail
+        // before allocating, not after).
+        let table_size = cap.checked_mul(stride).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "hash map capacity overflow")
+        })?;
+        if table_size > allocator.stack().len()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hash map bucket block larger than the stack",
+            ));
+        }
+        let mut image = vec![0u8; table_size as usize];
         allocator.stack().get_into(table, &mut image)?;
         for j in 0..cap as usize {
             let lo = j * stride as usize;
@@ -505,7 +555,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             }
         }
         // SAFETY: the map solely owns its bucket block.
-        unsafe { dealloc_range(allocator, BStackRange::new(table, cap * stride))? };
+        unsafe { dealloc_range(allocator, BStackRange::new(table, table_size))? };
         Ok(())
     }
 
@@ -527,7 +577,17 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             (0, 0, 0)
         } else {
             // Copy the whole bucket block, then deep-clone the occupied values.
-            let mut image = vec![0u8; (cap * stride) as usize];
+            // Untrusted `cap`: checked math + stack bound (see drop_children).
+            let table_size = cap.checked_mul(stride).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "hash map capacity overflow")
+            })?;
+            if table_size > allocator.stack().len()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hash map bucket block larger than the stack",
+                ));
+            }
+            let mut image = vec![0u8; table_size as usize];
             allocator.stack().get_into(table, &mut image)?;
             for j in 0..cap as usize {
                 let lo = j * stride as usize;
@@ -540,7 +600,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
                     .start();
                 image[lo + 8 + ksz..lo + 16 + ksz].copy_from_slice(&cloned.to_le_bytes());
             }
-            let dst = plan.alloc_raw(allocator, cap * stride)?;
+            let dst = plan.alloc_raw(allocator, table_size)?;
             plan.write(dst.start(), image);
             (dst.start(), cap, used)
         };
@@ -556,14 +616,6 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             used: new_used,
         };
         Ok(od)
-    }
-}
-
-impl<K: Pod, V: BStackBlock> BStackDrop for BStackHashMap<K, V> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 
@@ -587,8 +639,14 @@ impl<K: Pod, V: BStackBlock> TryCloneIn for BStackHashMap<K, V> {
 /// `io::Result<(K, V)>`. Created by [`BStackHashMap::iter`]; scans the buckets.
 pub struct HashMapIter<'a, K: Pod, V: BStackBlock> {
     stack: &'a BStack,
+    /// The map handle block, re-read each step to detect mutation.
+    block_off: u64,
     table: u64,
     cap: u64,
+    /// Snapshot of the entry count; a same-table insert/remove (no rehash) leaves
+    /// `table`/`cap` unchanged but changes `len`, so comparing it too makes the
+    /// mutation check catch every mutation, not only a growth.
+    len: u64,
     stride: u64,
     ksz: usize,
     idx: u64,
@@ -600,6 +658,29 @@ impl<'a, K: Pod, V: BStackBlock> Iterator for HashMapIter<'a, K, V> {
     type Item = io::Result<(K, V)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Fail fast if the map was mutated during iteration: a growth/rehash
+        // frees the old table and repoints `table`; a same-table insert/remove
+        // leaves `table`/`cap` but changes `len` (a remove's backward-shift can
+        // relocate an unvisited entry into a visited slot, silently skipping it).
+        // Comparing all three catches every mutation.
+        if self.idx < self.cap {
+            match read_fields::<3>(self.stack, self.block_off + TABLE_OFF) {
+                Ok([table, cap, len])
+                    if table == self.table && cap == self.cap && len == self.len => {}
+                Ok(_) => {
+                    self.idx = self.cap;
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "BStackHashMap was mutated during iteration (its table/len \
+                         changed); the iterator is invalidated",
+                    )));
+                }
+                Err(e) => {
+                    self.idx = self.cap;
+                    return Some(Err(e));
+                }
+            }
+        }
         while self.idx < self.cap {
             let i = self.idx;
             self.idx += 1;

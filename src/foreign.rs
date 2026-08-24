@@ -30,7 +30,6 @@
 //! owning clone *error* rather than silently alias.
 
 use core::marker::PhantomData;
-use core::num::NonZeroU64;
 use std::io;
 
 use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
@@ -116,36 +115,98 @@ impl ForeignRepr {
     }
 }
 
-/// An **explicit** cross-file pointer: a non-`SELF` file id and an address. The
-/// `NonZeroU64` file id is the enum niche that keeps [`FilePtr`] at 16 bytes and makes
-/// "explicit" unrepresentable as `SELF`. It carries no borrow — an explicit pointer
-/// resolves through the registry, so it is valid independent of any file handle (its
-/// deref is fallible).
-#[derive(Clone, Copy)]
-pub(crate) struct ExternalPtr {
-    file_id: NonZeroU64,
-    address: u64,
+/// **Read-side `SELF` resolution**. A stored [`ForeignRepr`] whose
+/// `file_id == 0` (`SELF`) is only meaningful *relative to the file it was read
+/// from*; handed out unchanged, an in-memory `SELF` pointer can be stored into a
+/// different file, whose later owning teardown / clone would then free or copy the
+/// wrong file's block. This rebinds a `SELF` pointer to the reading file's
+/// **registered** [`FileId`], so the escaped pointer is *explicit* and routes
+/// correctly no matter where it is later stored. An explicit pointer (and the
+/// `offset == 0` null niche) pass through unchanged.
+///
+/// **When the home file is not registered the `SELF` pointer is passed through as-is**
+/// (not an error): a `SELF` pointer that reached storage through *safe* code was
+/// minted by [`Foreign::from_local`] / `bstack_cast!`, both of which require the file
+/// to be registered — so the safe surface is always resolvable here. An
+/// unregistered file's `SELF` can only have been minted through the `unsafe`
+/// [`Foreign::new`] / [`Foreign::at`], whose contract already forbids moving it to
+/// another file. Returns `io::Result` for signature symmetry with the fallible read
+/// paths that call it; it currently never errors. The inverse is
+/// [`home_relative_repr`], applied on write.
+pub fn resolve_self_repr(repr: ForeignRepr, home: &BStack) -> io::Result<ForeignRepr> {
+    if repr.file_id() != 0 || repr.offset() == 0 {
+        return Ok(repr);
+    }
+    match registry::id_of_host(home) {
+        Some(id) => {
+            Ok(ForeignRepr::new(id.as_u64(), repr.offset()).with_type_index(repr.type_index()))
+        }
+        // Unregistered home: no id to resolve against. A safe SELF can't reach here
+        // (its minting required registration); leave an unsafe-minted one as-is.
+        None => Ok(repr),
+    }
 }
 
-/// A **`SELF`** pointer: an address in the current file, branded with a borrow `'a` of
-/// that file. The brand is **covariant** in `'a` (an explicit `'static` pointer narrows
-/// freely), but a `SELF` pointer can never *widen* its `'a`, so Rust will not let it
-/// outlive — or be stored beyond — the file it was read from. Length is recovered from
-/// the target type: this is the analogue of a lifetime-branded [`BStackRef`].
+/// **Write-side `SELF` re-encoding**, the inverse of
+/// [`resolve_self_repr`]. An explicit pointer whose target file **is** the home file
+/// being written is stored back as `file_id == 0` (`SELF`), so the on-disk encoding
+/// stays portable across re-attaches (file ids are assigned per attach). A pointer to
+/// any other file stays explicit; an already-`SELF` pointer (only mintable through
+/// `unsafe`) is left as-is — after resolve-on-read a legitimate in-memory `SELF`
+/// means "home", so writing it as `SELF` is correct.
+pub fn home_relative_repr(repr: ForeignRepr, home: &BStack) -> ForeignRepr {
+    if repr.file_id() == 0 {
+        return repr;
+    }
+    if let Some(id) = registry::id_of_host(home) {
+        if repr.file_id() == id.as_u64() {
+            return ForeignRepr::new(0, repr.offset()).with_type_index(repr.type_index());
+        }
+    }
+    repr
+}
+
+/// The in-memory form of a cross-file pointer: a single 16-byte record keyed on
+/// `file_id`, mirroring the on-disk [`ForeignRepr`] one-to-one.
+///
+/// * `file_id == 0` ⇒ **`SELF`** — an address in the file it was read from. `SELF` is
+///   an on-disk *encoding* only: the generated read paths resolve it to the reading
+///   file's explicit [`FileId`] before handing a `Foreign` out
+///   ([`resolve_self_repr`]), so a `SELF` pointer does not normally exist in memory
+///   from safe code. The `'a` brand does **not** confine it to its file — a lifetime
+///   bounds duration, not identity — so an unresolved `SELF` (mintable only through
+///   the `unsafe` [`Foreign::new`] / [`Foreign::at`]) is the caller's obligation to
+///   keep in its home file. Length is recovered from the target type.
+/// * `file_id != 0` ⇒ **explicit** — a non-`SELF` [`FileId`], **registry-resolved** and
+///   borrow-free (valid independent of any file handle; deref fallible). Being `'static`
+///   it narrows `'a` freely (the brand is covariant).
+///
+/// A single struct rather than a niche-packed 2-variant enum on purpose: the enum form
+/// left the compiler unable to co-locate a `NonZeroU32` file-id niche with the borrow-
+/// bound variant's fields once an in-memory `type_index` was added, padding
+/// [`Foreign`] out to 24 bytes. Branching on `file_id == 0` keeps it flat and exactly
+/// [`ForeignRepr`]-sized (16 bytes), `type_index` and all.
 #[derive(Clone, Copy)]
-pub(crate) struct SelfPtr<'a> {
+pub(crate) struct FilePtr<'a> {
+    /// The target file: `0` = [`FileId::SELF`], else an explicit [`FileId`] (`u32`).
+    file_id: u32,
+    /// The target's RTTI type ordinal + 1 (`0` = untyped, recovered from the block
+    /// header). Carried in memory so a read → re-store round-trip preserves it — the
+    /// on-disk [`ForeignRepr`] holds it, but rebuilding one via `ForeignRepr::new`
+    /// would zero it.
+    type_index: u32,
+    /// The target's address within `file_id`'s file.
     address: u64,
+    /// Borrow brand for the `SELF` case (see the type docs); zero-sized.
     _brand: PhantomData<fn() -> &'a ()>,
 }
 
-/// The in-memory discriminated form of a cross-file pointer: either [`ExternalPtr`]
-/// (explicit, registry-resolved, borrow-free) or [`SelfPtr`] (`SELF`, borrow-bound).
-/// 16 bytes — the `NonZeroU64` niche in `Ext` encodes the discriminant for free
-/// (`file_id == 0` ⇒ `SelfRef`).
-#[derive(Clone, Copy)]
-pub(crate) enum FilePtr<'a> {
-    Ext(ExternalPtr),
-    SelfRef(SelfPtr<'a>),
+impl<'a> FilePtr<'a> {
+    /// Whether this is a `SELF` pointer (`file_id == 0`).
+    #[inline]
+    fn is_self(&self) -> bool {
+        self.file_id == 0
+    }
 }
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
@@ -182,49 +243,43 @@ impl<'a, T: 'static> Foreign<'a, T> {
     ///   file's borrow (a generated field accessor does this by tying `'a` to the
     ///   `&'a BStack` / `&'a A` it read through), so a `SELF` pointer cannot escape it.
     pub unsafe fn from_repr(repr: ForeignRepr) -> Self {
-        let inner = match NonZeroU64::new(repr.file_id()) {
-            Some(file_id) => FilePtr::Ext(ExternalPtr {
-                file_id,
-                address: repr.offset(),
-            }),
-            None => FilePtr::SelfRef(SelfPtr {
+        Self {
+            inner: FilePtr {
+                file_id: repr.file_id() as u32,
+                type_index: repr.type_index(),
                 address: repr.offset(),
                 _brand: PhantomData,
-            }),
-        };
-        Self {
-            inner,
+            },
             _marker: PhantomData,
         }
     }
 
-    /// The on-disk wire pointer, for storing into a field.
+    /// The on-disk wire pointer, for storing into a field. Preserves the RTTI
+    /// `type_index` the pointer was read with (so a round-trip keeps it typed).
     pub fn repr(self) -> ForeignRepr {
-        match self.inner {
-            FilePtr::Ext(e) => ForeignRepr::new(e.file_id.get(), e.address),
-            FilePtr::SelfRef(s) => ForeignRepr::new(0, s.address),
-        }
+        // `file_id == 0` (SELF) yields a `ForeignRepr` with a zero file id, exactly as
+        // the wire form encodes SELF.
+        ForeignRepr::new(self.inner.file_id as u64, self.inner.address)
+            .with_type_index(self.inner.type_index)
     }
 
     /// The target's address within its file.
     pub fn offset(self) -> u64 {
-        match self.inner {
-            FilePtr::Ext(e) => e.address,
-            FilePtr::SelfRef(s) => s.address,
-        }
+        self.inner.address
     }
 
     /// Whether this points into the *current* file ([`FileId::SELF`]).
     pub fn is_self(self) -> bool {
-        matches!(self.inner, FilePtr::SelfRef(_))
+        self.inner.is_self()
     }
 
     /// The file this points into: [`SELF`](FileId::SELF) for a `SELF` pointer, else the
     /// explicit target file.
     pub fn file_id(self) -> FileId {
-        match self.inner {
-            FilePtr::Ext(e) => FileId::from_u64(e.file_id.get()).unwrap_or(FileId::SELF),
-            FilePtr::SelfRef(_) => FileId::SELF,
+        if self.inner.is_self() {
+            FileId::SELF
+        } else {
+            FileId::from_u64(self.inner.file_id as u64).unwrap_or(FileId::SELF)
         }
     }
 
@@ -233,12 +288,19 @@ impl<'a, T: 'static> Foreign<'a, T> {
     /// (its deref stays fallible). `None` for a `SELF` pointer, which is only valid
     /// within the scope of the file it was read from.
     pub fn detach(self) -> Option<Foreign<'static, T>> {
-        match self.inner {
-            FilePtr::Ext(e) => Some(Foreign {
-                inner: FilePtr::Ext(e),
+        if self.inner.is_self() {
+            None
+        } else {
+            // Explicit ⇒ borrow-free: rebrand the identical bytes to `'static`.
+            Some(Foreign {
+                inner: FilePtr {
+                    file_id: self.inner.file_id,
+                    type_index: self.inner.type_index,
+                    address: self.inner.address,
+                    _brand: PhantomData,
+                },
                 _marker: PhantomData,
-            }),
-            FilePtr::SelfRef(_) => None,
+            })
         }
     }
 }
@@ -255,18 +317,16 @@ impl<T: 'static> Foreign<'static, T> {
     /// the wrong data — the caller must resolve it only against its home file. (A sound
     /// `SELF` pointer is borrow-bound; read it from its field instead.)
     pub const unsafe fn new(file: FileId, offset: u64) -> Self {
-        let inner = match NonZeroU64::new(file.as_u64()) {
-            Some(file_id) => FilePtr::Ext(ExternalPtr {
-                file_id,
-                address: offset,
-            }),
-            None => FilePtr::SelfRef(SelfPtr {
+        Self {
+            inner: FilePtr {
+                // `file == SELF` is `0`, matching the `SELF` key. A raw pointer carries
+                // no RTTI ordinal (the interpreter recovers the type from the target's
+                // block header); `type_index` is `0` = untyped.
+                file_id: file.as_u64() as u32,
+                type_index: 0,
                 address: offset,
                 _brand: PhantomData,
-            }),
-        };
-        Self {
-            inner,
+            },
             _marker: PhantomData,
         }
     }
@@ -299,19 +359,18 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         if self.offset() == 0 {
             return Ok(None);
         }
-        let t = T::from_range(self.range());
-        match self.inner {
-            FilePtr::SelfRef(_) => Ok(Some(f(t, local.stack()))),
-            FilePtr::Ext(e) => {
-                let id = FileId::from_u64(e.file_id.get()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
-                })?;
-                registry::with_host(id, |host| f(t, host.stack()))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
-                    })
-                    .map(Some)
-            }
+        let t = unsafe { T::from_range(self.range()) };
+        if self.inner.is_self() {
+            Ok(Some(f(t, local.stack())))
+        } else {
+            let id = FileId::from_u64(self.inner.file_id as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
+            })?;
+            registry::with_host(id, |host| f(t, host.stack()))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
+                })
+                .map(Some)
         }
     }
 
@@ -321,11 +380,12 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     /// resolvable); `None` otherwise. Does no I/O — pair the ref with the target
     /// file's stack (e.g. via [`with`](Self::with)) to read it.
     pub fn into_local(self) -> Option<BStackRef<T>> {
-        let resolvable = match self.inner {
-            FilePtr::SelfRef(_) => true,
-            FilePtr::Ext(e) => FileId::from_u64(e.file_id.get())
+        let resolvable = if self.inner.is_self() {
+            true
+        } else {
+            FileId::from_u64(self.inner.file_id as u64)
                 .and_then(|id| registry::get().map(|r| r.is_live(id)))
-                .unwrap_or(false),
+                .unwrap_or(false)
         };
         // SAFETY: `range()` is this pointer's target region; the returned ref is a
         // plain offset handle (no aliasing/liveness claim beyond the caller's).
@@ -348,29 +408,47 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         if self.offset() == 0 {
             return Ok(None);
         }
-        let t = T::from_range(self.range());
-        match self.inner {
-            FilePtr::SelfRef(_) => Ok(Some(f(t, local.stack()))),
-            FilePtr::Ext(e) => {
-                let id = FileId::from_u64(e.file_id.get()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
-                })?;
-                registry
-                    .with_host(id, |host| f(t, host.stack()))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
-                    })
-                    .map(Some)
-            }
+        let t = unsafe { T::from_range(self.range()) };
+        if self.inner.is_self() {
+            Ok(Some(f(t, local.stack())))
+        } else {
+            let id = FileId::from_u64(self.inner.file_id as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
+            })?;
+            registry
+                .with_host(id, |host| f(t, host.stack()))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
+                })
+                .map(Some)
         }
     }
 }
 
 impl<T: BStackBlock + 'static> Foreign<'static, T> {
-    /// A foreign pointer to the block `target` currently occupies, in file `file`.
-    pub fn at(file: FileId, target: &T) -> Self {
-        // SAFETY: `target` is a live `T` handle, so its start names a valid `T`.
-        unsafe { Self::new(file, target.range().start()) }
+    /// A **`SELF`** foreign pointer to the block `target` currently occupies.
+    ///
+    /// # Safety
+    /// A `SELF` pointer stores only `target`'s **offset** — never its file — and
+    /// resolves against whatever file it is later stored in and read back from. It is
+    /// therefore sound only while it lives in `target`'s **own** file. `target: &T` is a
+    /// bare offset handle that carries no file identity, so this cannot be checked: the
+    /// caller asserts that the returned pointer is only ever stored into / resolved
+    /// against `target`'s home file. Storing it into a block in a *different* file
+    /// persists a `{file_id: 0, offset}` whose offset names nothing valid there — a later
+    /// owning teardown / deep clone then frees or copies **that offset in the wrong
+    /// file**, corrupting an unrelated block from otherwise-safe code.
+    ///
+    /// (This is the same unverifiable promise that makes [`Foreign::new`](Self::new)
+    /// `unsafe`; an earlier revision made `at` safe, which was unsound — issue
+    /// NEW-20260818-F1.) For a **safe** pointer to a local block, use
+    /// [`from_local`](Self::from_local) / `bstack_cast!(slice as Foreign<T>)`, which
+    /// resolves the block's file to its registered [`FileId`] through the registry — an
+    /// *explicit* id that routes correctly no matter where the pointer is later stored.
+    pub unsafe fn at(target: &T) -> Self {
+        // SAFETY: the caller upholds that this `SELF` pointer stays in `target`'s home
+        // file; `target` is a live `T` handle, so its start names a valid `T` there.
+        unsafe { Self::new(FileId::SELF, target.range().start()) }
     }
 
     /// **normal → foreign** (`bstack_cast!(slice as Foreign<T>)`): name the block a
@@ -468,17 +546,42 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
     /// Resolve to a plain [`BStackOwned<T>`](crate::BStackOwned) — the in-file owning
     /// handle — **valid in the target's own file**. Consumes `self`, transferring the
     /// sole ownership to the returned handle (so there is never a second owner). The
-    /// owning analogue of [`Foreign::into_local`]: the result is offset-only and
-    /// carries no file identity, so pair it with the target file's allocator — the home
-    /// allocator for a [`SELF`](FileId::SELF) target, or the target file's host (e.g. a
-    /// [`ForeignHostAllocator`](crate::registry::ForeignHostAllocator)) for a cross-file
-    /// one — to read or `bstack_drop` it. Using the wrong file's allocator reads / frees
-    /// garbage, exactly as for a cast-produced [`BStackRef`].
-    pub fn into_local(self) -> BStackOwned<T> {
+    /// owning analogue of [`Foreign::into_local`], with its siblings'
+    /// ([`ForeignRc::into_local`] / [`ForeignWeak::into_local`]) target-binding
+    /// signature: `target` names the file the returned offset-only handle will be
+    /// used against, and an **explicit**-`FileId` pointer is checked against it —
+    /// a mismatch is rejected (`InvalidInput`) instead of handing back a handle
+    /// whose safe `bstack_drop` would free that offset in the wrong file.
+    ///
+    /// A [`SELF`](FileId::SELF) pointer carries no file identity to check (it is
+    /// only meaningful in the file it was read from — pass that file's allocator);
+    /// the caller keeps that obligation, exactly as for a cast-produced
+    /// [`BStackRef`].
+    pub fn into_local<'t, A: BStackRaiiAllocator>(
+        self,
+        target: &'t A,
+    ) -> io::Result<BStackOwned<T>> {
+        let fid = self.ptr.repr().file_id();
+        if fid != 0 {
+            // Resolve `target`'s identity: its adapter-declared id (a
+            // `ForeignHostAllocator`), or the registry's reverse map for a plain
+            // allocator over an attached file.
+            let target_id = match target.wal_file_id() {
+                FileId::SELF => registry::id_of_host(target.stack()),
+                id => Some(id),
+            };
+            if target_id.map(FileId::as_u64) != Some(fid) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ForeignOwned::into_local: the pointer's home file is not the \
+                     given target allocator's file",
+                ));
+            }
+        }
         // SAFETY: `self` was the sole owner (its `from_foreign` contract) and is
         // consumed here, so the returned `BStackOwned` becomes the sole owner of the
         // same live block, in the target's own file.
-        unsafe { BStackOwned::from_raw(T::from_range(self.ptr.range())) }
+        Ok(unsafe { BStackOwned::from_raw(T::from_range(self.ptr.range())) })
     }
 }
 
@@ -671,7 +774,8 @@ pub unsafe fn foreign_drop_owned<T: BStackBlock, A: BStackRaiiAllocator>(
     let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
     // SAFETY: `range` is the caller-asserted live block of `T`.
     let child = unsafe { BStackRef::<T>::from_range(range) };
-    OwnedRef(child).bstack_drop(alloc)
+    // SAFETY: the caller (an owning foreign slot's teardown) owns `child`.
+    unsafe { OwnedRef::new(child) }.bstack_drop(alloc)
 }
 
 /// Tear down an `#[bstack_strong] Foreign<T>` target: decrement the strong count at
@@ -706,7 +810,8 @@ pub unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     let range = BStackRange::new(ctrl_offset, core::mem::size_of::<T::Control>() as u64);
     // SAFETY: `range` is the caller-asserted live control block of a weakable `T`.
     let ctrl = unsafe { BStackRef::<T::Control>::from_range(range) };
-    WeakRef::<T>(ctrl).bstack_drop(alloc)
+    // SAFETY: the weak foreign slot being torn down held this weak count.
+    unsafe { WeakRef::<T>::new(ctrl) }.bstack_drop(alloc)
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +846,7 @@ pub unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackRaiiAllo
     offset: u64,
 ) -> io::Result<u64> {
     let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
-    let src = T::from_range(range);
+    let src = unsafe { T::from_range(range) };
     let new = src.try_clone_in(alloc)?;
     Ok(new.handle().range().start())
 }
@@ -761,8 +866,8 @@ pub unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocator>(
     let data = unsafe { BStackRef::<T>::from_range(range) };
     let (data_ref, ctrl) = <T as BStackShared>::strong_parts(data, alloc)?;
     let off = match ctrl {
-        None => data_ref.into_range().start() + layout::RC_REFCOUNT_OFFSET,
-        Some(c) => c.start() + layout::CTRL_STRONG_OFFSET,
+        None => layout::checked_off(data_ref.into_range().start(), layout::RC_REFCOUNT_OFFSET)?,
+        Some(c) => layout::checked_off(c.start(), layout::CTRL_STRONG_OFFSET)?,
     };
     refcount::fetch_add(alloc.stack(), off, 1)?;
     Ok(())
@@ -779,6 +884,10 @@ pub unsafe fn foreign_clone_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     alloc: &A,
     ctrl_offset: u64,
 ) -> io::Result<()> {
-    refcount::fetch_add(alloc.stack(), ctrl_offset + layout::CTRL_WEAK_OFFSET, 1)?;
+    refcount::fetch_add(
+        alloc.stack(),
+        layout::checked_off(ctrl_offset, layout::CTRL_WEAK_OFFSET)?,
+        1,
+    )?;
     Ok(())
 }

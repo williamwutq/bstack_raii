@@ -1,0 +1,49 @@
+[package]
+name = "bstack_raii-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone from the parent workspace (which lists only `derive`) — the
+# standard cargo-fuzz layout.
+[workspace]
+
+# FUZZ.md Lever 2: swap the crates.io `bstack` for a local vendored copy so the
+# fuzz build (and only the fuzz build — `bstack_raii`'s own Cargo.toml is
+# untouched) can turn on `debug-no-sync` below. See vendor/bstack/PIN.md for
+# the exact upstream commit this snapshot was taken from and why.
+[patch.crates-io]
+bstack = { path = "../vendor/bstack" }
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# `debug-no-sync` skips the real fsync/F_FULLFSYNC on every write (debug builds
+# only, which is what cargo-fuzz always produces) — without it every committing
+# op in the fuzz loop pays a real disk sync, 1-2 orders of magnitude slower.
+# Feature unification means this also switches off syncing for the `bstack`
+# instance `bstack_raii` itself links against in this build.
+bstack = { version = "=0.4", features = ["alloc", "set", "atomic", "debug-no-sync"] }
+
+[dependencies.bstack_raii]
+path = ".."
+
+[[bin]]
+name = "rtti_decode"
+path = "fuzz_targets/rtti_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtti_interpret"
+path = "fuzz_targets/rtti_interpret.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

@@ -44,6 +44,12 @@ pub trait BStackCastInto<'a, A: BStackRaiiAllocator>: Sized {
 
 impl<'a, A: BStackRaiiAllocator> BStackCastInto<'a, A> for BStackOwnedSlice<'a, A> {
     fn cast_into<T: BStackBlock>(self) -> io::Result<Result<BStackOwned<T>, Self>> {
+        // Second gate after the tag: the allocator-attested slice length must be
+        // exactly the target's on-disk size. Rejects a same-tag instantiation of a
+        // different size (a lossy generic-tag collision) with no extra I/O.
+        if self.len() != core::mem::size_of::<T::OnDisk>() as u64 {
+            return Ok(Err(self));
+        }
         let mut tag = [0u8; 8];
         self.read_range_into(TAG_OFFSET, &mut tag)?;
         if EightCC(tag) != T::eightcc() {
@@ -65,11 +71,16 @@ pub trait BStackCastAs<'a> {
 
 impl<'a> BStackCastAs<'a> for BStackSlice<'a> {
     fn cast_as<T: BStackBlock>(&self) -> io::Result<Option<T>> {
+        // Same size gate as `cast_into`: same tag but a different on-disk size is
+        // a generic-tag collision, not a match.
+        if self.len() != core::mem::size_of::<T::OnDisk>() as u64 {
+            return Ok(None);
+        }
         let mut tag = [0u8; 8];
         self.read_range_into(TAG_OFFSET, &mut tag)?;
         if EightCC(tag) != T::eightcc() {
             return Ok(None);
         }
-        Ok(Some(T::from_range(self.as_range())))
+        Ok(Some(unsafe { T::from_range(self.as_range()) }))
     }
 }

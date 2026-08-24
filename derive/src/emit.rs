@@ -7,15 +7,17 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Error, Ident, Type};
 
-use crate::model::{FieldParts, VariantParts};
+use crate::model::{FieldCtx, FieldParts, VariantCtx, VariantParts};
 use crate::util::*;
 
 /// Teardown for a POD `Vec<T>` / `String` field: free the vector's data block
 /// (the inline descriptor is freed with the enclosing struct's block). A nullable
 /// field frees nothing when the descriptor is the `0` niche.
 pub(crate) fn vec_drop_stmt(fname: &Ident, elem: &TokenStream, nullable: bool) -> TokenStream {
+    // SAFETY (emitted): the descriptor was read from this type's own inline
+    // field, which the constructor/mutators keep pointing at a live data block.
     let free = quote! {
-        ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
+        unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__on_disk.#fname, allocator) }
             .bstack_drop()?;
     };
     if nullable {
@@ -36,7 +38,10 @@ pub(crate) fn vec_accessor(
     nullable: bool,
 ) -> TokenStream {
     let getter = format_ident!("get_{}", fname);
-    let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    let field = quote!(::bstack_raii::__private::checked_field_offset(
+        self.0.start(),
+        ::core::mem::offset_of!(#on_disk, #fname) as u64
+    )?);
     if nullable {
         quote! {
             #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
@@ -117,7 +122,10 @@ pub(crate) fn vec_move(
     nullable: bool,
 ) -> (TokenStream, TokenStream) {
     let ty = quote!(::bstack_raii::BStackVec<'__mv, #elem, __A>);
-    let build = quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc));
+    // SAFETY (emitted): `#cap` was captured from the moved-out parent's inline
+    // descriptor before its shell was freed; the data block is live and now
+    // solely owned by the returned detached handle.
+    let build = quote!(unsafe { ::bstack_raii::BStackVec::from_desc(#cap, __alloc) });
     wrap_vec_move(ty, build, cap, nullable)
 }
 
@@ -129,28 +137,30 @@ pub(crate) fn vec_move(
 /// are deep-cloned (recursing each child); strong/weak elements are
 /// re-referenced (their refcount bumped); ref elements are aliased.
 pub(crate) fn vec_clone_stmt(fname: &Ident, kind: Kind, elem: &TokenStream) -> TokenStream {
+    // SAFETY (emitted, all arms): `__srcdesc` was read from the source block's
+    // own inline field, so it names that field's live data block.
     let clone_expr = match kind {
         Kind::Pod => quote! {
-            ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+            unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                 .clone_data_into(__plan)?
         },
         Kind::Owned => quote! {
-            ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+            unsafe { ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                 .clone_into(__plan, |__er, __p| {
-                    <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+                    unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(__er) }
                         .__bstack_clone_into(allocator, __p)
                 })?
         },
         Kind::Strong => quote! {
-            ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+            unsafe { ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                 .clone_into(__plan)?
         },
         Kind::Weak => quote! {
-            ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+            unsafe { ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                 .clone_into(__plan)?
         },
         Kind::Ref => quote! {
-            ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+            unsafe { ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                 .clone_into(__plan)?
         },
         // `#[embed]` never reaches the vec branch (rejected earlier).
@@ -207,8 +217,10 @@ pub(crate) fn block_vec_drop_stmt(
     elem: &TokenStream,
     nullable: bool,
 ) -> TokenStream {
+    // SAFETY (emitted): as `vec_drop_stmt` — the descriptor comes from this
+    // type's own inline field.
     let free = quote! {
-        ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(__on_disk.#fname, allocator)
+        unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(__on_disk.#fname, allocator) }
             .bstack_drop()?;
     };
     if nullable {
@@ -229,7 +241,10 @@ pub(crate) fn block_vec_accessor(
     nullable: bool,
 ) -> TokenStream {
     let getter = format_ident!("get_{}", fname);
-    let field = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    let field = quote!(::bstack_raii::__private::checked_field_offset(
+        self.0.start(),
+        ::core::mem::offset_of!(#on_disk, #fname) as u64
+    )?);
     if nullable {
         quote! {
             #vis fn #getter<'__v, __A: ::bstack_raii::BStackRaiiAllocator>(
@@ -262,27 +277,52 @@ pub(crate) fn block_vec_ctor(
     vec_ty: TokenStream,
     handle_ty: TokenStream,
     nullable: bool,
+    // Whether this element kind owns its children (owned/strong/weak). An owning
+    // vec's `from_handles` hands the children back through `ReplaceError` on
+    // failure; a `ref` vec owns nothing and returns a plain
+    // `io::Result`. Full hand-back through the generated `new` is deferred;
+    // until then a failed owning build reclaims the children (the
+    // strong/weak counts are released by their handles' `Drop`; owned children
+    // become a reclaimable leak, not an orphan) and propagates the I/O error.
+    owns: bool,
 ) -> (TokenStream, TokenStream, TokenStream) {
+    // Build a `VecDesc` from a `Vec` of element handles bound to `src`.
+    let build = |src: TokenStream| -> TokenStream {
+        if owns {
+            quote! {
+                match ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #src) {
+                    ::core::result::Result::Ok(__v) => __v.descriptor(),
+                    ::core::result::Result::Err(__e) => {
+                        // Reclaim the handed-back children, then propagate.
+                        ::core::mem::drop(__e.value);
+                        return ::core::result::Result::Err(::core::convert::Into::into(__e.source));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #src)?.descriptor()
+            }
+        }
+    };
     if nullable {
+        let some_build = build(quote!(__v));
         (
             quote!(#fname: ::core::option::Option<::std::vec::Vec<#handle_ty>>,),
             quote! {
                 let #fname: ::bstack_raii::VecDesc = match #fname {
-                    ::core::option::Option::Some(__v) =>
-                        ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, __v)?
-                            .descriptor(),
+                    ::core::option::Option::Some(__v) => #some_build,
                     ::core::option::Option::None => ::core::default::Default::default(),
                 };
             },
             quote!(#fname: #fname,),
         )
     } else {
+        let build = build(quote!(#fname));
         (
             quote!(#fname: ::std::vec::Vec<#handle_ty>,),
             quote! {
-                let #fname: ::bstack_raii::VecDesc =
-                    ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #fname)?
-                        .descriptor();
+                let #fname: ::bstack_raii::VecDesc = #build;
             },
             quote!(#fname: #fname,),
         )
@@ -298,7 +338,9 @@ pub(crate) fn block_vec_move(
     nullable: bool,
 ) -> (TokenStream, TokenStream) {
     let ty = quote!(::bstack_raii::#vec_ty<'__mv, #elem, __A>);
-    let build = quote!(::bstack_raii::#vec_ty::from_desc(#cap, __alloc));
+    // SAFETY (emitted): as `vec_move` — captured from the moved-out parent
+    // before the shell free; the detached handle is the sole owner.
+    let build = quote!(unsafe { ::bstack_raii::#vec_ty::from_desc(#cap, __alloc) });
     wrap_vec_move(ty, build, cap, nullable)
 }
 
@@ -366,10 +408,11 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                     } else {
                         let __fid = __fp.file_id();
                         if __fid == 0 {
-                            let __child = <#ftarget as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(__off, #od_size));
+                            let __child = unsafe { <#ftarget as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #od_size)) };
                             let __new = __child.__bstack_clone_into(allocator, __plan)?;
                             ::bstack_raii::ForeignRepr::new(0, __new.start())
+                                .with_type_index(__fp.type_index())
                         } else if __plan.is_measuring() {
                             // Foreign deep-clone is build-only; this value is discarded
                             // in the measure pass (home-file sizes only).
@@ -384,6 +427,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __new_off = unsafe {
                                 ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
                             ::bstack_raii::ForeignRepr::new(__fid, __new_off)
+                                .with_type_index(__fp.type_index())
                         } else {
                             #malformed
                         }
@@ -428,7 +472,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                     if __off != 0 {
                         let __fid = __fp.file_id();
                         if __fid == 0 {
-                            __plan.bump_weak(__off);
+                            __plan.bump_weak(__off)?;
                         } else if __plan.is_measuring() {
                             // Foreign refcount bump is build-only (measure skips it).
                         } else if let ::core::option::Option::Some(__id) =
@@ -471,8 +515,9 @@ pub(crate) fn accessor(
             ) -> ::std::io::Result<
                 ::core::option::Option<::bstack_raii::BStackRc<'__u, #inner_ty, __A>>
             > {
-                let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-                ::bstack_raii::upgrade_weak_field(allocator, __field)
+                let __field = ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
+                // SAFETY (emitted): `__field` is this block's own weak-field slot.
+                unsafe { ::bstack_raii::__private::upgrade_weak_field(allocator, __field) }
             }
         };
     }
@@ -491,10 +536,10 @@ pub(crate) fn accessor(
     }
     // Owned/strong/ref field: resolve the stored data offset to the handle.
     let resolve = quote! {
-        <#inner_ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
+        unsafe { <#inner_ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
             __od.#fname,
             ::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
-        ))
+        )) }
     };
     if nullable {
         quote! {
@@ -551,20 +596,21 @@ pub(crate) fn raw_slice_accessor(
         /// # Safety
         /// Bypasses the field's typed invariants: writing bytes through the returned
         /// slice can corrupt a pointer field (a bogus or aliased offset) or leak an
-        /// owned target. Reads are always valid.
+        /// owned target. Reads are always valid (once the offset itself resolves —
+        /// `Err` only for a corrupt/forged handle whose base offset would overflow).
         #vis unsafe fn #raw<'__s>(
             &self,
             stack: &'__s ::bstack_raii::BStack,
-        ) -> ::bstack_raii::BStackSlice<'__s> {
-            let __off = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
+        ) -> ::std::io::Result<::bstack_raii::BStackSlice<'__s>> {
+            let __off = ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
             // SAFETY: `[__off, __off + #len)` is exactly this field's inline region
             // within the record, which is a live allocation of the backing stack.
-            unsafe {
+            ::std::result::Result::Ok(unsafe {
                 ::bstack_raii::BStackSlice::from_raw_range(
                     stack,
                     ::bstack_raii::BStackRange::new(__off, #len),
                 )
-            }
+            })
         }
     }
 }
@@ -583,7 +629,10 @@ pub(crate) fn set_accessor(
     nullable: bool,
 ) -> TokenStream {
     let setter = format_ident!("set_{}", fname);
-    let off = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    let off = quote!(::bstack_raii::__private::checked_field_offset(
+        self.0.start(),
+        ::core::mem::offset_of!(#on_disk, #fname) as u64
+    )?);
     match kind {
         Kind::Pod => quote! {
             /// Overwrite this POD field, as one crash-atomic `set`.
@@ -641,7 +690,14 @@ pub(crate) fn replace_accessor(
     nullable: bool,
 ) -> TokenStream {
     let name = format_ident!("replace_{}", fname);
-    let off = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    // Not `?`-terminated: every use of `off` in this function (and in
+    // `replace_stack_method`, below) is inside a `Result<_, ReplaceError<_>>`
+    // mutator, which must hand `value` back via `ReplaceError::recovered`
+    // rather than propagate a bare `io::Error`.
+    let off = quote!(::bstack_raii::__private::checked_field_offset(
+        self.0.start(),
+        ::core::mem::offset_of!(#on_disk, #fname) as u64
+    ));
     let size_od =
         quote!(::core::mem::size_of::<<#inner_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
 
@@ -663,7 +719,7 @@ pub(crate) fn replace_accessor(
             let rebuild = |range: TokenStream| {
                 quote!(unsafe {
                     ::bstack_raii::BStackOwned::from_raw(
-                        <#inner_ty as ::bstack_raii::BStackBlock>::from_range(#range),
+                        unsafe { <#inner_ty as ::bstack_raii::BStackBlock>::from_range(#range) },
                     )
                 })
             };
@@ -719,10 +775,14 @@ pub(crate) fn replace_accessor(
                         ::std::result::Result::Ok((__d, __c)) => {
                             unsafe { ::bstack_raii::BStackRc::from_raw(__d, __c, allocator) }
                         }
-                        // The new value is safely installed; the OLD block is now
-                        // reachable only via crash-recovery. Hand back nothing.
+                        // The new value is safely installed, but reading the old
+                        // value's control pointer failed. The old block is untouched
+                        // at `__old_range` — hand its raw offset back so it stays
+                        // recoverable (retry `strong_parts` once I/O recovers, or
+                        // reclaim it) rather than leaking.
                         ::std::result::Result::Err(__e) => {
-                            return ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e));
+                            return ::core::result::Result::Err(
+                                ::bstack_raii::ReplaceError::lost_raw(__e, ::std::vec![#old_range]));
                         }
                     }
                 }
@@ -744,13 +804,13 @@ pub(crate) fn replace_accessor(
 
             let body = if nullable {
                 quote! {
-                    let __off = #off;
+                    let __off = match #off {
+                        ::std::result::Result::Ok(__o) => __o,
+                        ::std::result::Result::Err(__e) =>
+                            return ::core::result::Result::Err(
+                                ::bstack_raii::ReplaceError::recovered(__e, value)),
+                    };
                     let __stack = allocator.stack();
-                    let mut __b = [0u8; 8];
-                    if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
-                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-                    }
-                    let __old_off = u64::from_le_bytes(__b);
                     let (__new, __back): (u64, ::core::option::Option<(::bstack_raii::BStackRange, ::core::option::Option<::bstack_raii::BStackRange>)>) =
                         match value {
                             ::core::option::Option::Some(__value) => {
@@ -759,15 +819,23 @@ pub(crate) fn replace_accessor(
                             }
                             ::core::option::Option::None => (0u64, ::core::option::Option::None),
                         };
-                    if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
-                        let __handback: #ret_ty = match __back {
-                            ::core::option::Option::Some((__new_range, __nc)) => {
-                                ::core::option::Option::Some(#rebuild_new)
-                            }
-                            ::core::option::Option::None => ::core::option::Option::None,
-                        };
-                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __handback));
-                    }
+                    // Atomic exchange (see the owned/ref mutator): one locked
+                    // read-old + write-new, so a concurrent replace can't double-own
+                    // the displaced strong ref.
+                    let __old_bytes = match __stack.swap(__off, __new.to_le_bytes()) {
+                        ::std::result::Result::Ok(__b) => __b,
+                        ::std::result::Result::Err(__e) => {
+                            let __handback: #ret_ty = match __back {
+                                ::core::option::Option::Some((__new_range, __nc)) => {
+                                    ::core::option::Option::Some(#rebuild_new)
+                                }
+                                ::core::option::Option::None => ::core::option::Option::None,
+                            };
+                            return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __handback));
+                        }
+                    };
+                    let __old_off = u64::from_le_bytes(
+                        <[u8; 8]>::try_from(&__old_bytes[..8]).unwrap());
                     if __old_off == 0 {
                         ::core::result::Result::Ok(::core::option::Option::None)
                     } else {
@@ -776,20 +844,24 @@ pub(crate) fn replace_accessor(
                 }
             } else {
                 quote! {
-                    let __off = #off;
+                    let __off = match #off {
+                        ::std::result::Result::Ok(__o) => __o,
+                        ::std::result::Result::Err(__e) =>
+                            return ::core::result::Result::Err(
+                                ::bstack_raii::ReplaceError::recovered(__e, value)),
+                    };
                     let __stack = allocator.stack();
-                    let mut __b = [0u8; 8];
-                    if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
-                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-                    }
-                    let __old_off = u64::from_le_bytes(__b);
                     let (__new_range, __nc) = { let __value = value; #consume_new };
                     let __new = __new_range.start();
-                    if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
-                        return ::core::result::Result::Err(
-                            ::bstack_raii::ReplaceError::recovered(__e, #rebuild_new),
-                        );
-                    }
+                    // Atomic exchange (see the owned/ref mutator).
+                    let __old_bytes = match __stack.swap(__off, __new.to_le_bytes()) {
+                        ::std::result::Result::Ok(__b) => __b,
+                        ::std::result::Result::Err(__e) =>
+                            return ::core::result::Result::Err(
+                                ::bstack_raii::ReplaceError::recovered(__e, #rebuild_new)),
+                    };
+                    let __old_off = u64::from_le_bytes(
+                        <[u8; 8]>::try_from(&__old_bytes[..8]).unwrap());
                     ::core::result::Result::Ok(#recon_old)
                 }
             };
@@ -835,6 +907,11 @@ pub(crate) fn replace_stack_method(
             /// Install `value` and move the previous value out (`None` = the `0`
             /// null niche). On an I/O failure the *new* value is handed back through
             /// [`ReplaceError`](::bstack_raii::ReplaceError), never lost.
+            ///
+            /// Thread-safe: the read of the old pointer and the write of the new one
+            /// are one atomic [`BStack::swap`], so concurrent callers each take the
+            /// distinct value they displaced — the old block is reclaimed once, never
+            /// double-owned.
             #vis fn #name(
                 &self,
                 stack: &::bstack_raii::BStack,
@@ -843,12 +920,12 @@ pub(crate) fn replace_stack_method(
                 ::core::option::Option<#handle_ty>,
                 ::bstack_raii::ReplaceError<::core::option::Option<#handle_ty>>,
             > {
-                let __off = #off;
-                let mut __b = [0u8; 8];
-                if let ::std::result::Result::Err(__e) = stack.get_into(__off, &mut __b) {
-                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-                }
-                let __old_off = u64::from_le_bytes(__b);
+                let __off = match #off {
+                    ::std::result::Result::Ok(__o) => __o,
+                    ::std::result::Result::Err(__e) =>
+                        return ::core::result::Result::Err(
+                            ::bstack_raii::ReplaceError::recovered(__e, value)),
+                };
                 let (__new, __new_range_opt): (u64, ::core::option::Option<::bstack_raii::BStackRange>) =
                     match value {
                         ::core::option::Option::Some(__value) => {
@@ -857,13 +934,18 @@ pub(crate) fn replace_stack_method(
                         }
                         ::core::option::Option::None => (0u64, ::core::option::Option::None),
                     };
-                if let ::std::result::Result::Err(__e) = stack.set(__off, __new.to_le_bytes()) {
-                    let __handback: ::core::option::Option<#handle_ty> = match __new_range_opt {
-                        ::core::option::Option::Some(__new_range) => ::core::option::Option::Some(#rebuild_new),
-                        ::core::option::Option::None => ::core::option::Option::None,
-                    };
-                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __handback));
-                }
+                let __old_bytes = match stack.swap(__off, __new.to_le_bytes()) {
+                    ::std::result::Result::Ok(__b) => __b,
+                    ::std::result::Result::Err(__e) => {
+                        let __handback: ::core::option::Option<#handle_ty> = match __new_range_opt {
+                            ::core::option::Option::Some(__new_range) => ::core::option::Option::Some(#rebuild_new),
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        };
+                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __handback));
+                    }
+                };
+                let __old_off = u64::from_le_bytes(
+                    <[u8; 8]>::try_from(&__old_bytes[..8]).unwrap());
                 if __old_off == 0 {
                     ::core::result::Result::Ok(::core::option::Option::None)
                 } else {
@@ -881,19 +963,25 @@ pub(crate) fn replace_stack_method(
                 stack: &::bstack_raii::BStack,
                 value: #handle_ty,
             ) -> ::core::result::Result<#handle_ty, ::bstack_raii::ReplaceError<#handle_ty>> {
-                let __off = #off;
-                let mut __b = [0u8; 8];
-                if let ::std::result::Result::Err(__e) = stack.get_into(__off, &mut __b) {
-                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-                }
-                let __old_off = u64::from_le_bytes(__b);
+                let __off = match #off {
+                    ::std::result::Result::Ok(__o) => __o,
+                    ::std::result::Result::Err(__e) =>
+                        return ::core::result::Result::Err(
+                            ::bstack_raii::ReplaceError::recovered(__e, value)),
+                };
                 let __new_range: ::bstack_raii::BStackRange = { let __value = value; #new_range };
                 let __new = __new_range.start();
-                if let ::std::result::Result::Err(__e) = stack.set(__off, __new.to_le_bytes()) {
-                    return ::core::result::Result::Err(
-                        ::bstack_raii::ReplaceError::recovered(__e, #rebuild_new),
-                    );
-                }
+                // Atomic exchange: install the new pointer and take the displaced
+                // one under one lock, so concurrent callers never both reclaim the
+                // same old block.
+                let __old_bytes = match stack.swap(__off, __new.to_le_bytes()) {
+                    ::std::result::Result::Ok(__b) => __b,
+                    ::std::result::Result::Err(__e) =>
+                        return ::core::result::Result::Err(
+                            ::bstack_raii::ReplaceError::recovered(__e, #rebuild_new)),
+                };
+                let __old_off = u64::from_le_bytes(
+                    <[u8; 8]>::try_from(&__old_bytes[..8]).unwrap());
                 ::core::result::Result::Ok(#recon_old)
             }
         }
@@ -928,7 +1016,14 @@ pub(crate) fn array_mut_methods(
     size_elem: &TokenStream,
     elem_nullable: bool,
 ) -> Vec<TokenStream> {
-    let base = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    // Not `?`-terminated: this fragment is reused inside both plain
+    // `io::Result` setters and `Result<_, ReplaceError<_>>` mutators, which
+    // resolve a failed offset differently (the latter must hand `value` back
+    // via `ReplaceError::recovered`, not just propagate the bare `io::Error`).
+    let base = quote!(::bstack_raii::__private::checked_field_offset(
+        self.0.start(),
+        ::core::mem::offset_of!(#on_disk, #fname) as u64
+    ));
     let is_strong = kind == Kind::Strong;
     let is_ref = kind == Kind::Ref;
     let oob = quote!(::std::io::Error::new(
@@ -976,8 +1071,8 @@ pub(crate) fn array_mut_methods(
     let rebuild = |off: TokenStream, ctrl: TokenStream| match kind {
         Kind::Owned => quote!(unsafe {
             ::bstack_raii::BStackOwned::from_raw(
-                <#elem as ::bstack_raii::BStackBlock>::from_range(
-                    ::bstack_raii::BStackRange::new(#off, #size_elem)))
+                unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                    ::bstack_raii::BStackRange::new(#off, #size_elem)) })
         }),
         Kind::Ref => quote!(unsafe {
             ::bstack_raii::BStackRef::<#elem>::from_range(
@@ -999,8 +1094,8 @@ pub(crate) fn array_mut_methods(
     let recon_old = |off: TokenStream| match kind {
         Kind::Owned => quote!(unsafe {
             ::bstack_raii::BStackOwned::from_raw(
-                <#elem as ::bstack_raii::BStackBlock>::from_range(
-                    ::bstack_raii::BStackRange::new(#off, #size_elem)))
+                unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                    ::bstack_raii::BStackRange::new(#off, #size_elem)) })
         }),
         Kind::Ref => quote!(unsafe {
             ::bstack_raii::BStackRef::<#elem>::from_range(
@@ -1014,8 +1109,13 @@ pub(crate) fn array_mut_methods(
             match <#elem as ::bstack_raii::BStackShared>::strong_parts(__old_data, allocator) {
                 ::std::result::Result::Ok((__od2, __oc2)) =>
                     unsafe { ::bstack_raii::BStackRc::from_raw(__od2, __oc2, allocator) },
-                ::std::result::Result::Err(__e) =>
-                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e)),
+                // Reconstructing this old element failed; hand its raw offset back
+                // so it stays recoverable rather than leaking.
+                ::std::result::Result::Err(__e) => {
+                    let __r = ::bstack_raii::BStackRange::new(#off, #size_elem);
+                    return ::core::result::Result::Err(
+                        ::bstack_raii::ReplaceError::lost_raw(__e, ::std::vec![__r]));
+                }
             }
         }),
         _ => unreachable!(),
@@ -1033,11 +1133,6 @@ pub(crate) fn array_mut_methods(
         let rb = rebuild(quote!(__o), quote!(__c));
         let old = recon_old(quote!(__old_off));
         quote! {
-            let mut __b = [0u8; 8];
-            if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
-                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-            }
-            let __old_off = u64::from_le_bytes(__b);
             let (__new, __back): (
                 u64,
                 ::core::option::Option<(u64, ::core::option::Option<::bstack_raii::BStackRange>)>,
@@ -1048,13 +1143,19 @@ pub(crate) fn array_mut_methods(
                 }
                 ::core::option::Option::None => (0u64, ::core::option::Option::None),
             };
-            if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
-                let __hb: #elem_leaf = match __back {
-                    ::core::option::Option::Some((__o, #cpat)) => ::core::option::Option::Some(#rb),
-                    ::core::option::Option::None => ::core::option::Option::None,
-                };
-                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
-            }
+            // Atomic exchange of the element slot.
+            let __old_bytes = match __stack.swap(__off, __new.to_le_bytes()) {
+                ::std::result::Result::Ok(__b) => __b,
+                ::std::result::Result::Err(__e) => {
+                    let __hb: #elem_leaf = match __back {
+                        ::core::option::Option::Some((__o, #cpat)) => ::core::option::Option::Some(#rb),
+                        ::core::option::Option::None => ::core::option::Option::None,
+                    };
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
+                }
+            };
+            let __old_off = u64::from_le_bytes(
+                <[u8; 8]>::try_from(&__old_bytes[..8]).unwrap());
             if __old_off == 0 {
                 ::core::result::Result::Ok(::core::option::Option::None)
             } else {
@@ -1066,15 +1167,15 @@ pub(crate) fn array_mut_methods(
         let rb = rebuild(quote!(__new), quote!(__c));
         let old = recon_old(quote!(__old_off));
         quote! {
-            let mut __b = [0u8; 8];
-            if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
-                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-            }
-            let __old_off = u64::from_le_bytes(__b);
             let (__new, #cpat): (u64, ::core::option::Option<::bstack_raii::BStackRange>) = #consume_v;
-            if let ::std::result::Result::Err(__e) = __stack.set(__off, __new.to_le_bytes()) {
-                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, #rb));
-            }
+            // Atomic exchange of the element slot.
+            let __old_bytes = match __stack.swap(__off, __new.to_le_bytes()) {
+                ::std::result::Result::Ok(__b) => __b,
+                ::std::result::Result::Err(__e) =>
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, #rb)),
+            };
+            let __old_off = u64::from_le_bytes(
+                <[u8; 8]>::try_from(&__old_bytes[..8]).unwrap());
             ::core::result::Result::Ok(#old)
         }
     };
@@ -1093,7 +1194,13 @@ pub(crate) fn array_mut_methods(
                     ::bstack_raii::ReplaceError::recovered(#oob, value));
             }
             let __stack = allocator.stack();
-            let __off = #base + (index as u64) * 8;
+            let __base = match #base {
+                ::std::result::Result::Ok(__o) => __o,
+                ::std::result::Result::Err(__e) =>
+                    return ::core::result::Result::Err(
+                        ::bstack_raii::ReplaceError::recovered(__e, value)),
+            };
+            let __off = __base + (index as u64) * 8;
             #elem_body
         }
     });
@@ -1164,20 +1271,20 @@ pub(crate) fn array_mut_methods(
     let old_nested = nested_build(dims, &elem_leaf, &old_read);
     let replace_whole = format_ident!("replace_{}", fname);
     out.push(quote! {
-        /// Swap the whole array, moving the old array out. One crash-atomic write of
-        /// the inline `[u64; N]` slot region; on I/O failure the *new* array is
-        /// handed back through [`ReplaceError`](::bstack_raii::ReplaceError).
+        /// Swap the whole array, moving the old array out. One crash-atomic,
+        /// thread-safe [`BStack::swap`] of the inline `[u64; N]` slot region — read
+        /// of the old offsets and write of the new happen together, so concurrent
+        /// callers each take the distinct array they displaced; on
+        /// I/O failure the *new* array is handed back through
+        /// [`ReplaceError`](::bstack_raii::ReplaceError).
         #vis fn #replace_whole<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
             &self,
             allocator: &'__m __A,
             value: #whole_ty,
         ) -> ::core::result::Result<#whole_ty, ::bstack_raii::ReplaceError<#whole_ty>> {
             let __stack = allocator.stack();
-            let __base = #base;
-            let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk>()];
-            let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
-            let __oldoffs: [u64; #total] = match __r.read_on_disk(__stack, &mut __buf) {
-                ::std::result::Result::Ok(__od) => __od.#fname,
+            let __base = match #base {
+                ::std::result::Result::Ok(__o) => __o,
                 ::std::result::Result::Err(__e) =>
                     return ::core::result::Result::Err(
                         ::bstack_raii::ReplaceError::recovered(__e, value)),
@@ -1185,12 +1292,20 @@ pub(crate) fn array_mut_methods(
             let mut __news = [0u64; #total];
             #decl_ncs
             #consume_all
-            if let ::std::result::Result::Err(__e) =
-                __stack.set(__base, ::bstack_raii::bytemuck::bytes_of(&__news))
-            {
-                let __hb: #whole_ty = #new_nested;
-                return ::core::result::Result::Err(
-                    ::bstack_raii::ReplaceError::recovered(__e, __hb));
+            // Atomic exchange of the whole inline region; the returned bytes are the
+            // old offsets this caller displaced.
+            let __old_bytes = match __stack.swap(__base, ::bstack_raii::bytemuck::bytes_of(&__news)) {
+                ::std::result::Result::Ok(__b) => __b,
+                ::std::result::Result::Err(__e) => {
+                    let __hb: #whole_ty = #new_nested;
+                    return ::core::result::Result::Err(
+                        ::bstack_raii::ReplaceError::recovered(__e, __hb));
+                }
+            };
+            let mut __oldoffs = [0u64; #total];
+            for __i in 0..(#total) {
+                __oldoffs[__i] = u64::from_le_bytes(
+                    <[u8; 8]>::try_from(&__old_bytes[__i * 8..__i * 8 + 8]).unwrap());
             }
             let __old: #whole_ty = #old_nested;
             ::core::result::Result::Ok(__old)
@@ -1220,7 +1335,7 @@ pub(crate) fn array_mut_methods(
                 if index >= (#total) {
                     return ::std::result::Result::Err(#oob);
                 }
-                let __off = #base + (index as u64) * 8;
+                let __off = #base? + (index as u64) * 8;
                 let __new: u64 = #new_off;
                 allocator.stack().set(__off, __new.to_le_bytes())
             }
@@ -1250,7 +1365,7 @@ pub(crate) fn array_mut_methods(
             ) -> ::std::io::Result<()> {
                 let mut __news = [0u64; #total];
                 #set_consume
-                allocator.stack().set(#base, ::bstack_raii::bytemuck::bytes_of(&__news))
+                allocator.stack().set(#base?, ::bstack_raii::bytemuck::bytes_of(&__news))
             }
         });
     }
@@ -1280,7 +1395,13 @@ pub(crate) fn foreign_mut_methods(
     kind: Kind,
     nullable: bool,
 ) -> Vec<TokenStream> {
-    let off = quote!(self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64);
+    // Not `?`-terminated: reused inside both an `io::Result` setter and a
+    // `Result<_, ReplaceError<_>>` mutator (see below), which resolve a
+    // failed offset differently.
+    let off = quote!(::bstack_raii::__private::checked_field_offset(
+        self.0.start(),
+        ::core::mem::offset_of!(#on_disk, #fname) as u64
+    ));
     // The RAII dual over the method's `'__m` (a `SELF` pointer stays bound to the
     // allocator borrow, mirroring `bstack_move!`).
     let dual = match kind {
@@ -1326,13 +1447,27 @@ pub(crate) fn foreign_mut_methods(
     let replace = format_ident!("replace_{}", fname);
     let read_old = quote! {
         let __stack = allocator.stack();
-        let __off = #off;
+        let __off = match #off {
+            ::std::result::Result::Ok(__o) => __o,
+            ::std::result::Result::Err(__e) =>
+                return ::core::result::Result::Err(
+                    ::bstack_raii::ReplaceError::recovered(__e, value)),
+        };
         let mut __b = [0u8; 16];
         if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
             return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
         }
-        let __old: ::bstack_raii::ForeignRepr =
+        let __old_raw: ::bstack_raii::ForeignRepr =
             ::bstack_raii::bytemuck::pod_read_unaligned(&__b);
+        // Resolve a SELF old-pointer to this file's registered id before it is handed
+        // back as a dual. Nothing is written yet, so on failure hand `value` back.
+        let __old: ::bstack_raii::ForeignRepr =
+            match ::bstack_raii::__private::resolve_self_repr(__old_raw, __stack) {
+                ::std::result::Result::Ok(__r) => __r,
+                ::std::result::Result::Err(__e) =>
+                    return ::core::result::Result::Err(
+                        ::bstack_raii::ReplaceError::recovered(__e, value)),
+            };
     };
     let replace_body = if nullable {
         let consume_some = consume(quote!(__v));
@@ -1346,7 +1481,10 @@ pub(crate) fn foreign_mut_methods(
             ) = match value {
                 ::core::option::Option::Some(__v) => {
                     let __r = #consume_some;
-                    (__r, ::core::option::Option::Some(__r))
+                    // Store the home-relative (SELF-re-encoded) form; keep the explicit
+                    // `__r` to hand back untouched on a write failure.
+                    (::bstack_raii::__private::home_relative_repr(__r, __stack),
+                     ::core::option::Option::Some(__r))
                 }
                 ::core::option::Option::None =>
                     (::bstack_raii::ForeignRepr::new(0, 0), ::core::option::Option::None),
@@ -1368,11 +1506,15 @@ pub(crate) fn foreign_mut_methods(
         }
     } else {
         let consume_v = consume(quote!(value));
-        let rb_new = rebuild(quote!(__new));
+        let rb_new = rebuild(quote!(__new_explicit));
         let rb_old = rebuild(quote!(__old));
         quote! {
             #read_old
-            let __new: ::bstack_raii::ForeignRepr = #consume_v;
+            let __new_explicit: ::bstack_raii::ForeignRepr = #consume_v;
+            // Store the home-relative (SELF-re-encoded) form; hand the explicit value
+            // back untouched on a write failure.
+            let __new: ::bstack_raii::ForeignRepr =
+                ::bstack_raii::__private::home_relative_repr(__new_explicit, __stack);
             if let ::std::result::Result::Err(__e) =
                 __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
             {
@@ -1414,10 +1556,12 @@ pub(crate) fn foreign_mut_methods(
                 allocator: &'__m __A,
                 value: #val_ty,
             ) -> ::std::io::Result<()> {
-                let __new: ::bstack_raii::ForeignRepr = #new_repr;
+                // Re-encode a pointer to the home file as SELF before storing.
+                let __new: ::bstack_raii::ForeignRepr =
+                    ::bstack_raii::__private::home_relative_repr(#new_repr, allocator.stack());
                 allocator
                     .stack()
-                    .set(#off, ::bstack_raii::bytemuck::bytes_of(&__new))
+                    .set(#off?, ::bstack_raii::bytemuck::bytes_of(&__new))
             }
         });
     }
@@ -1426,14 +1570,22 @@ pub(crate) fn foreign_mut_methods(
 }
 
 /// Generate `(param, prep, init)` for one constructor field. Not called for
-/// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>` (None => 0).
+/// `#[bstack_weak]` fields. `nullable` fields take an `Option<Handle>`
+/// (None => 0). `prep` consumes the handle into its `u64` on-disk offset.
+///
+/// The consumed child is **not** freed on a failed construction step: the
+/// constructor instead reconstructs every field's [`BStackMove::Fields`] element
+/// from the in-memory `__on_disk` image (via the field's `bstack_move!`
+/// reconstruction) and hands the whole `Self::Fields` tuple back through
+/// [`ConstructError`](::bstack_raii::ConstructError) — so an orphaned child
+/// becomes a returned one. That reconstruction lives in the
+/// `constructor` emitter, not here.
 pub(crate) fn ctor_field(
     fname: &Ident,
     inner_ty: &Type,
     kind: Kind,
     nullable: bool,
 ) -> (TokenStream, TokenStream, TokenStream) {
-    // The prep body that turns a consumed handle into its `u64` offset.
     let (handle_ty, to_offset): (TokenStream, TokenStream) = match kind {
         Kind::Pod => {
             return (
@@ -1483,6 +1635,40 @@ pub(crate) fn ctor_field(
     }
 }
 
+/// Rewrite a `bstack_move!` move type (which names `bstack_move`'s `'__mv`
+/// lifetime) into the constructor's `'__ctor` lifetime, so the same handle type
+/// can name the tuple element `new` hands back through `ConstructError`. Only the
+/// `'__mv` lifetime differs between the two contexts; a string round-trip is
+/// sufficient and robust (that lifetime token appears nowhere else). Types with no
+/// lifetime (e.g. `BStackOwned<T>`) pass through unchanged.
+pub(crate) fn mv_ty_as_ctor(ty: &TokenStream) -> TokenStream {
+    rename_lifetime(ty, "__mv", "__ctor")
+}
+
+/// Rewrite every occurrence of the lifetime ident `from` (as in `'from`) to `to`
+/// throughout a token stream, recursing into groups. A lifetime is a `'` punct
+/// followed by an ident; only the ident is rewritten (the `'` punct is a separate,
+/// unchanged token). Used to re-home a `bstack_move!` reconstruction (which names
+/// `bstack_move`'s `'__mv`) into a constructor's own lifetime (`'__ctor` for
+/// structs, `'__e` for enums), so the shared reconstruction code type-checks in
+/// both contexts.
+pub(crate) fn rename_lifetime(ts: &TokenStream, from: &str, to: &str) -> TokenStream {
+    use proc_macro2::{Ident, TokenTree};
+    ts.clone()
+        .into_iter()
+        .map(|tt| match tt {
+            TokenTree::Ident(id) if id.to_string() == from => {
+                TokenTree::Ident(Ident::new(to, id.span()))
+            }
+            TokenTree::Group(g) => TokenTree::Group(proc_macro2::Group::new(
+                g.delimiter(),
+                rename_lifetime(&g.stream(), from, to),
+            )),
+            other => other,
+        })
+        .collect()
+}
+
 /// Build one `bstack_move!` field: its type in the result tuple and the
 /// expression that reconstructs it from the captured offset `cap`.
 pub(crate) fn move_field(
@@ -1506,14 +1692,14 @@ pub(crate) fn move_field(
                     ::core::option::Option::None
                 } else {
                     let __ctrl = unsafe {
-                        ::bstack_raii::BStackRef::<
+                        unsafe { ::bstack_raii::BStackRef::<
                             <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                         >::from_range(::bstack_raii::BStackRange::new(
                             #cap,
                             ::core::mem::size_of::<
                                 <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                             >() as u64,
-                        ))
+                        )) }
                     };
                     ::core::option::Option::Some(
                         unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
@@ -1527,9 +1713,9 @@ pub(crate) fn move_field(
             quote! {
                 unsafe {
                     ::bstack_raii::BStackOwned::from_raw(
-                        <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
+                        unsafe { <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
                             ::bstack_raii::BStackRange::new(#cap, #size_od),
-                        ),
+                        ) },
                     )
                 }
             },
@@ -1605,9 +1791,23 @@ pub(crate) fn weak_setter(
             &self,
             allocator: &'__s __A,
             weak: ::bstack_raii::BStackWeak<'__s, #fty, __A>,
-        ) -> ::std::io::Result<()> {
-            let __field = self.0.start() + ::core::mem::offset_of!(#on_disk, #fname) as u64;
-            ::bstack_raii::set_weak_field(allocator, __field, weak)
+        ) -> ::core::result::Result<
+            (),
+            ::bstack_raii::ReplaceError<::bstack_raii::BStackWeak<'__s, #fty, __A>>,
+        > {
+            // The offset is computed before `weak` is consumed, so on its failure
+            // hand `weak` back unharmed.
+            let __field = match ::bstack_raii::__private::checked_field_offset(
+                self.0.start(),
+                ::core::mem::offset_of!(#on_disk, #fname) as u64,
+            ) {
+                ::core::result::Result::Ok(__f) => __f,
+                ::core::result::Result::Err(__e) => {
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, weak));
+                }
+            };
+            // SAFETY (emitted): `__field` is this block's own weak-field slot.
+            unsafe { ::bstack_raii::__private::set_weak_field(allocator, __field, weak) }
         }
     }
 }
@@ -1627,6 +1827,15 @@ pub(crate) fn constructor(
     params: &[TokenStream],
     preps: &[TokenStream],
     inits: &[TokenStream],
+    // Per-owning-child hand-back: on a failed construction step, reconstruct each
+    // moved-in owning child (`#[bstack_owned]` / `#[bstack_strong]` / `#[embed]`,
+    // or a vec / array of them) and return the tuple through `ConstructError`, so
+    // a consumed child is handed back to the caller rather than orphaned or freed.
+    // `handback_tys` are the matching tuple element types.
+    // Empty when the constructor moves in nothing the caller owns — then `new`
+    // keeps a plain `io::Result`.
+    handbacks: &[TokenStream],
+    handback_tys: &[TokenStream],
     // Steps run *after* the block's OnDisk is written (with `__data` = the block
     // range in scope): `#[embed]` fields copy each child block into its now-written
     // inline slot via `BStack::copy` and free the child shell.
@@ -1639,6 +1848,52 @@ pub(crate) fn constructor(
         },
     };
     let size = quote!(::core::mem::size_of::<#on_disk>() as u64);
+
+    // Whether this constructor moves in any owning child. When it does, `new`
+    // returns `Result<_, ConstructError<Fields>>` and every fallible step hands
+    // the children back through `#on_fail`; otherwise it keeps a bare
+    // `io::Result` and a failed step just returns the error (nothing to reclaim).
+    let has_owning = !handbacks.is_empty();
+    let handback_tuple = quote!(( #(#handback_tys,)* ));
+    // The failure epilogue (with `__e: io::Error` in scope): reconstruct each
+    // consumed owning child from the prep-local offsets and hand the tuple back.
+    // The reconstruction can itself fail (a re-read of a `#[bstack_strong]`
+    // child's control block); on that rare double fault the children are `lost`
+    // (`None`) — exactly the `BStackAllocError`/`ReplaceError` shape. Reads the
+    // prep locals, not the block image, so it also works on the `rc, weak` path
+    // that allocates before materialising the image.
+    let wrap_err = |err: TokenStream| -> TokenStream {
+        if !has_owning {
+            return quote!({ return ::core::result::Result::Err(#err); });
+        }
+        quote! {
+            {
+                let __e: ::std::io::Error = #err;
+                #[allow(unused_variables)]
+                let __alloc = allocator;
+                #[allow(unused_variables)]
+                let __stack = allocator.stack();
+                let __recovered: ::std::io::Result<#handback_tuple> =
+                    (|| ::core::result::Result::Ok(( #(#handbacks,)* )))();
+                return match __recovered {
+                    ::core::result::Result::Ok(__f) => ::core::result::Result::Err(
+                        ::bstack_raii::ConstructError::recovered(__e, __f),
+                    ),
+                    ::core::result::Result::Err(_) => ::core::result::Result::Err(
+                        ::bstack_raii::ConstructError::lost(__e),
+                    ),
+                };
+            }
+        }
+    };
+    // `new`'s return type: the hand-back error when it moves in owning children.
+    let ret_wrap = |ok: &TokenStream| -> TokenStream {
+        if has_owning {
+            quote!(::core::result::Result<#ok, ::bstack_raii::ConstructError<#handback_tuple>>)
+        } else {
+            quote!(::std::io::Result<#ok>)
+        }
+    };
 
     match mode {
         // Plain and `rc` are already a single atomic write: the injected refcount
@@ -1669,31 +1924,39 @@ pub(crate) fn constructor(
                 quote! {
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
-                            <Self as ::bstack_raii::BStackBlock>::from_range(__data),
+                            unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__data) },
                         )
                     })
                 }
             };
+            let ret_ty = ret_wrap(&ret);
+            let on_alloc_fail = wrap_err(quote!(__e));
+            let on_write_fail = wrap_err(quote!(__e));
             quote! {
                 // A block with many fields yields a many-arg `new`; that is expected.
                 #[allow(clippy::too_many_arguments)]
                 #vis fn new<'__ctor, __A: ::bstack_raii::BStackRaiiAllocator>(
                     allocator: &'__ctor __A,
                     #(#params)*
-                ) -> ::std::io::Result<#ret> {
+                ) -> #ret_ty {
                     #(#preps)*
                     let __on_disk = #on_disk_ctor {
                         #header
                         #injected
                         #(#inits)*
                     };
-                    let mut __slice = allocator.alloc(#size)?;
+                    let mut __slice = match allocator.alloc(#size) {
+                        ::std::result::Result::Ok(__s) => __s,
+                        // Hand the already-consumed children back.
+                        ::std::result::Result::Err(__e) => #on_alloc_fail
+                    };
                     let __data = __slice.as_range();
                     if let ::std::result::Result::Err(__e) =
                         __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__on_disk))
                     {
                         let _ = allocator.dealloc(__slice);
-                        return ::std::result::Result::Err(__e);
+                        // Hand the already-consumed children back.
+                        #on_write_fail
                     }
                     #(#post)*
                     #finish
@@ -1709,17 +1972,25 @@ pub(crate) fn constructor(
             let ctrl_size = quote! {
                 ::core::mem::size_of::<<Self as ::bstack_raii::BStackWeakable>::Control>() as u64
             };
+            let ret = quote!(::bstack_raii::BStackRc<'__ctor, Self, __A>);
+            let ret_ty = ret_wrap(&ret);
+            let on_alloc_fail = wrap_err(quote!(__e));
+            let on_commit_fail = wrap_err(quote!(__e));
             quote! {
                 // A block with many fields yields a many-arg `new`; that is expected.
                 #[allow(clippy::too_many_arguments)]
                 #vis fn new<'__ctor, __A: ::bstack_raii::BStackRaiiAllocator>(
                     allocator: &'__ctor __A,
                     #(#params)*
-                ) -> ::std::io::Result<::bstack_raii::BStackRc<'__ctor, Self, __A>> {
+                ) -> #ret_ty {
                     #(#preps)*
                     // Allocate data + control up front (atomically when the
                     // allocator supports bulk); both are orphans until the commit.
-                    let __blocks = ::bstack_raii::BStackRaiiAllocator::alloc_many(allocator, &[#size, #ctrl_size])?;
+                    let __blocks = match ::bstack_raii::BStackRaiiAllocator::alloc_many(allocator, &[#size, #ctrl_size]) {
+                        ::std::result::Result::Ok(__b) => __b,
+                        // Hand the already-consumed children back.
+                        ::std::result::Result::Err(__e) => #on_alloc_fail
+                    };
                     let __data = __blocks[0];
                     let __ctrl = __blocks[1];
                     let __on_disk = #on_disk_ctor {
@@ -1727,7 +1998,7 @@ pub(crate) fn constructor(
                         __bstack_ctrl: __ctrl.start(),
                         #(#inits)*
                     };
-                    let __ctrl_payload = ::bstack_raii::build_control_payload(
+                    let __ctrl_payload = ::bstack_raii::__private::build_control_payload(
                         #ctrl_eightcc,
                         __data.start(),
                         #ctrl_size,
@@ -1742,8 +2013,11 @@ pub(crate) fn constructor(
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)
                     {
-                        let _ = ::bstack_raii::BStackRaiiAllocator::free_many(allocator, [__data, __ctrl]);
-                        return ::std::result::Result::Err(__e);
+                        // SAFETY (emitted): `__data` / `__ctrl` are the two blocks this
+                        // constructor just allocated and failed to initialize.
+                        let _ = unsafe { ::bstack_raii::BStackRaiiAllocator::free_many(allocator, [__data, __ctrl]) };
+                        // Hand the already-consumed children back.
+                        #on_commit_fail
                     }
                     #(#post)*
                     ::std::result::Result::Ok(unsafe {
@@ -1776,11 +2050,14 @@ pub(crate) fn child_range_stmt(
         let __child = unsafe { ::bstack_raii::BStackRef::<#inner_ty>::from_range(__range) };
         #body
     };
-    if nullable {
-        quote! { { let __off = __on_disk.#fname; if __off != 0 { #core } } }
-    } else {
-        quote! { { let __off = __on_disk.#fname; #core } }
-    }
+    // The `__off != 0` guard is unconditional (matching `weak_drop_stmt` and the
+    // clone emitter): teardown reads the offset off disk, and a truncated file, a
+    // crashed writer, or an interpreted mutator has no obligation to honour a
+    // non-nullable field's invariant — a null must skip cleanly, not become a
+    // `Child`-sized free at offset 0. `nullable` only governs the *type-level*
+    // accessor surface, not the defensive read here.
+    let _ = nullable;
+    quote! { { let __off = __on_disk.#fname; if __off != 0 { #core } } }
 }
 
 /// Teardown statement for a `#[bstack_weak]` field, which stores the child's
@@ -1791,16 +2068,16 @@ pub(crate) fn weak_drop_stmt(fname: &Ident, inner_ty: &Type) -> TokenStream {
             let __off = __on_disk.#fname;
             if __off != 0 {
                 let __ctrl = unsafe {
-                    ::bstack_raii::BStackRef::<
+                    unsafe { ::bstack_raii::BStackRef::<
                         <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                     >::from_range(::bstack_raii::BStackRange::new(
                         __off,
                         ::core::mem::size_of::<
                             <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                         >() as u64,
-                    ))
+                    )) }
                 };
-                ::bstack_raii::WeakRef::<#inner_ty>(__ctrl).bstack_drop(allocator)?;
+                unsafe { ::bstack_raii::WeakRef::<#inner_ty>::new(__ctrl) }.bstack_drop(allocator)?;
             }
         }
     }
@@ -1819,14 +2096,14 @@ pub(crate) fn clone_field_stmt(fname: &Ident, inner_ty: &Type, kind: Kind) -> Op
             {
                 let __coff: u64 = __od.#fname;
                 if __coff != 0 {
-                    let __child = <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
+                    let __child = unsafe { <#inner_ty as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
                             __coff,
                             ::core::mem::size_of::<
                                 <#inner_ty as ::bstack_raii::BStackBlock>::OnDisk
                             >() as u64,
                         ),
-                    );
+                    ) };
                     let __new = __child.__bstack_clone_into(allocator, __plan)?;
                     __od.#fname = __new.start();
                 }
@@ -1856,7 +2133,7 @@ pub(crate) fn clone_field_stmt(fname: &Ident, inner_ty: &Type, kind: Kind) -> Op
             {
                 let __coff: u64 = __od.#fname;
                 if __coff != 0 {
-                    __plan.bump_weak(__coff);
+                    __plan.bump_weak(__coff)?;
                 }
             }
         }),
@@ -1878,7 +2155,7 @@ pub(crate) fn shared_impl(mode: Mode, name: &Ident) -> TokenStream {
                     allocator: &__A,
                 ) -> ::std::io::Result<()> {
                     use ::bstack_raii::BStackDrop as _;
-                    ::bstack_raii::StrongRef(data).bstack_drop(allocator)
+                    unsafe { ::bstack_raii::StrongRef::new(data) }.bstack_drop(allocator)
                 }
                 fn strong_parts<__A: ::bstack_raii::BStackRaiiAllocator>(
                     data: ::bstack_raii::BStackRef<Self>,
@@ -1898,7 +2175,7 @@ pub(crate) fn shared_impl(mode: Mode, name: &Ident) -> TokenStream {
                     allocator: &__A,
                 ) -> ::std::io::Result<()> {
                     use ::bstack_raii::BStackDrop as _;
-                    ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?
+                    unsafe { ::bstack_raii::StrongWeakRef::from_disk(data, allocator)? }
                         .bstack_drop(allocator)
                 }
                 fn strong_parts<__A: ::bstack_raii::BStackRaiiAllocator>(
@@ -1908,10 +2185,10 @@ pub(crate) fn shared_impl(mode: Mode, name: &Ident) -> TokenStream {
                     ::bstack_raii::BStackRef<Self>,
                     ::core::option::Option<::bstack_raii::BStackRange>,
                 )> {
-                    let __swr = ::bstack_raii::StrongWeakRef::from_disk(data, allocator)?;
+                    let __swr = unsafe { ::bstack_raii::StrongWeakRef::from_disk(data, allocator)? };
                     ::std::result::Result::Ok((
-                        __swr.0,
-                        ::core::option::Option::Some(__swr.1.into_range()),
+                        __swr.data_ref(),
+                        ::core::option::Option::Some(__swr.ctrl_ref().into_range()),
                     ))
                 }
             }
@@ -1925,6 +2202,7 @@ pub(crate) fn weakable_items(
     mode: Mode,
     name: &Ident,
     control: &Ident,
+    ctrl_eightcc: &TokenStream,
     vis: &syn::Visibility,
 ) -> TokenStream {
     if mode == Mode::RcWeak {
@@ -1942,6 +2220,7 @@ pub(crate) fn weakable_items(
 
             impl ::bstack_raii::BStackWeakable for #name {
                 type Control = #control;
+                fn control_eightcc() -> ::bstack_raii::EightCC { #ctrl_eightcc }
             }
         }
     } else {
@@ -1953,17 +2232,20 @@ pub(crate) fn weakable_items(
 /// the inline `ForeignRepr` slot, the lifetime-bound accessor, ctor wiring,
 /// per-kind cross-file teardown / deep-clone, `bstack_move!` RAII-dual pieces, and
 /// (for `#[bstack_mut]`) the `replace_` / `set_` mutators.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn foreign_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     ftarget: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
-    type_params: &[&Ident],
 ) -> syn::Result<FieldParts> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        type_params,
+        ..
+    } = ctx;
     let mut parts = FieldParts::default();
     let getter = format_ident!("get_{}", fname);
     validate_foreign_target(
@@ -1985,31 +2267,36 @@ pub(crate) fn foreign_field(
     // `bstack_move!` hands an owning foreign field back as its RAII dual
     // (`ForeignOwned` / `ForeignRc` / `ForeignWeak`, each with `bstack_drop` +
     // `into_foreign`); a `#[bstack_ref]` yields a plain `Foreign` (owns nothing).
+    // `#cap` is the on-disk repr captured from the block; resolve a SELF pointer to
+    // this file's registered id (`__stack` is the home stack, in scope in the
+    // generated `bstack_move`) before the dual escapes, so it can't later be
+    // re-stored into another file. Fallible — `bstack_move` returns `io::Result`.
+    let resolved_cap = quote!(::bstack_raii::__private::resolve_self_repr(#cap, __stack)?);
     let (mv_leaf_ty, mv_leaf_expr) = match kind {
         Kind::Owned => (
             quote!(::bstack_raii::ForeignOwned<'__mv, #ftarget>),
             quote!(unsafe {
                 ::bstack_raii::ForeignOwned::from_foreign(
-                    ::bstack_raii::Foreign::from_repr(#cap))
+                    ::bstack_raii::Foreign::from_repr(#resolved_cap))
             }),
         ),
         Kind::Strong => (
             quote!(::bstack_raii::ForeignRc<'__mv, #ftarget>),
             quote!(unsafe {
                 ::bstack_raii::ForeignRc::from_foreign(
-                    ::bstack_raii::Foreign::from_repr(#cap))
+                    ::bstack_raii::Foreign::from_repr(#resolved_cap))
             }),
         ),
         Kind::Weak => (
             quote!(::bstack_raii::ForeignWeak<'__mv, #ftarget>),
             quote!(unsafe {
                 ::bstack_raii::ForeignWeak::from_foreign(
-                    ::bstack_raii::Foreign::from_repr(#cap))
+                    ::bstack_raii::Foreign::from_repr(#resolved_cap))
             }),
         ),
         _ => (
             quote!(::bstack_raii::Foreign<'__mv, #ftarget>),
-            quote!(unsafe { ::bstack_raii::Foreign::from_repr(#cap) }),
+            quote!(unsafe { ::bstack_raii::Foreign::from_repr(#resolved_cap) }),
         ),
     };
 
@@ -2026,15 +2313,17 @@ pub(crate) fn foreign_field(
                 let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                 let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                 let __p = __od.#fname;
-                ::std::result::Result::Ok(if __p.offset() == 0 {
+                let __out = if __p.offset() == 0 {
                     ::core::option::Option::None
                 } else {
-                    // SAFETY: `__p` was stored into this file; the returned
-                    // `Foreign`'s lifetime is bound to `stack` by the signature.
+                    // Resolve SELF to this file's registered id before it escapes.
+                    let __repr = ::bstack_raii::__private::resolve_self_repr(__p, stack)?;
+                    // SAFETY: `__repr` names a valid `T` stored into this file.
                     ::core::option::Option::Some(unsafe {
-                        ::bstack_raii::Foreign::from_repr(__p)
+                        ::bstack_raii::Foreign::from_repr(__repr)
                     })
-                })
+                };
+                ::std::result::Result::Ok(__out)
             }
         });
         parts
@@ -2042,7 +2331,9 @@ pub(crate) fn foreign_field(
             .push(quote!(#fname: ::core::option::Option<#field_ty>,));
         parts.ctor_preps.push(quote! {
             let #fname: ::bstack_raii::ForeignRepr = match #fname {
-                ::core::option::Option::Some(__f) => __f.repr(),
+                // Re-encode a pointer to the home file as SELF.
+                ::core::option::Option::Some(__f) =>
+                    ::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack()),
                 ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
             };
         });
@@ -2068,16 +2359,23 @@ pub(crate) fn foreign_field(
                 let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                 let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                 let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
-                // SAFETY: stored into this file; bound to `stack` by the signature.
+                // Resolve a SELF pointer to this file's registered id before it
+                // escapes, so it can't be mis-stored into another file.
+                let __repr = ::bstack_raii::__private::resolve_self_repr(__od.#fname, stack)?;
+                // SAFETY: `__repr` came from this block's stored field (SELF now an
+                // explicit registered id), so it names a valid `T`.
                 ::std::result::Result::Ok(unsafe {
-                    ::bstack_raii::Foreign::from_repr(__od.#fname)
+                    ::bstack_raii::Foreign::from_repr(__repr)
                 })
             }
         });
         parts.ctor_params.push(quote!(#fname: #field_ty,));
-        parts
-            .ctor_preps
-            .push(quote!(let #fname: ::bstack_raii::ForeignRepr = #fname.repr();));
+        parts.ctor_preps.push(quote!(
+            // Re-encode a pointer to the home file as SELF, keeping the
+            // on-disk form portable across re-attaches.
+            let #fname: ::bstack_raii::ForeignRepr =
+                ::bstack_raii::__private::home_relative_repr(#fname.repr(), allocator.stack());
+        ));
         parts.ctor_inits.push(quote!(#fname: #fname,));
         parts.mv_types.push(quote!(#mv_leaf_ty));
         parts.mv_recon.push(quote!(#mv_leaf_expr));
@@ -2150,11 +2448,12 @@ pub(crate) fn foreign_field(
                     let __fid = __fp.file_id();
                     if __fid == 0 {
                         // SELF: deep-clone into the home plan (one atomic commit).
-                        let __child = <#ftarget as ::bstack_raii::BStackBlock>::from_range(
+                        let __child = unsafe { <#ftarget as ::bstack_raii::BStackBlock>::from_range(
                             ::bstack_raii::BStackRange::new(__off, #target_od_size),
-                        );
+                        ) };
                         let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                        __od.#fname = ::bstack_raii::ForeignRepr::new(0, __new.start());
+                        __od.#fname = ::bstack_raii::ForeignRepr::new(0, __new.start())
+                            .with_type_index(__fp.type_index());
                     } else if __plan.is_measuring() {
                         // Foreign deep-clone is eager cross-file work; the
                         // measure pass (home-file sizes only) skips it, so it
@@ -2175,7 +2474,8 @@ pub(crate) fn foreign_field(
                                 &__adapter, __off,
                             )?
                         };
-                        __od.#fname = ::bstack_raii::ForeignRepr::new(__fid, __new_off);
+                        __od.#fname = ::bstack_raii::ForeignRepr::new(__fid, __new_off)
+                            .with_type_index(__fp.type_index());
                     } else {
                         return ::std::result::Result::Err(::std::io::Error::new(
                             ::std::io::ErrorKind::InvalidData,
@@ -2237,7 +2537,7 @@ pub(crate) fn foreign_field(
                     let __fid = __fp.file_id();
                     if __fid == 0 {
                         // SELF: bump the weak count via the home plan (atomic).
-                        __plan.bump_weak(__off);
+                        __plan.bump_weak(__off)?;
                     } else if __plan.is_measuring() {
                         // Foreign refcount bump is eager cross-file work; done
                         // once, in the build pass (measure skips it).
@@ -2290,19 +2590,22 @@ pub(crate) fn foreign_field(
 /// forms) field to its [`FieldParts`]: the inline `VecDesc` slot, the `BStackVec`-
 /// family accessor, ctor wiring, per-kind teardown / deep-clone, and `bstack_move!`
 /// pieces. `vinfo` is the element/`is_string` classification from `util::vec_info`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn vec_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     opt_inner: &Type,
     vinfo: VecInfo,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
-    type_params: &[&Ident],
-    const_params: &[&Ident],
 ) -> syn::Result<FieldParts> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        type_params,
+        const_params,
+        ..
+    } = ctx;
     let mut parts = FieldParts::default();
     let getter = format_ident!("get_{}", fname);
     let elem = &vinfo.elem;
@@ -2344,41 +2647,56 @@ pub(crate) fn vec_field(
         )?;
 
         let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
-        let field_loc =
-            quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
+        let field_loc = quote!(::bstack_raii::__private::checked_field_offset(
+            self.0.start(),
+            ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
+        )?);
         let field_ty = if elem_nullable {
             quote!(::core::option::Option<::bstack_raii::Foreign<#ftarget>>)
         } else {
             quote!(::bstack_raii::Foreign<#ftarget>)
         };
-        // The accessor binds each returned `Foreign`'s lifetime to `'__v` (the
-        // allocator borrow it read through), so a `SELF` element cannot escape it.
+        // The accessor resolves each SELF element to this file's registered id
+        // before it escapes, so it cannot be mis-stored into another file.
         let acc_elem_ty = if elem_nullable {
             quote!(::core::option::Option<::bstack_raii::Foreign<'__v, #ftarget>>)
         } else {
             quote!(::bstack_raii::Foreign<'__v, #ftarget>)
         };
-        // Map a stored `ForeignRepr` ↔ the element type (offset 0 ⇒ `None` when
-        // the element is `Option`-wrapped). SAFETY: each repr was stored into
-        // this file; the returned `Foreign`s are `'__v`-bound by the accessor.
+        // Map a stored `ForeignRepr` ↔ the element type (offset 0 ⇒ `None` when the
+        // element is `Option`-wrapped). Read: resolve a SELF pointer to this file's
+        // registered id before it escapes (fallible — collected into a
+        // `Result`). Write: re-encode a home pointer back to SELF.
         let from_ptr = if elem_nullable {
-            quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
-                ::core::option::Option::None
-            } else {
-                ::core::option::Option::Some(
-                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+            quote!(|__p: ::bstack_raii::ForeignRepr|
+                        -> ::std::io::Result<#acc_elem_ty> {
+                if __p.offset() == 0 {
+                    ::std::result::Result::Ok(::core::option::Option::None)
+                } else {
+                    let __repr =
+                        ::bstack_raii::__private::resolve_self_repr(__p, allocator.stack())?;
+                    ::std::result::Result::Ok(::core::option::Option::Some(
+                        unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }))
+                }
             })
         } else {
             quote!(|__p: ::bstack_raii::ForeignRepr|
-                        unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                        -> ::std::io::Result<#acc_elem_ty> {
+                let __repr =
+                    ::bstack_raii::__private::resolve_self_repr(__p, allocator.stack())?;
+                ::std::result::Result::Ok(
+                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
+            })
         };
         let to_ptr = if elem_nullable {
             quote!(|__f: #field_ty| match __f {
-                ::core::option::Option::Some(__ff) => __ff.repr(),
+                ::core::option::Option::Some(__ff) =>
+                    ::bstack_raii::__private::home_relative_repr(__ff.repr(), allocator.stack()),
                 ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
             })
         } else {
-            quote!(|__f: #field_ty| __f.repr())
+            quote!(|__f: #field_ty|
+                        ::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack()))
         };
 
         // ---- Accessor: `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>` (or `Option<..>`) ----
@@ -2390,7 +2708,7 @@ pub(crate) fn vec_field(
                         __v.to_vec()?
                             .into_iter()
                             .map(#from_ptr)
-                            .collect()),
+                            .collect::<::std::io::Result<::std::vec::Vec<_>>>()?),
                     ::core::option::Option::None => ::core::option::Option::None,
                 }),
             )
@@ -2401,7 +2719,7 @@ pub(crate) fn vec_field(
                             .to_vec()?
                             .into_iter()
                             .map(#from_ptr)
-                            .collect()),
+                            .collect::<::std::io::Result<::std::vec::Vec<_>>>()?),
             )
         };
         parts.accessors.push(quote! {
@@ -2446,8 +2764,9 @@ pub(crate) fn vec_field(
         let drop_loop = if matches!(kind, Kind::Ref) {
             quote!()
         } else {
+            // SAFETY (emitted): `__desc` is this type's own inline field.
             quote! {
-                for __fp in #store::from_desc(__desc, allocator).to_vec()? { #elem_drop }
+                for __fp in unsafe { #store::from_desc(__desc, allocator) }.to_vec()? { #elem_drop }
             }
         };
         parts.drop_stmts.push(quote! {
@@ -2455,7 +2774,7 @@ pub(crate) fn vec_field(
                 let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
                 if __desc.data_off != 0 {
                     #drop_loop
-                    #store::from_desc(__desc, allocator).bstack_drop()?;
+                    unsafe { #store::from_desc(__desc, allocator) }.bstack_drop()?;
                 }
             }
         });
@@ -2466,7 +2785,7 @@ pub(crate) fn vec_field(
             {
                 let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
                 if __srcdesc.data_off != 0 {
-                    let __src = #store::from_desc(__srcdesc, allocator).to_vec()?;
+                    let __src = unsafe { #store::from_desc(__srcdesc, allocator) }.to_vec()?;
                     let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
                         ::std::vec::Vec::with_capacity(__src.len());
                     for __fp in __src {
@@ -2479,13 +2798,73 @@ pub(crate) fn vec_field(
             }
         });
 
-        // ---- Move: the raw `ForeignPtr` vector handle ----
-        let (mvt, mvr) = wrap_vec_move(
-            quote!(::bstack_raii::BStackVec<'__mv, ::bstack_raii::ForeignRepr, __A>),
-            quote!(::bstack_raii::BStackVec::from_desc(#cap, __alloc)),
-            &cap,
-            nullable,
-        );
+        // ---- Move: hand back a `Vec` of the per-element RAII dual, not the raw
+        // `ForeignRepr` store. An owning kind yields the freeable
+        // `ForeignOwned` / `ForeignRc` / `ForeignWeak` (each `bstack_drop`-able or
+        // re-storable); a `ref` yields a plain `Foreign`. Every element is resolved
+        // to an explicit id. The `ForeignRepr` storage block is freed here —
+        // its pointers now live in the returned duals.
+        let (dual_ty, wrap) = match kind {
+            Kind::Owned => (
+                quote!(::bstack_raii::ForeignOwned<'__mv, #ftarget>),
+                quote!(::bstack_raii::ForeignOwned::from_foreign(
+                    ::bstack_raii::Foreign::from_repr(__repr)
+                )),
+            ),
+            Kind::Strong => (
+                quote!(::bstack_raii::ForeignRc<'__mv, #ftarget>),
+                quote!(::bstack_raii::ForeignRc::from_foreign(
+                    ::bstack_raii::Foreign::from_repr(__repr)
+                )),
+            ),
+            Kind::Weak => (
+                quote!(::bstack_raii::ForeignWeak<'__mv, #ftarget>),
+                quote!(::bstack_raii::ForeignWeak::from_foreign(
+                    ::bstack_raii::Foreign::from_repr(__repr)
+                )),
+            ),
+            _ => (
+                quote!(::bstack_raii::Foreign<'__mv, #ftarget>),
+                quote!(::bstack_raii::Foreign::from_repr(__repr)),
+            ),
+        };
+        let leaf_ty = if elem_nullable {
+            quote!(::core::option::Option<#dual_ty>)
+        } else {
+            dual_ty.clone()
+        };
+        let push_expr = if elem_nullable {
+            quote! {
+                if __p.offset() == 0 {
+                    ::core::option::Option::None
+                } else {
+                    let __repr =
+                        ::bstack_raii::__private::resolve_self_repr(__p, __alloc.stack())?;
+                    ::core::option::Option::Some(unsafe { #wrap })
+                }
+            }
+        } else {
+            quote! {{
+                let __repr = ::bstack_raii::__private::resolve_self_repr(__p, __alloc.stack())?;
+                unsafe { #wrap }
+            }}
+        };
+        // SAFETY (emitted): `#cap` is this field's own inline descriptor, captured
+        // before the parent shell is freed; the data block it names is freed here.
+        let build = quote! {{
+            let __vec = unsafe {
+                ::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>::from_desc(#cap, __alloc)
+            };
+            let __reprs = __vec.to_vec()?;
+            __vec.bstack_drop()?;
+            let mut __out: ::std::vec::Vec<#leaf_ty> =
+                ::std::vec::Vec::with_capacity(__reprs.len());
+            for __p in __reprs {
+                __out.push(#push_expr);
+            }
+            __out
+        }};
+        let (mvt, mvr) = wrap_vec_move(quote!(::std::vec::Vec<#leaf_ty>), build, &cap, nullable);
         parts.mv_types.push(mvt);
         parts.mv_recon.push(mvr);
         return Ok(parts);
@@ -2509,8 +2888,10 @@ pub(crate) fn vec_field(
         let size_elem = quote!(::core::mem::size_of::<
                     <#elem_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
         let store = quote!(::bstack_raii::BStackVec::<u64, __A>);
-        let field_loc =
-            quote!(self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64);
+        let field_loc = quote!(::bstack_raii::__private::checked_field_offset(
+            self.0.start(),
+            ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
+        )?);
         let is_weak = kind == Kind::Weak;
         let (ctrl_ty, ctrl_size) = (
             quote!(<#elem_ty as ::bstack_raii::BStackWeakable>::Control),
@@ -2559,13 +2940,13 @@ pub(crate) fn vec_field(
                         ::core::option::Option::None
                     } else {
                         ::core::option::Option::Some(
-                            <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                            unsafe { <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__o, #size_elem)) })
                     }
                 })
             } else {
-                quote!(<#elem_ty as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__grp[#k], #size_elem)))
+                quote!(unsafe { <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__grp[#k], #size_elem)) })
             }
         };
         let build_body = nested_build(&dims, &view_leaf, &view_read);
@@ -2680,20 +3061,20 @@ pub(crate) fn vec_field(
 
         // ---- Teardown: free each child per kind, then the offset block ----
         let free_child = match kind {
-            Kind::Owned => quote!(::bstack_raii::OwnedRef(unsafe {
+            Kind::Owned => quote!(unsafe { ::bstack_raii::OwnedRef::new(
                         ::bstack_raii::BStackRef::<#elem_ty>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #size_elem))
-                    }).bstack_drop(allocator)?;),
+                            ::bstack_raii::BStackRange::new(__off, #size_elem)))
+                    }.bstack_drop(allocator)?;),
             Kind::Strong => {
                 quote!(<#elem_ty as ::bstack_raii::BStackShared>::drop_strong_ref(
                         unsafe { ::bstack_raii::BStackRef::<#elem_ty>::from_range(
                             ::bstack_raii::BStackRange::new(__off, #size_elem)) },
                         allocator)?;)
             }
-            Kind::Weak => quote!(::bstack_raii::WeakRef::<#elem_ty>(unsafe {
+            Kind::Weak => quote!(unsafe { ::bstack_raii::WeakRef::<#elem_ty>::new(
                         ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #ctrl_size))
-                    }).bstack_drop(allocator)?;),
+                            ::bstack_raii::BStackRange::new(__off, #ctrl_size)))
+                    }.bstack_drop(allocator)?;),
             Kind::Ref => quote!(),
             _ => unreachable!(),
         };
@@ -2701,7 +3082,7 @@ pub(crate) fn vec_field(
             quote!()
         } else {
             quote! {
-                for __off in #store::from_desc(__desc, allocator).to_vec()? {
+                for __off in unsafe { #store::from_desc(__desc, allocator) }.to_vec()? {
                     if __off != 0 { #free_child }
                 }
             }
@@ -2711,7 +3092,7 @@ pub(crate) fn vec_field(
                 let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
                 if __desc.data_off != 0 {
                     #free_children
-                    #store::from_desc(__desc, allocator).bstack_drop()?;
+                    unsafe { #store::from_desc(__desc, allocator) }.bstack_drop()?;
                 }
             }
         });
@@ -2720,14 +3101,14 @@ pub(crate) fn vec_field(
         //      ref copies verbatim (all staged into the plan) ----
         let clone_body = match kind {
             Kind::Owned => quote! {
-                let __flat = #store::from_desc(__srcdesc, allocator).to_vec()?;
+                let __flat = unsafe { #store::from_desc(__srcdesc, allocator) }.to_vec()?;
                 let mut __new: ::std::vec::Vec<u64> =
                     ::std::vec::Vec::with_capacity(__flat.len());
                 for __off in __flat {
                     if __off != 0 {
                         __new.push(
-                            <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(__off, #size_elem))
+                            unsafe { <#elem_ty as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #size_elem)) }
                                 .__bstack_clone_into(allocator, __plan)?.start());
                     } else {
                         __new.push(0u64);
@@ -2737,7 +3118,7 @@ pub(crate) fn vec_field(
                     allocator, ::bstack_raii::bytemuck::cast_slice(&__new))?;
             },
             Kind::Strong => quote! {
-                for __off in #store::from_desc(__srcdesc, allocator).to_vec()? {
+                for __off in unsafe { #store::from_desc(__srcdesc, allocator) }.to_vec()? {
                     if __off != 0 {
                         __plan.bump_strong(unsafe {
                             ::bstack_raii::BStackRef::<#elem_ty>::from_range(
@@ -2745,18 +3126,18 @@ pub(crate) fn vec_field(
                         }, allocator)?;
                     }
                 }
-                __od.#fname = #store::from_desc(__srcdesc, allocator)
+                __od.#fname = unsafe { #store::from_desc(__srcdesc, allocator) }
                     .clone_data_into(__plan)?;
             },
             Kind::Weak => quote! {
-                for __off in #store::from_desc(__srcdesc, allocator).to_vec()? {
-                    if __off != 0 { __plan.bump_weak(__off); }
+                for __off in unsafe { #store::from_desc(__srcdesc, allocator) }.to_vec()? {
+                    if __off != 0 { __plan.bump_weak(__off)?; }
                 }
-                __od.#fname = #store::from_desc(__srcdesc, allocator)
+                __od.#fname = unsafe { #store::from_desc(__srcdesc, allocator) }
                     .clone_data_into(__plan)?;
             },
             Kind::Ref => quote! {
-                __od.#fname = #store::from_desc(__srcdesc, allocator)
+                __od.#fname = unsafe { #store::from_desc(__srcdesc, allocator) }
                     .clone_data_into(__plan)?;
             },
             _ => unreachable!(),
@@ -2772,6 +3153,15 @@ pub(crate) fn vec_field(
 
         // ---- Move: yield the flat block-vector handle (loses `[T; N]` shape) ----
         let (mvt, mvr) = block_vec_move(&cap, &elem_ts, vec_ty, nullable);
+        // Owning element handles (all but `ref`) are moved in and lost on a failed
+        // ctor step; hand the flat block-vector back (from its prep-local
+        // descriptor) rather than orphan it.
+        if !matches!(kind, Kind::Ref) {
+            parts
+                .ctor_handback
+                .push(mv_ty_as_ctor(&quote!({ let #cap = #fname; #mvr })));
+            parts.ctor_handback_ty.push(mv_ty_as_ctor(&mvt));
+        }
         parts.mv_types.push(mvt);
         parts.mv_recon.push(mvr);
         return Ok(parts);
@@ -2809,6 +3199,7 @@ pub(crate) fn vec_field(
                 quote!(BStackBlockVec),
                 quote!(::bstack_raii::BStackOwned<#elem>),
                 nullable,
+                true,
             ),
             block_vec_move(&cap, elem, quote!(BStackBlockVec), nullable),
         ),
@@ -2828,6 +3219,7 @@ pub(crate) fn vec_field(
                 quote!(BStackStrongVec),
                 quote!(::bstack_raii::BStackRc<'__ctor, #elem, __A>),
                 nullable,
+                true,
             ),
             block_vec_move(&cap, elem, quote!(BStackStrongVec), nullable),
         ),
@@ -2847,6 +3239,7 @@ pub(crate) fn vec_field(
                 quote!(BStackWeakVec),
                 quote!(::bstack_raii::BStackWeak<'__ctor, #elem, __A>),
                 nullable,
+                true,
             ),
             block_vec_move(&cap, elem, quote!(BStackWeakVec), nullable),
         ),
@@ -2859,6 +3252,7 @@ pub(crate) fn vec_field(
                 quote!(BStackRefVec),
                 quote!(::bstack_raii::BStackRef<#elem>),
                 nullable,
+                false,
             ),
             block_vec_move(&cap, elem, quote!(BStackRefVec), nullable),
         ),
@@ -2871,6 +3265,15 @@ pub(crate) fn vec_field(
     parts.ctor_preps.push(prep);
     parts.ctor_inits.push(init);
     let (mv_ty, mv_rc) = mv;
+    // A vec of *owning* element handles is moved in and lost on a failed ctor
+    // step; hand the whole vector back (reconstructed from its prep-local
+    // descriptor) rather than orphan it. A `ref`/`pod` vec owns no handles.
+    if matches!(kind, Kind::Owned | Kind::Strong | Kind::Weak) {
+        parts
+            .ctor_handback
+            .push(mv_ty_as_ctor(&quote!({ let #cap = #fname; #mv_rc })));
+        parts.ctor_handback_ty.push(mv_ty_as_ctor(&mv_ty));
+    }
     parts.mv_types.push(mv_ty);
     parts.mv_recon.push(mv_rc);
     Ok(parts)
@@ -2880,17 +3283,20 @@ pub(crate) fn vec_field(
 /// `Option` included) to its [`FieldParts`] — N independent inline `VecDesc`s,
 /// each owning its own data block. Returns `Ok(None)` if the field isn't an array
 /// whose leaf is a `Vec` / `String` (so the caller falls through to the next shape).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn vec_array_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     opt_inner: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
-    const_params: &[&Ident],
 ) -> syn::Result<Option<FieldParts>> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        const_params,
+        ..
+    } = ctx;
     let Type::Array(_) = opt_inner else {
         return Ok(None);
     };
@@ -2971,7 +3377,7 @@ pub(crate) fn vec_array_field(
                 allocator: &'__v __A,
             ) -> ::std::io::Result<#acc_ret> {
                 let __base =
-                    self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 ::std::result::Result::Ok(#acc_body)
             }
         });
@@ -3009,8 +3415,22 @@ pub(crate) fn vec_array_field(
                     quote!(::bstack_raii::BStackVec::<#elem, __A>::from_slice(
                                 allocator, #data)?.descriptor())
                 }
-                _ => quote!(::bstack_raii::#vec_ty::<#elem, __A>::from_handles(
+                // A `ref` vec owns nothing, so its `from_handles` is a plain
+                // `io::Result` — propagate directly.
+                Kind::Ref => quote!(::bstack_raii::#vec_ty::<#elem, __A>::from_handles(
                             allocator, #b)?.descriptor()),
+                // Owning element kinds hand children back on failure;
+                // reclaim them here and propagate (full ctor hand-back is
+                // deferred).
+                _ => {
+                    quote!(match ::bstack_raii::#vec_ty::<#elem, __A>::from_handles(allocator, #b) {
+                        ::core::result::Result::Ok(__v) => __v.descriptor(),
+                        ::core::result::Result::Err(__e) => {
+                            ::core::mem::drop(__e.value);
+                            return ::core::result::Result::Err(::core::convert::Into::into(__e.source));
+                        }
+                    })
+                }
             }
         };
         let ctor_write = |k: &Ident, leaf: &Ident| {
@@ -3047,8 +3467,8 @@ pub(crate) fn vec_array_field(
                 let __descs: [::bstack_raii::VecDesc; #total] = __on_disk.#fname;
                 for __k in 0usize..(#total) {
                     if __descs[__k].data_off != 0 {
-                        ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
-                            __descs[__k], allocator).bstack_drop()?;
+                        unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
+                            __descs[__k], allocator) }.bstack_drop()?;
                     }
                 }
             }
@@ -3057,19 +3477,21 @@ pub(crate) fn vec_array_field(
         // Clone: deep-clone each vector's data block per the element
         // relationship, repointing the slot descriptor (a `0` niche is kept).
         let clone_expr = match kind {
-            Kind::Pod => quote!(::bstack_raii::BStackVec::<#elem, __A>::from_desc(
-                        __sd, allocator).clone_data_into(__plan)?),
-            Kind::Owned => quote!(::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(
-                        __sd, allocator).clone_into(__plan, |__er, __p| {
-                            <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+            Kind::Pod => quote!(unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                        __sd, allocator) }.clone_data_into(__plan)?),
+            Kind::Owned => quote!(unsafe { ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(
+                        __sd, allocator) }.clone_into(__plan, |__er, __p| {
+                            unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(__er) }
                                 .__bstack_clone_into(allocator, __p)
                         })?),
-            Kind::Strong => quote!(::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(
-                        __sd, allocator).clone_into(__plan)?),
-            Kind::Weak => quote!(::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(
-                        __sd, allocator).clone_into(__plan)?),
-            Kind::Ref => quote!(::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(
-                        __sd, allocator).clone_into(__plan)?),
+            Kind::Strong => {
+                quote!(unsafe { ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(
+                        __sd, allocator) }.clone_into(__plan)?)
+            }
+            Kind::Weak => quote!(unsafe { ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(
+                        __sd, allocator) }.clone_into(__plan)?),
+            Kind::Ref => quote!(unsafe { ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(
+                        __sd, allocator) }.clone_into(__plan)?),
             Kind::Embed => unreachable!(),
         };
         parts.clone_stmts.push(quote! {
@@ -3094,23 +3516,34 @@ pub(crate) fn vec_array_field(
         } else {
             mv_handle.clone()
         };
-        parts.mv_types.push(nested_ty(&dims, &mv_leaf));
+        let mv_ty = nested_ty(&dims, &mv_leaf);
         let mv_read = |k: &Ident| {
             if leaf_nullable {
                 quote!({
                     let __d = #cap[#k];
                     if __d.data_off != 0 {
                         ::core::option::Option::Some(
-                            ::bstack_raii::#vec_ty::from_desc(__d, __alloc))
+                            unsafe { ::bstack_raii::#vec_ty::from_desc(__d, __alloc) })
                     } else {
                         ::core::option::Option::None
                     }
                 })
             } else {
-                quote!(::bstack_raii::#vec_ty::from_desc(#cap[#k], __alloc))
+                quote!(unsafe { ::bstack_raii::#vec_ty::from_desc(#cap[#k], __alloc) })
             }
         };
-        parts.mv_recon.push(nested_build(&dims, &mv_leaf, &mv_read));
+        let mv_rc = nested_build(&dims, &mv_leaf, &mv_read);
+        // An array of vectors of *owning* element handles is moved in and lost on a
+        // failed ctor step; hand the nested handle array back (from its prep-local
+        // descriptor array) rather than orphan it. `ref`/`pod` own nothing.
+        if matches!(kind, Kind::Owned | Kind::Strong | Kind::Weak) {
+            parts
+                .ctor_handback
+                .push(mv_ty_as_ctor(&quote!({ let #cap = #fname; #mv_rc })));
+            parts.ctor_handback_ty.push(mv_ty_as_ctor(&mv_ty));
+        }
+        parts.mv_types.push(mv_ty);
+        parts.mv_recon.push(mv_rc);
         return Ok(Some(parts));
     }
     Ok(None)
@@ -3120,18 +3553,21 @@ pub(crate) fn vec_array_field(
 /// `Option`) to its [`FieldParts`] — a flat `[ForeignRepr; TOTAL]` inline, each
 /// slot's teardown / deep-clone dispatching cross-file like a scalar `Foreign`.
 /// Returns `Ok(None)` if the field isn't an array whose leaf is a `Foreign`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn foreign_array_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     opt_inner: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
-    type_params: &[&Ident],
-    const_params: &[&Ident],
 ) -> syn::Result<Option<FieldParts>> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        type_params,
+        const_params,
+        ..
+    } = ctx;
     let Type::Array(_) = opt_inner else {
         return Ok(None);
     };
@@ -3163,8 +3599,8 @@ pub(crate) fn foreign_array_field(
             .push(quote!(#fname: [::bstack_raii::ForeignRepr; #total],));
 
         // ---- Accessor: nested `[[Foreign<T>; ..]; ..]` (Option per slot) ----
-        // Each returned `Foreign`'s lifetime is bound to `'__f` (the `stack`
-        // borrow), so a `SELF` slot cannot escape the file it was read from.
+        // Each SELF slot is resolved to this file's registered id before it escapes,
+        // so it cannot be mis-stored into another file.
         let leaf_ty = if aleaf_nullable {
             quote!(::core::option::Option<::bstack_raii::Foreign<'__f, #ftarget>>)
         } else {
@@ -3172,19 +3608,25 @@ pub(crate) fn foreign_array_field(
         };
         let acc_ret = nested_ty(&adims, &leaf_ty);
         let acc_read = |k: &Ident| {
-            // SAFETY: each slot repr was stored into this file; bound to `'__f`.
+            // `resolve_self_repr` is fallible; the `?` propagates to the accessor's
+            // `io::Result` (nested_build emits plain blocks, not a closure).
             if aleaf_nullable {
                 quote!({
                     let __p = __arr[#k];
                     if __p.offset() == 0 {
                         ::core::option::Option::None
                     } else {
+                        let __repr = ::bstack_raii::__private::resolve_self_repr(__p, stack)?;
                         ::core::option::Option::Some(
-                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
                     }
                 })
             } else {
-                quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__arr[#k]) })
+                quote!({
+                    let __repr =
+                        ::bstack_raii::__private::resolve_self_repr(__arr[#k], stack)?;
+                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }
+                })
             }
         };
         let acc_body = nested_build(&adims, &leaf_ty, &acc_read);
@@ -3210,13 +3652,17 @@ pub(crate) fn foreign_array_field(
         let param_ty = nested_ty(&adims, &param_leaf);
         parts.ctor_params.push(quote!(#fname: #param_ty,));
         let ctor_write = |k: &Ident, leaf: &Ident| {
+            // Re-encode a pointer to the home file as SELF before storing.
             if aleaf_nullable {
                 quote!(__slots[#k] = match #leaf {
-                            ::core::option::Option::Some(__f) => __f.repr(),
+                            ::core::option::Option::Some(__f) =>
+                                ::bstack_raii::__private::home_relative_repr(
+                                    __f.repr(), allocator.stack()),
                             ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                         };)
             } else {
-                quote!(__slots[#k] = #leaf.repr();)
+                quote!(__slots[#k] = ::bstack_raii::__private::home_relative_repr(
+                    #leaf.repr(), allocator.stack());)
             }
         };
         let flatten = nested_consume(&adims, &quote!(#fname), &ctor_write);
@@ -3269,19 +3715,27 @@ pub(crate) fn foreign_array_field(
         };
         parts.mv_types.push(nested_ty(&adims, &mv_leaf));
         let mv_read = |k: &Ident| {
-            // SAFETY: each slot repr was stored into this file; bound to `'__mv`.
+            // Resolve each SELF slot to this file's registered id before the dual
+            // escapes. `?` propagates to `bstack_move`'s `io::Result`; `__stack`
+            // is the home stack it binds.
             if aleaf_nullable {
                 quote!({
                     let __p = #cap[#k];
                     if __p.offset() == 0 {
                         ::core::option::Option::None
                     } else {
+                        let __repr =
+                            ::bstack_raii::__private::resolve_self_repr(__p, __stack)?;
                         ::core::option::Option::Some(
-                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
                     }
                 })
             } else {
-                quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(#cap[#k]) })
+                quote!({
+                    let __repr =
+                        ::bstack_raii::__private::resolve_self_repr(#cap[#k], __stack)?;
+                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }
+                })
             }
         };
         parts
@@ -3296,18 +3750,21 @@ pub(crate) fn foreign_array_field(
 /// per-element `Option`, and the `#[embed]` / weak variants) to its [`FieldParts`]
 /// — a flat `[u64; N0*..*Nk]` (or inline embed) with per-element ownership. Returns
 /// `Ok(None)` for a POD array or a non-array (fall through to the POD scalar path).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn block_array_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     opt_inner: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
-    type_params: &[&Ident],
-    const_params: &[&Ident],
 ) -> syn::Result<Option<FieldParts>> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        type_params,
+        const_params,
+        ..
+    } = ctx;
     if kind == Kind::Pod {
         return Ok(None);
     }
@@ -3362,7 +3819,7 @@ pub(crate) fn block_array_field(
         parts.drop_stmts.push(quote! {
             {
                 let __base =
-                    __range.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                    ::bstack_raii::__private::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 for __k in 0usize..(#total) {
                     let __embed = ::bstack_raii::BStackRange::new(
@@ -3375,16 +3832,16 @@ pub(crate) fn block_array_field(
         // Accessor: nested `[[Child; ..]; ..]`, each a handle into its slot.
         let acc_ret = nested_ty(&dims, &quote!(#child));
         let acc_read = |k: &Ident| {
-            quote!(<#child as ::bstack_raii::BStackBlock>::from_range(
-                        ::bstack_raii::BStackRange::new(__base + (#k as u64) * __step, __step)))
+            quote!(unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__base + (#k as u64) * __step, __step)) })
         };
         let acc_body = nested_build(&dims, &quote!(#child), &acc_read);
         parts.accessors.push(quote! {
-            #vis fn #getter(&self) -> #acc_ret {
+            #vis fn #getter(&self) -> ::std::io::Result<#acc_ret> {
                 let __base =
-                    self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
-                #acc_body
+                ::std::result::Result::Ok(#acc_body)
             }
         });
 
@@ -3416,7 +3873,7 @@ pub(crate) fn block_array_field(
         parts.ctor_post.push(quote! {
             {
                 let __base =
-                    __data.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                    ::bstack_raii::__private::checked_field_offset(__data.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 for __k in 0usize..(#total) {
                     let __src = #src_id[__k];
@@ -3448,7 +3905,7 @@ pub(crate) fn block_array_field(
                 }
                 unsafe {
                     ::bstack_raii::BStackOwned::from_raw(
-                        <#child as ::bstack_raii::BStackBlock>::from_range(__r))
+                        unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(__r) })
                 }
             }}
         };
@@ -3458,18 +3915,37 @@ pub(crate) fn block_array_field(
             &mv_read,
         ));
 
+        // Failed-construction hand-back: before the post-write copy runs,
+        // each embedded child is still its own standalone block at `#src_id[k]`, so
+        // hand the array of them straight back — no re-home, infallibly.
+        let hb_read = |k: &Ident| {
+            quote!(unsafe {
+                ::bstack_raii::BStackOwned::from_raw(
+                    unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(#src_id[#k]) })
+            })
+        };
+        parts.ctor_handback.push(nested_build(
+            &dims,
+            &quote!(::bstack_raii::BStackOwned<#child>),
+            &hb_read,
+        ));
+        parts.ctor_handback_ty.push(nested_ty(
+            &dims,
+            &quote!(::bstack_raii::BStackOwned<#child>),
+        ));
+
         // Clone: fold each embedded child's clone inline (flat; copy the
         // array out, mutate, write back — packed fields can't be `&mut`'d).
         parts.clone_stmts.push(quote! {
             {
                 let __base =
-                    __src.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                    ::bstack_raii::__private::checked_field_offset(__src.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 let mut __arr: [#child_od; #total] = __od.#fname;
                 for __k in 0usize..(#total) {
-                    let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                    let __child = unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
-                            __base + (__k as u64) * __step, __step));
+                            __base + (__k as u64) * __step, __step)) };
                     __arr[__k] =
                         __child.__bstack_clone_children_inplace(allocator, __plan)?;
                 }
@@ -3499,19 +3975,37 @@ pub(crate) fn block_array_field(
                 allocator: &'__s __A,
                 index: usize,
                 weak: ::bstack_raii::BStackWeak<'__s, #elem, __A>,
-            ) -> ::std::io::Result<()> {
+            ) -> ::core::result::Result<
+                (),
+                ::bstack_raii::ReplaceError<::bstack_raii::BStackWeak<'__s, #elem, __A>>,
+            > {
+                // Bounds-check before computing the slot offset: an unchecked `index`
+                // would write the control offset past the array (into a neighboring
+                // field) and read a caller-influenced word back as a control offset to
+                // decrement / free. On rejection `weak` is handed back unharmed.
+                if index >= (#total) {
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(
+                        ::std::io::Error::new(
+                            ::std::io::ErrorKind::InvalidInput,
+                            "array index out of bounds",
+                        ),
+                        weak,
+                    ));
+                }
                 let __field = self.0.start()
                     + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
                     + (index as u64) * 8;
-                ::bstack_raii::set_weak_field(allocator, __field, weak)
+                // SAFETY (emitted): `__field` indexes this block's own weak array.
+                unsafe { ::bstack_raii::__private::set_weak_field(allocator, __field, weak) }
             }
         });
 
         let leaf_ty = quote!(::core::option::Option<::bstack_raii::BStackRc<'__u, #elem, __A>>);
         let acc_ret = nested_ty(&dims, &leaf_ty);
         let acc_read = |k: &Ident| {
-            quote!(::bstack_raii::upgrade_weak_field(
-                        allocator, __base + (#k as u64) * 8)?)
+            // SAFETY (emitted): `__base + k*8` indexes this block's own weak array.
+            quote!(unsafe { ::bstack_raii::__private::upgrade_weak_field(
+                        allocator, __base + (#k as u64) * 8)? })
         };
         let acc_body = nested_build(&dims, &leaf_ty, &acc_read);
         parts.accessors.push(quote! {
@@ -3520,7 +4014,7 @@ pub(crate) fn block_array_field(
                 allocator: &'__u __A,
             ) -> ::std::io::Result<#acc_ret> {
                 let __base =
-                    self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64;
+                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 ::std::result::Result::Ok(#acc_body)
             }
         });
@@ -3535,7 +4029,7 @@ pub(crate) fn block_array_field(
                             ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
                                 ::bstack_raii::BStackRange::new(__off, #ctrl_size))
                         };
-                        ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
+                        unsafe { ::bstack_raii::WeakRef::<#elem>::new(__ctrl) }.bstack_drop(allocator)?;
                     }
                 }
             }
@@ -3548,7 +4042,7 @@ pub(crate) fn block_array_field(
                 let __offs: [u64; #total] = __od.#fname;
                 for __off in __offs {
                     if __off != 0 {
-                        __plan.bump_weak(__off);
+                        __plan.bump_weak(__off)?;
                     }
                 }
             }
@@ -3598,13 +4092,13 @@ pub(crate) fn block_array_field(
                     ::core::option::Option::None
                 } else {
                     ::core::option::Option::Some(
-                        <#elem as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                        unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__o, #size_elem)) })
                 }
             })
         } else {
-            quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
-                        ::bstack_raii::BStackRange::new(__offs[#k], #size_elem)))
+            quote!(unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__offs[#k], #size_elem)) })
         }
     };
     let acc_body = nested_build(&dims, &leaf_view, &acc_read);
@@ -3675,10 +4169,10 @@ pub(crate) fn block_array_field(
     // Teardown: free / release each non-null element (a ref owns nothing).
     let per_teardown = match kind {
         Kind::Owned => quote! {
-            ::bstack_raii::OwnedRef(unsafe {
+            unsafe { ::bstack_raii::OwnedRef::new(
                 ::bstack_raii::BStackRef::<#elem>::from_range(
-                    ::bstack_raii::BStackRange::new(__off, #size_elem))
-            }).bstack_drop(allocator)?;
+                    ::bstack_raii::BStackRange::new(__off, #size_elem)))
+            }.bstack_drop(allocator)?;
         },
         Kind::Strong => quote! {
             <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(unsafe {
@@ -3707,8 +4201,8 @@ pub(crate) fn block_array_field(
                 for __k in 0usize..(#total) {
                     let __off = __arr[__k];
                     if __off != 0 {
-                        let __child = <#elem as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #size_elem));
+                        let __child = unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #size_elem)) };
                         __arr[__k] =
                             __child.__bstack_clone_into(allocator, __plan)?.start();
                     }
@@ -3742,8 +4236,8 @@ pub(crate) fn block_array_field(
             quote!(::bstack_raii::BStackOwned<#elem>),
             quote!(unsafe {
                 ::bstack_raii::BStackOwned::from_raw(
-                    <#elem as ::bstack_raii::BStackBlock>::from_range(
-                        ::bstack_raii::BStackRange::new(__off, #size_elem)))
+                    unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__off, #size_elem)) })
             }),
         ),
         Kind::Ref => (
@@ -3772,7 +4266,7 @@ pub(crate) fn block_array_field(
     } else {
         mv_leaf.clone()
     };
-    parts.mv_types.push(nested_ty(&dims, &mv_leaf_ty));
+    let mv_ty = nested_ty(&dims, &mv_leaf_ty);
     let mv_read = |k: &Ident| {
         if elem_nullable {
             quote! {{
@@ -3790,9 +4284,18 @@ pub(crate) fn block_array_field(
             }}
         }
     };
-    parts
-        .mv_recon
-        .push(nested_build(&dims, &mv_leaf_ty, &mv_read));
+    let mv_rc = nested_build(&dims, &mv_leaf_ty, &mv_read);
+    // An array of *owning* element handles is moved in and lost on a failed ctor
+    // step; hand the nested handle array back (reconstructed from the prep-local
+    // offset array) rather than orphan it. `ref` aliases own nothing.
+    if matches!(kind, Kind::Owned | Kind::Strong) {
+        parts
+            .ctor_handback
+            .push(mv_ty_as_ctor(&quote!({ let #cap = #fname; #mv_rc })));
+        parts.ctor_handback_ty.push(mv_ty_as_ctor(&mv_ty));
+    }
+    parts.mv_types.push(mv_ty);
+    parts.mv_recon.push(mv_rc);
 
     // `#[bstack_mut]`: element `replace_<f>_at` + whole-array `replace_<f>`
     // (and `set_` for `ref`). Weak arrays already have a `set_<f>` element
@@ -3819,17 +4322,20 @@ pub(crate) fn block_array_field(
 /// [`FieldParts`]: POD elements packed inline, each foreign element a `ForeignRepr`,
 /// all at cumulative payload offsets. Returns `Ok(None)` if the field isn't a tuple
 /// containing a `Foreign` (fall through to the POD-tuple / scalar path).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn foreign_tuple_field(
-    vis: &syn::Visibility,
-    name: &Ident,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     inner_ty: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
 ) -> syn::Result<Option<FieldParts>> {
+    let &FieldCtx {
+        vis,
+        name,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        ..
+    } = ctx;
     let Type::Tuple(tup) = inner_ty else {
         return Ok(None);
     };
@@ -3893,9 +4399,9 @@ pub(crate) fn foreign_tuple_field(
     // rewrite each foreign element to the real `::bstack_raii::Foreign<T>` (the
     // user's bare `Foreign` isn't in scope in the generated impls).
     // Build the public tuple type with a given lifetime on each `Foreign`
-    // element (`None` ⇒ elided, for the by-value ctor param). The accessor binds
-    // `'__f` (its `stack` borrow) and the move binds `'__mv`, so a `SELF` element
-    // cannot escape the file / block it came from.
+    // element (`None` ⇒ elided, for the by-value ctor param). The accessor / move
+    // resolve each SELF element to this file's registered id before it escapes, so
+    // it cannot be mis-stored into another file.
     let mk_tuple_ty = |lt: Option<&syn::Lifetime>| -> TokenStream {
         let elems: Vec<TokenStream> = (0..n)
             .map(|i| {
@@ -3950,8 +4456,8 @@ pub(crate) fn foreign_tuple_field(
     parts.on_disk_fields.push(quote!(#fname: #wrapper,));
 
     // Accessor: rebuild the tuple, mapping each `ForeignRepr` back to a `Foreign`.
-    // SAFETY: each element repr was stored into this file; the returned
-    // `Foreign`s are `'__f`-bound to `stack` by the accessor signature.
+    // Each SELF element is resolved to this file's registered id before it escapes;
+    // the `?` propagates to the accessor's `io::Result`.
     let acc_elems: Vec<TokenStream> = (0..n)
         .map(|i| {
             let ix = &idx[i];
@@ -3961,11 +4467,17 @@ pub(crate) fn foreign_tuple_field(
                     quote!(if __w.#ix.offset() == 0 {
                         ::core::option::Option::None
                     } else {
+                        let __repr =
+                            ::bstack_raii::__private::resolve_self_repr(__w.#ix, stack)?;
                         ::core::option::Option::Some(
-                            unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__w.#ix) })
+                            unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) })
                     })
                 } else {
-                    quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__w.#ix) })
+                    quote!({
+                        let __repr =
+                            ::bstack_raii::__private::resolve_self_repr(__w.#ix, stack)?;
+                        unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) }
+                    })
                 }
             } else {
                 quote!(__w.#ix)
@@ -3986,17 +4498,21 @@ pub(crate) fn foreign_tuple_field(
     });
 
     // Constructor: map each foreign element to a `ForeignPtr`, POD verbatim.
+    // A pointer to the home file is re-encoded as SELF before storing.
     let ctor_elems: Vec<TokenStream> = (0..n)
         .map(|i| {
             let ix = &idx[i];
             if is_foreign[i] {
                 if nulls[i] {
                     quote!(match #fname.#ix {
-                        ::core::option::Option::Some(__f) => __f.repr(),
+                        ::core::option::Option::Some(__f) =>
+                            ::bstack_raii::__private::home_relative_repr(
+                                __f.repr(), allocator.stack()),
                         ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
                     })
                 } else {
-                    quote!(#fname.#ix.repr())
+                    quote!(::bstack_raii::__private::home_relative_repr(
+                        #fname.#ix.repr(), allocator.stack()))
                 }
             } else {
                 quote!(#fname.#ix)
@@ -4050,8 +4566,9 @@ pub(crate) fn foreign_tuple_field(
         });
     }
 
-    // Move: rebuild the tuple (same mapping as the accessor), `'__mv`-bound.
-    // SAFETY: each element repr was stored into this file; bound to `'__mv`.
+    // Move: rebuild the tuple (same mapping as the accessor). Each SELF element is
+    // resolved to this file's registered id before the dual escapes; `?`
+    // propagates to `bstack_move`'s `io::Result`, `__stack` is its home stack.
     let cap = format_ident!("__cap_{}", fname);
     parts.mv_caps.push(quote!(let #cap = __od.#fname;));
     parts.mv_types.push(quote!(#mv_tuple_ty));
@@ -4064,11 +4581,17 @@ pub(crate) fn foreign_tuple_field(
                     quote!(if #cap.#ix.offset() == 0 {
                         ::core::option::Option::None
                     } else {
+                        let __repr =
+                            ::bstack_raii::__private::resolve_self_repr(#cap.#ix, __stack)?;
                         ::core::option::Option::Some(
-                            unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#cap.#ix) })
+                            unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) })
                     })
                 } else {
-                    quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#cap.#ix) })
+                    quote!({
+                        let __repr =
+                            ::bstack_raii::__private::resolve_self_repr(#cap.#ix, __stack)?;
+                        unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) }
+                    })
                 }
             } else {
                 quote!(#cap.#ix)
@@ -4083,15 +4606,16 @@ pub(crate) fn foreign_tuple_field(
 /// `#[repr(C, packed)]` `Pod` wrapper stored inline, rebuilt into the tuple on read
 /// (+ a `set_` mutator for `#[bstack_mut]`). Returns `Ok(None)` unless the field is a
 /// POD (un-annotated) tuple.
-pub(crate) fn pod_tuple_field(
-    vis: &syn::Visibility,
-    name: &Ident,
-    fname: &Ident,
-    field: &syn::Field,
-    inner_ty: &Type,
-    kind: Kind,
-    on_disk_ty: &TokenStream,
-) -> syn::Result<Option<FieldParts>> {
+pub(crate) fn pod_tuple_field(ctx: &FieldCtx, inner_ty: &Type) -> syn::Result<Option<FieldParts>> {
+    let &FieldCtx {
+        vis,
+        name,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        ..
+    } = ctx;
     if kind != Kind::Pod {
         return Ok(None);
     }
@@ -4162,17 +4686,20 @@ pub(crate) fn pod_tuple_field(
 /// on-disk form stored INLINE (`<Child as BStackBlock>::OnDisk`), copied in
 /// post-write and freed/cloned in place. Returns `Ok(None)` unless the field is
 /// `#[embed]`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn embed_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     inner_ty: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
-    type_params: &[&Ident],
 ) -> syn::Result<Option<FieldParts>> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        type_params,
+        ..
+    } = ctx;
     if kind != Kind::Embed {
         return Ok(None);
     }
@@ -4220,7 +4747,7 @@ pub(crate) fn embed_field(
     parts.drop_stmts.push(quote! {
         {
             let __embed = ::bstack_raii::BStackRange::new(
-                __range.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                ::bstack_raii::__private::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                 ::core::mem::size_of::<#child_od>() as u64,
             );
             <#child>::__bstack_drop_children(__embed, allocator)?;
@@ -4229,13 +4756,13 @@ pub(crate) fn embed_field(
 
     // Accessor: a child handle at the embedded offset (pure offset math).
     parts.accessors.push(quote! {
-        #vis fn #getter(&self) -> #child {
-            <#child as ::bstack_raii::BStackBlock>::from_range(
+        #vis fn #getter(&self) -> ::std::io::Result<#child> {
+            ::std::result::Result::Ok(unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                 ::bstack_raii::BStackRange::new(
-                    self.0.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                     ::core::mem::size_of::<#child_od>() as u64,
                 ),
-            )
+            ) })
         }
     });
 
@@ -4259,7 +4786,7 @@ pub(crate) fn embed_field(
         {
             allocator.stack().copy(
                 #src_id.start(),
-                __data.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                ::bstack_raii::__private::checked_field_offset(__data.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                 ::core::mem::size_of::<#child_od>() as u64,
             )?;
             unsafe { ::bstack_raii::dealloc_range(allocator, #src_id)?; }
@@ -4285,22 +4812,37 @@ pub(crate) fn embed_field(
             }
             unsafe {
                 ::bstack_raii::BStackOwned::from_raw(
-                    <#child as ::bstack_raii::BStackBlock>::from_range(__r),
+                    unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(__r) },
                 )
             }
         }
     });
+    // Failed-construction hand-back: before the post-write copy runs, the
+    // embedded child is still its own standalone block at `#src_id`, so hand it
+    // straight back as a `BStackOwned` — no re-home, infallibly. (`#src_id` is a
+    // `Copy` `BStackRange`, so using it here and in the success-path copy/free
+    // never conflicts.)
+    parts.ctor_handback.push(quote! {
+        unsafe {
+            ::bstack_raii::BStackOwned::from_raw(
+                unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(#src_id) },
+            )
+        }
+    });
+    parts
+        .ctor_handback_ty
+        .push(quote!(::bstack_raii::BStackOwned<#child>));
     // Clone: fold the embedded child's clone inline — deep-clone its own
     // children into the plan and store the fixed-up child OnDisk in place
     // (no separate child allocation, mirroring the in-place teardown).
     parts.clone_stmts.push(quote! {
         {
-            let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+            let __child = unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                 ::bstack_raii::BStackRange::new(
-                    __src.start() + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64,
+                    ::bstack_raii::__private::checked_field_offset(__src.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                     ::core::mem::size_of::<#child_od>() as u64,
                 ),
-            );
+            ) };
             __od.#fname =
                 __child.__bstack_clone_children_inplace(allocator, __plan)?;
         }
@@ -4314,14 +4856,18 @@ pub(crate) fn embed_field(
 /// accessor, `#[bstack_mut]` `set_`/`replace_` mutators, ctor wiring (or a weak
 /// setter), teardown, clone, and `bstack_move!` pieces. Always applies.
 pub(crate) fn scalar_field(
-    vis: &syn::Visibility,
-    fname: &Ident,
-    field: &syn::Field,
+    ctx: &FieldCtx,
     inner_ty: &Type,
-    kind: Kind,
     nullable: bool,
-    on_disk_ty: &TokenStream,
 ) -> syn::Result<FieldParts> {
+    let &FieldCtx {
+        vis,
+        fname,
+        field,
+        kind,
+        on_disk_ty,
+        ..
+    } = ctx;
     let mut parts = FieldParts::default();
     // On-disk lowering.
     match kind {
@@ -4338,7 +4884,7 @@ pub(crate) fn scalar_field(
                 fname,
                 inner_ty,
                 nullable,
-                quote!(::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;),
+                quote!(unsafe { ::bstack_raii::OwnedRef::new(__child) }.bstack_drop(allocator)?;),
             )),
             Kind::Strong => parts.drop_stmts.push(child_range_stmt(
                 fname,
@@ -4420,6 +4966,32 @@ pub(crate) fn scalar_field(
     let cap = format_ident!("__cap_{}", fname);
     parts.mv_caps.push(quote!(let #cap = __od.#fname;));
     let (mv_ty, mv_rc) = move_field(&cap, inner_ty, kind, nullable);
+    // An owned/strong scalar child is *moved* into the constructor and lost if a
+    // later fallible step fails; hand it back rather than orphan it. Its
+    // reconstruction is exactly `bstack_move!`'s — but reads the offset from the
+    // prep-local `#fname` (== the on-disk slot) so it works even before the block
+    // image is materialised (the `rc, weak` path allocates first). (`ref` aliases
+    // and `pod` values own nothing; a scalar `weak` is setter-wired, never a ctor
+    // parameter — none need hand-back.)
+    if matches!(kind, Kind::Owned | Kind::Strong) {
+        // The hand-back element's type is the ctor *parameter* type — the same
+        // handle, reconstructed — carrying the constructor's `'__ctor` lifetime
+        // (not `bstack_move!`'s `'__mv`, which `mv_ty` names).
+        let base = match kind {
+            Kind::Owned => quote!(::bstack_raii::BStackOwned<#inner_ty>),
+            Kind::Strong => quote!(::bstack_raii::BStackRc<'__ctor, #inner_ty, __A>),
+            _ => unreachable!(),
+        };
+        let hb_ty = if nullable {
+            quote!(::core::option::Option<#base>)
+        } else {
+            base
+        };
+        parts
+            .ctor_handback
+            .push(mv_ty_as_ctor(&quote!({ let #cap = #fname; #mv_rc })));
+        parts.ctor_handback_ty.push(hb_ty);
+    }
     parts.mv_types.push(mv_ty);
     parts.mv_recon.push(mv_rc);
     Ok(parts)
@@ -4431,14 +5003,18 @@ pub(crate) fn scalar_field(
 /// **unaligned**, so field alignment is irrelevant — the packed byte sequence of POD
 /// fields is itself just POD bytes. The loop's catch-all; always applies.
 pub(crate) fn pod_aggregate_variant(
+    ctx: &VariantCtx,
     variant: &syn::Variant,
-    vname: &Ident,
-    disc: &TokenStream,
-    kind: Kind,
-    data: &Ident,
-    view: &Ident,
-    payload_const: &Ident,
 ) -> syn::Result<VariantParts> {
+    let &VariantCtx {
+        vname,
+        disc,
+        kind,
+        data,
+        view,
+        payload_const,
+        ..
+    } = ctx;
     let mut parts = VariantParts::default();
     if kind != Kind::Pod {
         return Err(Error::new_spanned(
@@ -4528,25 +5104,24 @@ pub(crate) fn pod_aggregate_variant(
 /// or `#[embed] V(Child)`, where the child is stored as a `u64` offset (owned / ref /
 /// strong / weak) or its whole on-disk form inline (`#[embed]`). The trailing case of
 /// the annotated single-field arm (vec / array / foreign shapes handled before it).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn single_block_variant(
-    ty: &Type,
-    vname: &Ident,
-    disc: &TokenStream,
-    kind: Kind,
-    data: &Ident,
-    view: &Ident,
-    on_disk: &Ident,
-    payload_const: &Ident,
-) -> syn::Result<VariantParts> {
+pub(crate) fn single_block_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<VariantParts> {
+    let &VariantCtx {
+        vname,
+        disc,
+        kind,
+        data,
+        view,
+        on_disk,
+        payload_const,
+    } = ctx;
     let mut parts = VariantParts::default();
     // The child block's range recovered from a stored offset (owned / ref).
     let child_from_off = |ty: &Type| {
         quote! {
-            <#ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
+            unsafe { <#ty as ::bstack_raii::BStackBlock>::from_range(::bstack_raii::BStackRange::new(
                 ::bstack_raii::get_u64(&__pl),
                 ::core::mem::size_of::<<#ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
-            ))
+            )) }
         }
     };
     // A `BStackRef<T>` over the child block, recovered from a stored offset.
@@ -4596,20 +5171,20 @@ pub(crate) fn single_block_variant(
                             ),
                         )
                     };
-                    ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
+                    unsafe { ::bstack_raii::OwnedRef::new(__child) }.bstack_drop(allocator)?;
                 }
             });
             parts.clone_arms.push(quote! {
                 #disc => {
                     let __off = ::bstack_raii::get_u64(&__pl);
-                    let __child = <#ty as ::bstack_raii::BStackBlock>::from_range(
+                    let __child = unsafe { <#ty as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
                             __off,
                             ::core::mem::size_of::<
                                 <#ty as ::bstack_raii::BStackBlock>::OnDisk
                             >() as u64,
                         ),
-                    );
+                    ) };
                     let __new = __child.__bstack_clone_into(allocator, __plan)?;
                     __pl[..8].copy_from_slice(&__new.start().to_le_bytes());
                 }
@@ -4680,6 +5255,15 @@ pub(crate) fn single_block_variant(
                     )?;
                 }
             });
+            // The old-value reconstruction (`strong_parts`) is the one fallible
+            // path in a whole-value enum `replace`; hand the strong child's data
+            // block back so a post-commit read fault leaves it recoverable.
+            parts.raw_arms.push(quote! {
+                #disc => ::std::vec![::bstack_raii::BStackRange::new(
+                    ::bstack_raii::get_u64(&__pl),
+                    ::core::mem::size_of::<<#ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64,
+                )],
+            });
             parts.clone_arms.push(quote! {
                 #disc => {
                     let __data = unsafe { #cref };
@@ -4693,14 +5277,14 @@ pub(crate) fn single_block_variant(
             parts.payload_sizes.push(quote!(8usize));
             let ctrl_ref = quote! {
                 unsafe {
-                    ::bstack_raii::BStackRef::<
+                    unsafe { ::bstack_raii::BStackRef::<
                         <#ty as ::bstack_raii::BStackWeakable>::Control
                     >::from_range(::bstack_raii::BStackRange::new(
                         ::bstack_raii::get_u64(&__pl),
                         ::core::mem::size_of::<
                             <#ty as ::bstack_raii::BStackWeakable>::Control
                         >() as u64,
-                    ))
+                    )) }
                 }
             };
             // A weak variant stores the child's CONTROL offset and holds
@@ -4743,13 +5327,13 @@ pub(crate) fn single_block_variant(
             });
             parts.drop_arms.push(quote! {
                 #disc => {
-                    ::bstack_raii::WeakRef::<#ty>(#ctrl_ref).bstack_drop(allocator)?;
+                    unsafe { ::bstack_raii::WeakRef::<#ty>::new(#ctrl_ref) }.bstack_drop(allocator)?;
                 }
             });
             parts.clone_arms.push(quote! {
                 #disc => {
                     let __ctrl_off = ::bstack_raii::get_u64(&__pl);
-                    __plan.bump_weak(__ctrl_off);
+                    __plan.bump_weak(__ctrl_off)?;
                 }
             });
         }
@@ -4784,14 +5368,14 @@ pub(crate) fn single_block_variant(
             // read (view): a child handle at the embedded payload offset.
             parts.read_arms.push(quote! {
                 #disc => #view::#vname(
-                    <#ty as ::bstack_raii::BStackBlock>::from_range(
+                    unsafe { <#ty as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
                             self.0.start()
                                 + ::core::mem::offset_of!(#on_disk, __bstack_payload)
                                     as u64,
                             ::core::mem::size_of::<#co>() as u64,
                         ),
-                    )
+                    ) }
                 ),
             });
             // move: re-home the embedded child to a fresh allocation.
@@ -4808,7 +5392,7 @@ pub(crate) fn single_block_variant(
                     }
                     #data::#vname(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
-                            <#ty as ::bstack_raii::BStackBlock>::from_range(__r),
+                            unsafe { <#ty as ::bstack_raii::BStackBlock>::from_range(__r) },
                         )
                     })
                 }
@@ -4826,14 +5410,14 @@ pub(crate) fn single_block_variant(
             });
             parts.clone_arms.push(quote! {
                 #disc => {
-                    let __child = <#ty as ::bstack_raii::BStackBlock>::from_range(
+                    let __child = unsafe { <#ty as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
                             self.0.start()
                                 + ::core::mem::offset_of!(#on_disk, __bstack_payload)
                                     as u64,
                             ::core::mem::size_of::<#co>() as u64,
                         ),
-                    );
+                    ) };
                     let __fixed =
                         __child.__bstack_clone_children_inplace(allocator, __plan)?;
                     __pl[..::core::mem::size_of::<#co>()]
@@ -4850,15 +5434,16 @@ pub(crate) fn single_block_variant(
 /// annotation naming the target's ownership in its own file (teardown / clone dispatch
 /// cross-file, like a scalar `Foreign` struct field). `None` = not a `Foreign` (fall
 /// through). Concrete target only for now; container-in-variant is not handled.
-pub(crate) fn foreign_variant(
-    ty: &Type,
-    vname: &Ident,
-    disc: &TokenStream,
-    kind: Kind,
-    data: &Ident,
-    view: &Ident,
-    payload_const: &Ident,
-) -> syn::Result<Option<VariantParts>> {
+pub(crate) fn foreign_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<VariantParts>> {
+    let &VariantCtx {
+        vname,
+        disc,
+        kind,
+        data,
+        view,
+        payload_const,
+        ..
+    } = ctx;
     let Some(ftarget) = foreign_inner(ty) else {
         return Ok(None);
     };
@@ -4884,27 +5469,33 @@ pub(crate) fn foreign_variant(
 
     parts.has_foreign = true;
     parts.payload_sizes.push(quote!(16usize));
-    // `'__e` is the enum's read / move borrow (see `has_foreign`), so a
-    // `SELF` pointer in this variant cannot escape it.
     let fty = quote!(::bstack_raii::Foreign<'__e, #ftarget>);
     let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
         ::bstack_raii::ForeignRepr,
     >(&__pl[..16]));
+    // Resolve a stored SELF pointer to this file's registered id before it escapes,
+    // so it can't be mis-stored into another file. `read` binds `allocator`,
+    // `bstack_move` / `replace` bind `__alloc`; both return `io::Result`, so the `?`
+    // propagates cleanly.
+    let read_resolved =
+        quote!(::bstack_raii::__private::resolve_self_repr(#read_fp, allocator.stack())?);
+    let move_resolved =
+        quote!(::bstack_raii::__private::resolve_self_repr(#read_fp, __alloc.stack())?);
     parts.data_variants.push(quote!(#vname(#fty),));
     parts.view_variants.push(quote!(#vname(#fty),));
     parts.new_arms.push(quote! {
         #data::#vname(__f) => {
             let mut __pl = [0u8; #payload_const];
-            __pl[..16].copy_from_slice(
-                ::bstack_raii::bytemuck::bytes_of(&__f.repr()));
+            // Re-encode a pointer to the home file as SELF before storing.
+            __pl[..16].copy_from_slice(::bstack_raii::bytemuck::bytes_of(
+                &::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack())));
             (#disc, __pl)
         }
     });
-    // SAFETY: the repr was stored into this file; bound to `'__e`.
     parts.read_arms.push(quote!(#disc => #view::#vname(
-                        unsafe { ::bstack_raii::Foreign::from_repr(#read_fp) }),));
+                        unsafe { ::bstack_raii::Foreign::from_repr(#read_resolved) }),));
     parts.move_arms.push(quote!(#disc => #data::#vname(
-                        unsafe { ::bstack_raii::Foreign::from_repr(#read_fp) }),));
+                        unsafe { ::bstack_raii::Foreign::from_repr(#move_resolved) }),));
     // Teardown / clone dispatch (a `#[bstack_ref]` owns nothing → none;
     // its `ForeignPtr` is byte-copied by the payload catch-all).
     if !matches!(kind, Kind::Ref) {
@@ -4934,14 +5525,18 @@ pub(crate) fn foreign_variant(
 /// (A, Foreign<T>)` struct field). The annotation names the foreign elements'
 /// ownership. `None` = not a tuple with a `Foreign` element (fall through).
 pub(crate) fn foreign_tuple_variant(
+    ctx: &VariantCtx,
     ty: &Type,
-    vname: &Ident,
-    disc: &TokenStream,
-    kind: Kind,
-    data: &Ident,
-    view: &Ident,
-    payload_const: &Ident,
 ) -> syn::Result<Option<VariantParts>> {
+    let &VariantCtx {
+        vname,
+        disc,
+        kind,
+        data,
+        view,
+        payload_const,
+        ..
+    } = ctx;
     let Type::Tuple(tup) = ty else {
         return Ok(None);
     };
@@ -5024,14 +5619,18 @@ pub(crate) fn foreign_tuple_variant(
             let off = &offsets[i];
             let sz = &sizes[i];
             if is_foreign[i] {
+                // Re-encode a pointer to the home file as SELF before storing.
                 let to_fp = if nulls[i] {
                     quote!(match #b {
-                        ::core::option::Option::Some(__x) => __x.repr(),
+                        ::core::option::Option::Some(__x) =>
+                            ::bstack_raii::__private::home_relative_repr(
+                                __x.repr(), allocator.stack()),
                         ::core::option::Option::None =>
                             ::bstack_raii::ForeignRepr::new(0, 0),
                     })
                 } else {
-                    quote!(#b.repr())
+                    quote!(::bstack_raii::__private::home_relative_repr(
+                        #b.repr(), allocator.stack()))
                 };
                 quote!(__pl[(#off)..(#off) + 16].copy_from_slice(
                                     ::bstack_raii::bytemuck::bytes_of(&(#to_fp)));)
@@ -5049,44 +5648,55 @@ pub(crate) fn foreign_tuple_variant(
         }
     });
 
-    // read / move: rebuild the tuple from the payload.
-    let reads: Vec<TokenStream> = (0..nelem)
-        .map(|i| {
-            let off = &offsets[i];
-            let sz = &sizes[i];
-            if is_foreign[i] {
-                let ft = ftargets[i].unwrap();
-                let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                    ::bstack_raii::ForeignRepr,
-                                >(&__pl[(#off)..(#off) + 16]));
-                // SAFETY: repr stored into this file; bound by the
-                // variant type (read `'__e` / move `'__mv`).
-                if nulls[i] {
-                    quote!({
-                        let __p = #fp;
-                        if __p.offset() == 0 {
-                            ::core::option::Option::None
-                        } else {
-                            ::core::option::Option::Some(
-                                unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__p) })
-                        }
-                    })
+    // read / move: rebuild the tuple from the payload. Each SELF foreign element is
+    // resolved to this file's registered id before it escapes; the `?`
+    // propagates to the enclosing `io::Result`. `read` binds `allocator`,
+    // `bstack_move` / `replace` bind `__alloc`, so the reads are built per stack.
+    let make_reads = |stack: &TokenStream| -> Vec<TokenStream> {
+        (0..nelem)
+            .map(|i| {
+                let off = &offsets[i];
+                let sz = &sizes[i];
+                if is_foreign[i] {
+                    let ft = ftargets[i].unwrap();
+                    let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
+                                        ::bstack_raii::ForeignRepr,
+                                    >(&__pl[(#off)..(#off) + 16]));
+                    if nulls[i] {
+                        quote!({
+                            let __p = #fp;
+                            if __p.offset() == 0 {
+                                ::core::option::Option::None
+                            } else {
+                                let __repr =
+                                    ::bstack_raii::__private::resolve_self_repr(__p, #stack)?;
+                                ::core::option::Option::Some(
+                                    unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) })
+                            }
+                        })
+                    } else {
+                        quote!({
+                            let __repr =
+                                ::bstack_raii::__private::resolve_self_repr(#fp, #stack)?;
+                            unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) }
+                        })
+                    }
                 } else {
-                    quote!(unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(#fp) })
+                    let e = &tup.elems[i];
+                    quote!(::bstack_raii::bytemuck::pod_read_unaligned::<#e>(
+                                        &__pl[(#off)..(#off) + #sz]))
                 }
-            } else {
-                let e = &tup.elems[i];
-                quote!(::bstack_raii::bytemuck::pod_read_unaligned::<#e>(
-                                    &__pl[(#off)..(#off) + #sz]))
-            }
-        })
-        .collect();
+            })
+            .collect()
+    };
+    let read_reads = make_reads(&quote!(allocator.stack()));
+    let move_reads = make_reads(&quote!(__alloc.stack()));
     parts
         .read_arms
-        .push(quote!(#disc => #view::#vname(( #(#reads,)* )),));
+        .push(quote!(#disc => #view::#vname(( #(#read_reads,)* )),));
     parts
         .move_arms
-        .push(quote!(#disc => #data::#vname(( #(#reads,)* )),));
+        .push(quote!(#disc => #data::#vname(( #(#move_reads,)* )),));
 
     // Teardown / clone: dispatch each foreign element (ref = none).
     if !matches!(kind, Kind::Ref) {
@@ -5124,17 +5734,16 @@ pub(crate) fn foreign_tuple_variant(
 /// foreign array `V([Foreign<T>; N])`, or an `#[embed] V([Child; N])`. Block refs are
 /// stored **flat** in the payload as `[u64; TOTAL]` (foreign: `[ForeignPtr; TOTAL]`;
 /// embed: each child's whole on-disk form). `None` = not an array (fall through).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn array_variant(
-    ty: &Type,
-    vname: &Ident,
-    disc: &TokenStream,
-    kind: Kind,
-    data: &Ident,
-    view: &Ident,
-    on_disk: &Ident,
-    payload_const: &Ident,
-) -> syn::Result<Option<VariantParts>> {
+pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<VariantParts>> {
+    let &VariantCtx {
+        vname,
+        disc,
+        kind,
+        data,
+        view,
+        on_disk,
+        payload_const,
+    } = ctx;
     let Type::Array(_) = ty else {
         return Ok(None);
     };
@@ -5316,9 +5925,9 @@ pub(crate) fn array_variant(
 
         // read (view): nested child handles into the payload slots.
         let read_leaf = |k: &Ident| {
-            quote!(<#child as ::bstack_raii::BStackBlock>::from_range(
+            quote!(unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                                 ::bstack_raii::BStackRange::new(
-                                    __base + (#k as u64) * __step, __step)))
+                                    __base + (#k as u64) * __step, __step)) })
         };
         let read_body = nested_build(&dims, &quote!(#child), &read_leaf);
         parts.read_arms.push(quote! {
@@ -5344,7 +5953,7 @@ pub(crate) fn array_variant(
                     return ::std::result::Result::Err(__e);
                 }
                 unsafe { ::bstack_raii::BStackOwned::from_raw(
-                    <#child as ::bstack_raii::BStackBlock>::from_range(__r)) }
+                    unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(__r) }) }
             }}
         };
         let mv_body = nested_build(&dims, &data_leaf, &mv_read);
@@ -5373,9 +5982,9 @@ pub(crate) fn array_variant(
                     + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64;
                 let __step = ::core::mem::size_of::<#co>() as u64;
                 for __k in 0usize..(#total) {
-                    let __child = <#child as ::bstack_raii::BStackBlock>::from_range(
+                    let __child = unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                         ::bstack_raii::BStackRange::new(
-                            __base + (__k as u64) * __step, __step));
+                            __base + (__k as u64) * __step, __step)) };
                     let __fixed =
                         __child.__bstack_clone_children_inplace(allocator, __plan)?;
                     let __start = (__k) * ::core::mem::size_of::<#co>();
@@ -5462,7 +6071,7 @@ pub(crate) fn array_variant(
                     let __ctrl = unsafe {
                         ::bstack_raii::BStackRef::<#ctrl_ty>::from_range(
                             ::bstack_raii::BStackRange::new(__off, #ctrl_size)) };
-                    ::bstack_raii::WeakRef::<#elem>(__ctrl).bstack_drop(allocator)?;
+                    unsafe { ::bstack_raii::WeakRef::<#elem>::new(__ctrl) }.bstack_drop(allocator)?;
                 }
             }
         });
@@ -5471,7 +6080,7 @@ pub(crate) fn array_variant(
             #disc => {
                 for __k in 0usize..(#total) {
                     let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
-                    __plan.bump_weak(__off);
+                    __plan.bump_weak(__off)?;
                 }
             }
         });
@@ -5545,8 +6154,8 @@ pub(crate) fn array_variant(
     // read (view): nested block views.
     let read_leaf = |k: &Ident| {
         let off = pl_off(k);
-        let build = quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #elem_size)));
+        let build = quote!(unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__off, #elem_size)) });
         if elem_nullable {
             quote! {{
                 let __off = #off;
@@ -5577,8 +6186,8 @@ pub(crate) fn array_variant(
     let build_one = match kind {
         Kind::Owned => quote!(unsafe {
             ::bstack_raii::BStackOwned::from_raw(
-                <#elem as ::bstack_raii::BStackBlock>::from_range(
-                    ::bstack_raii::BStackRange::new(__off, #elem_size)))
+                unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                    ::bstack_raii::BStackRange::new(__off, #elem_size)) })
         }),
         Kind::Ref => quote!(unsafe {
             ::bstack_raii::BStackRef::<#elem>::from_range(
@@ -5615,7 +6224,7 @@ pub(crate) fn array_variant(
     if kind != Kind::Ref {
         let per = match kind {
             Kind::Owned => quote! {
-                ::bstack_raii::OwnedRef(__child).bstack_drop(allocator)?;
+                unsafe { ::bstack_raii::OwnedRef::new(__child) }.bstack_drop(allocator)?;
             },
             Kind::Strong => quote! {
                 <#elem as ::bstack_raii::BStackShared>::drop_strong_ref(
@@ -5646,8 +6255,8 @@ pub(crate) fn array_variant(
                     let __off = ::bstack_raii::get_u64(&__pl[__k * 8..]);
                     if __off != 0 {
                         let __child =
-                            <#elem as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(__off, #elem_size));
+                            unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__off, #elem_size)) };
                         let __new = __child.__bstack_clone_into(allocator, __plan)?;
                         __pl[__k * 8..__k * 8 + 8]
                             .copy_from_slice(&__new.start().to_le_bytes());
@@ -5681,14 +6290,22 @@ pub(crate) fn array_variant(
 /// the struct case), reshaped to `Vec<[[T;..];..]>` on read. `None` = not a `Vec` /
 /// `String` (fall through).
 pub(crate) fn vec_variant(
+    ctx: &VariantCtx,
     ty: &Type,
-    vname: &Ident,
-    disc: &TokenStream,
-    kind: Kind,
-    data: &Ident,
-    view: &Ident,
-    payload_const: &Ident,
+    // The absolute on-disk location of the payload's inline `VecDesc` in `read`'s scope
+    // (`self.0.start() + offset_of!(OnDisk, __bstack_payload)`), used to bind a scalar
+    // vec variant's read view to its field so a realloc-on-`push` persists.
+    payload_loc: &TokenStream,
 ) -> syn::Result<Option<VariantParts>> {
+    let &VariantCtx {
+        vname,
+        disc,
+        kind,
+        data,
+        view,
+        payload_const,
+        ..
+    } = ctx;
     if vec_info(ty).is_none() {
         return Ok(None);
     }
@@ -5786,15 +6403,15 @@ pub(crate) fn vec_variant(
         });
         parts.read_arms.push(quote! {
             #disc => #view::#vname(
-                #store::from_desc(#read_desc, allocator)
+                unsafe { #store::from_desc(#read_desc, allocator) }
                     .to_vec()?.into_iter().map(#from_ptr).collect()),
         });
         parts.move_arms.push(quote! {
             #disc => {
                 let __out: ::std::vec::Vec<#fty_mv> =
-                    #store::from_desc(#read_desc, __alloc)
+                    unsafe { #store::from_desc(#read_desc, __alloc) }
                         .to_vec()?.into_iter().map(#from_ptr).collect();
-                #store::from_desc(#read_desc, __alloc).bstack_drop()?;
+                unsafe { #store::from_desc(#read_desc, __alloc) }.bstack_drop()?;
                 #data::#vname(__out)
             }
         });
@@ -5804,20 +6421,20 @@ pub(crate) fn vec_variant(
         let drop_loop = if matches!(kind, Kind::Ref) {
             quote!()
         } else {
-            quote!(for __fp in #store::from_desc(#read_desc, allocator).to_vec()? {
+            quote!(for __fp in unsafe { #store::from_desc(#read_desc, allocator) }.to_vec()? {
                 #elem_drop
             })
         };
         parts.drop_arms.push(quote! {
             #disc => {
                 #drop_loop
-                #store::from_desc(#read_desc, allocator).bstack_drop()?;
+                unsafe { #store::from_desc(#read_desc, allocator) }.bstack_drop()?;
             }
         });
         let elem_clone = foreign_elem_clone(kind, ftarget);
         parts.clone_arms.push(quote! {
             #disc => {
-                let __src = #store::from_desc(#read_desc, allocator).to_vec()?;
+                let __src = unsafe { #store::from_desc(#read_desc, allocator) }.to_vec()?;
                 let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
                     ::std::vec::Vec::with_capacity(__src.len());
                 for __fp in __src {
@@ -5864,25 +6481,27 @@ pub(crate) fn vec_variant(
         });
         parts.read_arms.push(quote! {
             #disc => #view::#vname(
-                ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
-                    #read_desc, allocator)),
+                // Field-bound (not detached) so a realloc-on-`push` persists the moved
+                // descriptor into the enum's inline slot.
+                unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_field(
+                    #payload_loc, allocator) }?),
         });
         parts.move_arms.push(quote! {
             #disc => #data::#vname(
-                ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
-                    #read_desc, __alloc)),
+                unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                    #read_desc, __alloc) }),
         });
         parts.drop_arms.push(quote! {
             #disc => {
-                ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
-                    #read_desc, allocator).bstack_drop()?;
+                unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                    #read_desc, allocator) }.bstack_drop()?;
             }
         });
         parts.clone_arms.push(quote! {
             #disc => {
                 let __srcdesc = #read_desc;
-                let __newdesc = ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
-                    __srcdesc, allocator).clone_data_into(__plan)?;
+                let __newdesc = unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_desc(
+                    __srcdesc, allocator) }.clone_data_into(__plan)?;
                 __pl[..16].copy_from_slice(
                     ::bstack_raii::bytemuck::bytes_of(&__newdesc));
             }
@@ -5932,26 +6551,26 @@ pub(crate) fn vec_variant(
     // ---- Teardown (shared) ----
     parts.drop_arms.push(quote! {
         #disc => {
-            ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(#read_desc, allocator)
+            unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(#read_desc, allocator) }
                 .bstack_drop()?;
         }
     });
     // ---- Clone (shared) ----
     let clone_expr = match kind {
         Kind::Owned => quote!(
-                            ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                            unsafe { ::bstack_raii::BStackBlockVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                                 .clone_into(__plan, |__er, __p| {
-                                    <#elem as ::bstack_raii::BStackBlock>::from_range(__er)
+                                    unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(__er) }
                                         .__bstack_clone_into(allocator, __p)
                                 })?),
         Kind::Strong => quote!(
-                            ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                            unsafe { ::bstack_raii::BStackStrongVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                                 .clone_into(__plan)?),
         Kind::Weak => quote!(
-                            ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                            unsafe { ::bstack_raii::BStackWeakVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                                 .clone_into(__plan)?),
         Kind::Ref => quote!(
-                            ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(__srcdesc, allocator)
+                            unsafe { ::bstack_raii::BStackRefVec::<#elem, __A>::from_desc(__srcdesc, allocator) }
                                 .clone_into(__plan)?),
         _ => unreachable!(),
     };
@@ -5983,13 +6602,17 @@ pub(crate) fn vec_variant(
         });
         parts.read_arms.push(quote! {
             #disc => #view::#vname(
-                ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
-                    #read_desc, allocator)),
+                // Bind the returned view's write-back to the payload's inline `VecDesc`
+                // so a realloc-on-`push` persists the moved descriptor into the live
+                // enum block. A detached `from_desc` view would leave the enum's slot
+                // pointing at freed space after a growth.
+                unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_field(
+                    #payload_loc, allocator) }?),
         });
         parts.move_arms.push(quote! {
             #disc => #data::#vname(
-                ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
-                    #read_desc, __alloc)),
+                unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
+                    #read_desc, __alloc) }),
         });
         return Ok(Some(parts));
     }
@@ -6030,13 +6653,13 @@ pub(crate) fn vec_variant(
                 let __o = __grp[#k];
                 if __o == 0 { ::core::option::Option::None } else {
                     ::core::option::Option::Some(
-                        <#elem as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                        unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                            ::bstack_raii::BStackRange::new(__o, #size_elem)) })
                 }
             })
         } else {
-            quote!(<#elem as ::bstack_raii::BStackBlock>::from_range(
-                                ::bstack_raii::BStackRange::new(__grp[#k], #size_elem)))
+            quote!(unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                                ::bstack_raii::BStackRange::new(__grp[#k], #size_elem)) })
         }
     };
     let view_build = nested_build(&dims, &view_leaf, &view_read);
@@ -6108,8 +6731,8 @@ pub(crate) fn vec_variant(
     // `read`: flat offsets → chunk → reshape to `Vec<[[View;..];..]>`.
     parts.read_arms.push(quote! {
         #disc => {
-            let __flat = ::bstack_raii::BStackVec::<u64, __A>::from_desc(
-                #read_desc, allocator).to_vec()?;
+            let __flat = unsafe { ::bstack_raii::BStackVec::<u64, __A>::from_desc(
+                #read_desc, allocator) }.to_vec()?;
             let mut __out = ::std::vec::Vec::with_capacity(__flat.len() / (#total));
             for __grp in __flat.chunks(#total) {
                 __out.push(#view_build);
@@ -6124,8 +6747,8 @@ pub(crate) fn vec_variant(
         let one = match kind {
             Kind::Owned => quote!(unsafe {
                 ::bstack_raii::BStackOwned::from_raw(
-                    <#elem as ::bstack_raii::BStackBlock>::from_range(
-                        ::bstack_raii::BStackRange::new(__o, #size_elem)))
+                    unsafe { <#elem as ::bstack_raii::BStackBlock>::from_range(
+                        ::bstack_raii::BStackRange::new(__o, #size_elem)) })
             }),
             Kind::Ref => quote!(unsafe {
                 ::bstack_raii::BStackRef::<#elem>::from_range(
@@ -6174,13 +6797,13 @@ pub(crate) fn vec_variant(
     let move_build = nested_build(&dims, &own_leaf_mv, &move_read);
     parts.move_arms.push(quote! {
         #disc => {
-            let __flat = ::bstack_raii::BStackVec::<u64, __A>::from_desc(
-                #read_desc, __alloc).to_vec()?;
+            let __flat = unsafe { ::bstack_raii::BStackVec::<u64, __A>::from_desc(
+                #read_desc, __alloc) }.to_vec()?;
             let mut __out = ::std::vec::Vec::with_capacity(__flat.len() / (#total));
             for __grp in __flat.chunks(#total) {
                 __out.push(#move_build);
             }
-            ::bstack_raii::BStackVec::<u64, __A>::from_desc(#read_desc, __alloc)
+            unsafe { ::bstack_raii::BStackVec::<u64, __A>::from_desc(#read_desc, __alloc) }
                 .bstack_drop()?;
             #data::#vname(__out)
         }

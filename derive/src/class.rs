@@ -42,6 +42,19 @@ use syn::{Error, Fields, Ident, ItemEnum, ItemStruct, Type};
 
 use crate::util::*;
 
+/// The `RttiType.ctrl_tag` field expression: `Some(<T>::control_eightcc())` for a
+/// weak (`rc, weak`) type — so the persisted schema records the control block's tag
+/// and `swap` can validate a `weak` target's control block directly — else
+/// `None`.
+fn ctrl_tag_expr(name: &Ident, weak: bool) -> TokenStream {
+    if weak {
+        quote!(::core::option::Option::Some(
+            <#name as ::bstack_raii::BStackWeakable>::control_eightcc()))
+    } else {
+        quote!(::core::option::Option::None)
+    }
+}
+
 /// `#[bstack_class] struct` — emit the `#[bstack_block]` machinery plus an RTTI
 /// descriptor builder and its `linkme` registration.
 pub fn expand_struct(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> {
@@ -146,12 +159,14 @@ pub fn expand_struct(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenS
     let block_ts = crate::block::expand(attr, instance_input)?;
 
     let name_str = name.to_string();
+    let ctrl_tag_expr = ctrl_tag_expr(name, weak);
     let rtti_type = quote! {
         ::bstack_raii::rtti::RttiType {
             tag: <#name as ::bstack_raii::BStackCast>::eightcc(),
             name: ::std::string::String::from(#name_str),
             rc: #rc,
             weak: #weak,
+            ctrl_tag: #ctrl_tag_expr,
             ondisk_size: ::core::mem::size_of::<#on_disk>() as u64,
             body: ::bstack_raii::rtti::RttiBody::Struct(::std::vec![
                 #(#rtti_fields),*
@@ -199,12 +214,14 @@ pub fn expand_enum(attr: TokenStream, input: ItemEnum) -> syn::Result<TokenStrea
     let block_ts = crate::enum_::expand_enum(attr, input.clone())?;
 
     let name_str = name.to_string();
+    let ctrl_tag_expr = ctrl_tag_expr(name, weak);
     let rtti_type = quote! {
         ::bstack_raii::rtti::RttiType {
             tag: <#name as ::bstack_raii::BStackCast>::eightcc(),
             name: ::std::string::String::from(#name_str),
             rc: #rc,
             weak: #weak,
+            ctrl_tag: #ctrl_tag_expr,
             ondisk_size: ::core::mem::size_of::<#on_disk>() as u64,
             body: ::bstack_raii::rtti::RttiBody::Enum(::bstack_raii::rtti::RttiEnum {
                 disc_width: ::core::mem::size_of::<#disc_ty>() as u8,
@@ -272,14 +289,14 @@ fn enum_variant(variant: &syn::Variant, value: i128) -> syn::Result<TokenStream>
                     let sizes = preceding
                         .iter()
                         .map(|t| quote!(::core::mem::size_of::<#t>()));
-                    quote!((#(#sizes)+*) as u32)
+                    quote!(::bstack_raii::__private::rtti_narrow_u32(#(#sizes)+*, "field offset"))
                 };
                 out.push(quote! {
                     ::bstack_raii::rtti::RttiField {
                         name: ::std::string::String::from(#fname),
                         offset: #offset,
                         shape: ::bstack_raii::rtti::Shape::Pod {
-                            width: ::core::mem::size_of::<#ty>() as u32,
+                            width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
                         },
                     }
                 });
@@ -317,7 +334,7 @@ fn instance_field(name: &str, on_disk: &Ident, fname: &Ident, shape: TokenStream
     quote! {
         ::bstack_raii::rtti::RttiField {
             name: ::std::string::String::from(#name),
-            offset: ::core::mem::offset_of!(#on_disk, #fname) as u32,
+            offset: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::offset_of!(#on_disk, #fname), "field offset"),
             shape: #shape,
         }
     }
@@ -333,7 +350,7 @@ fn class_field(name: &str, ty: &Type, mutable: bool, expr: &syn::Expr) -> TokenS
             shape: ::bstack_raii::rtti::Shape::Class {
                 mutable: #mutable,
                 inner: ::std::boxed::Box::new(::bstack_raii::rtti::Shape::Pod {
-                    width: ::core::mem::size_of::<#ty>() as u32,
+                    width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "class-variable width"),
                 }),
                 value: {
                     let __v: #ty = #expr;
@@ -391,6 +408,24 @@ fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::R
 
     // `Option<Inner>` — nullable leaf / child.
     if let Some(inner) = option_inner(ty) {
+        // A POD `Option<T>` (`T: PodInOption`) is itself `Pod`, using bytemuck's
+        // **in-place** niche — NOT the offset-0 `u64` niche `Shape::Option` denotes.
+        // Describe it as opaque POD of its whole width (matching the tuple lowering), so
+        // the interpreter reads the niche bytes verbatim instead of a `u64` at the slot
+        // (which would overlap the next field / run past the block). Only a *reference*
+        // `Option` (`owned`/`strong`/`weak`/`ref`/`foreign`, or a `Vec`) is the offset-0
+        // niche.
+        //
+        // An un-annotated `Option<Vec<T>>` / `Option<String>` is *also* `Kind::Pod`, but
+        // its on-disk form is a 16-byte `VecDesc` with the `data_off == 0` niche — the
+        // offset-0 container niche, not an inline POD value. Exclude a container inner
+        // here so it falls through to the `Shape::Option(Shape::Vec(..))` lowering
+        //; the bytemuck in-place niche is only for a genuine scalar POD.
+        if kind == Kind::Pod && vec_info(inner).is_none() {
+            return Ok(quote!(::bstack_raii::rtti::Shape::Pod {
+                width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
+            }));
+        }
         let inner_shape = leaf_or_container_shape(fname, ty, inner, kind)?;
         return Ok(
             quote!(::bstack_raii::rtti::Shape::Option(::std::boxed::Box::new(#inner_shape))),
@@ -399,6 +434,31 @@ fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::R
 
     let _ = field;
     leaf_or_container_shape(fname, ty, ty, kind)
+}
+
+/// The `Shape::Vec` region shape for a `Vec<T>` / `String` `ty`, or `None` if `ty` is
+/// neither. A `Vec` / `String` on disk is a 16-byte `VecDesc` region (offset-0 niche),
+/// **not** an inline value — so every shape path (a bare field, an `Option` inner, an
+/// array element) must recognise it the same way. Centralised here so no sibling path
+/// can drift back to treating it as opaque POD (the exact defect this guards against).
+fn vec_region_shape(
+    fname: &str,
+    orig: &Type,
+    ty: &Type,
+    kind: Kind,
+) -> Option<syn::Result<TokenStream>> {
+    let _vi = vec_info(ty)?;
+    Some((|| {
+        if _vi.is_string {
+            return Ok(quote!(::bstack_raii::rtti::Shape::Vec(
+                ::std::boxed::Box::new(::bstack_raii::rtti::Shape::Pod { width: 1 })
+            )));
+        }
+        // The element carries the field's ownership kind (POD bytes, or block offsets).
+        let elem = vec_inner(ty).expect("vec_info matched");
+        let elem_shape = leaf_shape(fname, orig, elem, kind)?;
+        Ok(quote!(::bstack_raii::rtti::Shape::Vec(::std::boxed::Box::new(#elem_shape))))
+    })())
 }
 
 /// The non-`Option` part of the shape: a `Vec` / `String` region, an `[T; N]` array,
@@ -410,29 +470,26 @@ fn leaf_or_container_shape(
     ty: &Type,
     kind: Kind,
 ) -> syn::Result<TokenStream> {
-    // `Vec<T>` / `String` — a dynamically-sized region; the element carries the
-    // field's ownership kind (POD bytes, or block offsets).
-    if let Some(vi) = vec_info(ty) {
-        if vi.is_string {
-            return Ok(quote!(::bstack_raii::rtti::Shape::Vec(
-                ::std::boxed::Box::new(::bstack_raii::rtti::Shape::Pod { width: 1 })
-            )));
-        }
-        let elem = vec_inner(ty).expect("vec_info matched");
-        let elem_shape = leaf_shape(fname, orig, elem, kind)?;
-        return Ok(quote!(::bstack_raii::rtti::Shape::Vec(::std::boxed::Box::new(#elem_shape))));
+    // `Vec<T>` / `String` — a dynamically-sized region.
+    if let Some(r) = vec_region_shape(fname, orig, ty, kind) {
+        return r;
     }
 
     // `[T; N]` (possibly nested `[[T; N]; M]`, possibly `[Option<T>; N]`).
     if matches!(ty, Type::Array(_)) {
         let (dims, leaf, nullable) = array_shape(ty)?;
         let mut acc = leaf_shape(fname, orig, leaf, kind)?;
-        if nullable {
+        // A per-element `Option` is the offset-0 `u64` niche only for a *reference*
+        // element. A POD `[Option<T>; N]` (`T: PodInOption`) uses bytemuck's in-place
+        // niche, and `leaf_shape` already produced opaque POD of the element's width
+        // (`size_of::<T>() == size_of::<Option<T>>()`), so it must NOT be wrapped in
+        // `Shape::Option` (see `field_shape`).
+        if nullable && kind != Kind::Pod {
             acc = quote!(::bstack_raii::rtti::Shape::Option(::std::boxed::Box::new(#acc)));
         }
         for dim in dims.iter().rev() {
             acc = quote!(::bstack_raii::rtti::Shape::Array {
-                n: (#dim) as u32,
+                n: ::bstack_raii::__private::rtti_narrow_u32(#dim, "array length"),
                 inner: ::std::boxed::Box::new(#acc),
             });
         }
@@ -458,6 +515,13 @@ fn foreign_kind_variant(kind: Kind) -> Option<TokenStream> {
 /// tag + ownership kind), or an in-file block reference (its target's tag), selected by
 /// the ownership `kind`.
 fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
+    // A `Vec<T>` / `String` reached as a leaf — an array element (`[Vec<u8>; N]`) is the
+    // path that bypasses `leaf_or_container_shape`'s own check. Recognise the container
+    // region here too rather than falling through to the opaque-POD arm below, which
+    // would record its Rust handle size instead of the 16-byte `VecDesc`.
+    if let Some(r) = vec_region_shape(fname, orig, ty, kind) {
+        return r;
+    }
     // A scalar `Foreign<T>`: emit the target tag + the ownership kind.
     if let Some(target) = foreign_inner(ty) {
         let fk = foreign_kind_variant(kind).ok_or_else(|| {
@@ -516,7 +580,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
                 // Opaque POD of the whole member type (an `Option<PodInOption>` keeps
                 // its bytemuck niche inline).
                 quote!(::bstack_raii::rtti::Shape::Pod {
-                    width: ::core::mem::size_of::<#e>() as u32,
+                    width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#e>(), "tuple element width"),
                 })
             };
             elems.push(es);
@@ -527,7 +591,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
     }
     Ok(match kind {
         Kind::Pod => quote!(::bstack_raii::rtti::Shape::Pod {
-            width: ::core::mem::size_of::<#ty>() as u32,
+            width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
         }),
         other => {
             let variant = kind_variant(other).expect("non-POD kind");

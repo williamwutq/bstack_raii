@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2b625810b994bceafedbff59f903858dd1a472d396bfc64d18d90f793e8fddb5 # shrinks to spec = Spec { child: false, kids: 0, shared: false, watch: false, alias: false, bytes: 0, nested: None }
+cc c05b55b38842ba8a418f23025608bf35927886576748c9c01b4581f268d7ffa0 # shrinks to spec = Spec { child: false, kids: 1, shared: false, watch: false, alias: false, bytes: 0, nested: None }
+cc b62abafd4650dcc6d4c0c7a555ad647128ce10a41d59a3126e6dfb54a4398f09 # shrinks to spec = Spec { child: false, kids: 2, shared: false, watch: false, alias: false, bytes: 0, nested: Some(Spec { child: false, kids: 3, shared: false, watch: false, alias: false, bytes: 0, nested: Some(Spec { child: false, kids: 3, shared: false, watch: false, alias: false, bytes: 0, nested: None }) }) }

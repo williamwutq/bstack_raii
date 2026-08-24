@@ -979,10 +979,11 @@ struct Card {
     #[bstack_owned] body: Foreign<Document>,   // owns a Document in another file
 }
 
-// Construct with an explicit (file, offset) pointer. `Foreign::new` is `unsafe`
-// (it asserts the offset names a valid `T`); the safe ways to obtain one are
-// `bstack_cast!(slice as Foreign<T>)`, `Foreign::at(file, &handle)`, or simply
-// reading a field.
+// Construct with an explicit (file, offset) pointer. `Foreign::new` (and the
+// bare-offset `Foreign::at`) are `unsafe` — they assert the offset names a valid
+// `T` *in that file*, which a raw offset can't prove. The safe ways to name a
+// block are `bstack_cast!(slice as Foreign<T>)` / `from_local` (registry-resolved
+// to an explicit file id) or simply reading a field.
 let ptr = unsafe { Foreign::<Document>::new(store_id, doc_off) };
 let card = Card::new(&catalog, "report", ptr)?;
 
@@ -1083,10 +1084,13 @@ prefix** followed by a **hash tail**.
 
 1. **Prefix** — derived from the type name. For a multi-word camel-case name, the
    uppercased word initials (`OrderLine` → `OL`); for a single word, its
-   de-voweled uppercase (`Session` → `SSSN`, clamped). It's 2–5 bytes.
-2. **Hash** — a 64-bit **FNV-1a** hash of `crate_name ++ "\0" ++ type_name`,
-   little-endian. Every byte then has its **high bit set** (`| 0x80`), pushing it
-   into the non-printable range so it can't be mistaken for prefix text.
+   de-voweled uppercase (`Session` → `SSSN`, clamped). It's 2–4 bytes, so at
+   least 4 hash bytes always remain.
+2. **Hash** — a 64-bit **FNV-1a** hash of `crate_name ++ "\0" ++ type_name`, with
+   the type's `module_path!()` folded into the tail (so same-named types in
+   different modules stay distinct), little-endian. Every byte then has its **high
+   bit set** (`| 0x80`), pushing it into the non-printable range so it can't be
+   mistaken for prefix text.
 3. **Overlay** — the prefix bytes overwrite the low bytes of the hash from the
    front; the remaining high bytes are the hash tail.
 
@@ -1102,8 +1106,9 @@ hash, exactly 8 is fully manual):
 struct OrderLine { /* … */ }
 ```
 
-`ctrl_tag = "…"` overrides the control-block tag (default: the data tag,
-lowercased). An override longer than 8 bytes is truncated with a compile warning;
+`ctrl_tag = "…"` overrides the control-block tag (default: the data tag with a
+reserved hash bit toggled — same readable prefix, always distinct). An override
+longer than 8 bytes is truncated with a compile warning;
 `#[bstack_block(allow(overlong_tag))]` silences it (as does `allow(coerced_ref)`
 for the coercion warning, or a real `#[allow(deprecated)]` on the item).
 

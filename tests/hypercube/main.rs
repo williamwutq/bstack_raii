@@ -8,7 +8,7 @@
 //! fixed set of *operations* (construct / read / mutate / teardown / clone / move /
 //! cast / refcount / foreign-resolve / atomicity / wal).
 //!
-//! Rather than one bespoke fixture per cell (the old `src/tests.rs` had ~140), we
+//! Rather than one bespoke fixture per cell (which would be ~140), we
 //! declare the axes **once** as reusable "sink" fixtures in [`fixtures`], and
 //! organize the tests **by operation** — one module (file) per concern, each
 //! iterating the shared sinks. Shared harness lives in [`common`].

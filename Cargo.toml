@@ -40,3 +40,6 @@ linkme = "0.3"
 # Compile-fail (`tests/hypercube/ui/*.rs`): asserts each illegal macro input fails
 # with the *right* error, keeping the negative cases out of lib.rs doctests.
 trybuild = "1"
+# H2 (FUZZ.md): the CI-friendly, non-libFuzzer mirror of the model-based
+# op-sequence fuzzer — random `Op` sequences with shrinking on failure.
+proptest = "1"

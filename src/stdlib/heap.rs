@@ -39,7 +39,8 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::replace::{ReplaceError, finish_handback};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackBinaryHeap`]: header, array-block pointer
 /// (`0` = none), capacity in slots, and element count. Non-generic.
@@ -77,11 +78,23 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         Self::ksize() as u64 + 8
     }
 
+    /// The absolute offset of slot `i` in the array at `data`, rejecting overflow.
+    /// `data`/`i` (via a corrupted on-disk `len`/`cap`) are not otherwise bounded
+    /// against the array's real allocated size, so an unchecked `data + i*stride`
+    /// could wrap to an unrelated in-file offset that a write then corrupts.
+    fn slot_off(data: u64, i: u64) -> io::Result<u64> {
+        let delta = i
+            .checked_mul(Self::stride())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap slot overflow"))?;
+        data.checked_add(delta)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap slot overflow"))
+    }
+
     fn value_size() -> u64 {
         size_of::<<V as BStackBlock>::OnDisk>() as u64
     }
     fn value_at(off: u64) -> V {
-        <V as BStackBlock>::from_range(BStackRange::new(off, Self::value_size()))
+        unsafe { <V as BStackBlock>::from_range(BStackRange::new(off, Self::value_size())) }
     }
     fn read_key(slot: &[u8]) -> K {
         bytemuck::pod_read_unaligned::<K>(&slot[..Self::ksize()])
@@ -99,7 +112,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
     /// Read the `stride` raw bytes of slot `i`.
     fn read_slot(stack: &BStack, data: u64, i: u64) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; Self::stride() as usize];
-        stack.get_into(data + i * Self::stride(), &mut buf)?;
+        stack.get_into(Self::slot_off(data, i)?, &mut buf)?;
         Ok(buf)
     }
 
@@ -185,13 +198,16 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         allocator: &A,
         key: K,
         value: BStackOwned<V>,
-    ) -> io::Result<()> {
+    ) -> Result<(), ReplaceError<BStackOwned<V>>> {
         let handle = self.range.start();
         let stride = Self::stride();
-        let val_ref = value.into_inner().range().start();
+        // Guard the value block: on failure [`finish_handback`] returns it to the
+        // caller rather than freeing it, defused once linked.
+        let value = value.auto(allocator);
+        let val_ref = value.range().start();
         let key_bytes = bytemuck::bytes_of(&key).to_vec();
 
-        loop {
+        let outcome: io::Result<()> = (|| loop {
             let (data, cap, len) = Self::read_meta(allocator.stack(), handle)?;
             if data == 0 || len >= cap {
                 self.grow(allocator)?;
@@ -211,7 +227,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
                 let parent_slot = Self::read_slot(allocator.stack(), data, parent)?;
                 if Self::read_key(&parent_slot) > key {
                     writes.push((
-                        data + hole * stride,
+                        Self::slot_off(data, hole)?,
                         SmallBuf::Heap(parent_slot.into_boxed_slice()),
                     ));
                     hole = parent;
@@ -220,13 +236,15 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
                 }
             }
             writes.push((
-                data + hole * stride,
+                Self::slot_off(data, hole)?,
                 SmallBuf::Heap(new_slot.into_boxed_slice()),
             ));
             writes.push(w8(handle + LEN_OFF, len + 1));
             allocator.stack().set_batched(writes)?;
+            // Linked into the heap.
             return Ok(());
-        }
+        })();
+        finish_handback(value, outcome)
     }
 
     /// Remove and return the minimum entry (its value block owned), or `None` if
@@ -236,7 +254,6 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         allocator: &A,
     ) -> io::Result<Option<(K, BStackOwned<V>)>> {
         let handle = self.range.start();
-        let stride = Self::stride();
         let (data, _cap, len) = Self::read_meta(allocator.stack(), handle)?;
         if len == 0 {
             return Ok(None);
@@ -279,7 +296,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
             }
             if smaller_key < last_key {
                 writes.push((
-                    data + hole * stride,
+                    Self::slot_off(data, hole)?,
                     SmallBuf::Heap(smaller.into_boxed_slice()),
                 ));
                 hole = child;
@@ -288,7 +305,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
             }
         }
         writes.push((
-            data + hole * stride,
+            Self::slot_off(data, hole)?,
             SmallBuf::Heap(last_slot.into_boxed_slice()),
         ));
         writes.push(w8(handle + LEN_OFF, newlen));
@@ -306,12 +323,32 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         let handle = self.range.start();
         let stride = Self::stride();
         let (data, cap, len) = Self::read_meta(allocator.stack(), handle)?;
-        let newcap = if cap == 0 { MIN_CAP } else { cap * 2 };
-        let newdata = allocator.alloc(newcap * stride)?.as_range().start();
+        let newcap = if cap == 0 {
+            MIN_CAP
+        } else {
+            cap.saturating_mul(2)
+        };
+        // A corrupted on-disk `cap` near `u64::MAX` would otherwise make
+        // `cap * 2` wrap small (silently swapping in a tiny array while `len`
+        // still reflects the old count) or panic under overflow-checks; reject
+        // it instead of ever installing a smaller-or-equal capacity.
+        if newcap <= cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt heap capacity",
+            ));
+        }
+        let new_size = newcap
+            .checked_mul(stride)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap capacity overflow"))?;
+        let newdata = allocator.alloc(new_size)?.as_range().start();
 
         // Copy the live elements into the new (orphan) array.
         if len > 0 {
-            let mut buf = vec![0u8; (len * stride) as usize];
+            let len_size = len.checked_mul(stride).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "heap length overflow")
+            })?;
+            let mut buf = vec![0u8; len_size as usize];
             allocator.stack().get_into(data, &mut buf)?;
             allocator.stack().set(newdata, buf)?;
         }
@@ -323,15 +360,14 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
 
         if data != 0 {
             // SAFETY: the descriptor no longer points at the old array.
-            let _ = unsafe { dealloc_range(allocator, BStackRange::new(data, cap * stride)) };
+            let _ = unsafe {
+                dealloc_range(
+                    allocator,
+                    BStackRange::new(data, cap.saturating_mul(stride)),
+                )
+            };
         }
         Ok(())
-    }
-
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the heap was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
     }
 }
 
@@ -350,7 +386,7 @@ impl<K: Pod + Ord, V: BStackBlock> crate::block::BStackEmbeddable for BStackBina
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     type OnDisk = HeapOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackBinaryHeap {
             range,
             _marker: PhantomData,
@@ -379,8 +415,11 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
             }
         }
         if data != 0 {
+            let size = cap.checked_mul(Self::stride()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "heap capacity overflow")
+            })?;
             // SAFETY: the heap solely owns its array block.
-            unsafe { dealloc_range(allocator, BStackRange::new(data, cap * Self::stride()))? };
+            unsafe { dealloc_range(allocator, BStackRange::new(data, size))? };
         }
         Ok(())
     }
@@ -398,7 +437,18 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
         let (data, _cap, len) = Self::read_meta(allocator.stack(), handle)?;
 
         let (new_data, new_cap) = if len > 0 {
-            let mut image = vec![0u8; (len * stride) as usize];
+            // Untrusted `len`: checked math + stack bound, matching the grow
+            // path's `checked_mul` guards.
+            let arr_size = len.checked_mul(stride).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "heap length overflow")
+            })?;
+            if arr_size > allocator.stack().len()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "heap element array larger than the stack",
+                ));
+            }
+            let mut image = vec![0u8; arr_size as usize];
             allocator.stack().get_into(data, &mut image)?;
             // Deep-clone each value and repoint its ref in the copy (heap order
             // is preserved, so the array stays a valid heap).
@@ -410,7 +460,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
                     .start();
                 image[vo..vo + 8].copy_from_slice(&cloned.to_le_bytes());
             }
-            let dst = plan.alloc_raw(allocator, len * stride)?;
+            let dst = plan.alloc_raw(allocator, arr_size)?;
             plan.write(dst.start(), image);
             (dst.start(), len)
         } else {
@@ -427,14 +477,6 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
             len,
         };
         Ok(od)
-    }
-}
-
-impl<K: Pod + Ord, V: BStackBlock> BStackDrop for BStackBinaryHeap<K, V> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 

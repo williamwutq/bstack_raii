@@ -15,6 +15,7 @@ use quote::{format_ident, quote};
 use syn::{Error, Fields, Ident, ItemStruct, Type};
 
 use crate::emit::*;
+use crate::model::FieldCtx;
 use crate::util::*;
 
 pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> {
@@ -75,6 +76,19 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             .collect(),
         Fields::Unit => Vec::new(),
     };
+
+    // The generated constructor takes a fixed `allocator` parameter; a field named
+    // exactly `allocator` would collide with it, producing a confusing `E0415`. Reject
+    // it up front with a clear message (the field params sit alongside `allocator`).
+    for (fname, _) in &field_list {
+        if fname == "allocator" {
+            return Err(Error::new_spanned(
+                fname,
+                "[BSTACK0310] a field named `allocator` collides with the generated \
+                 constructor's `allocator` parameter; rename the field",
+            ));
+        }
+    }
 
     let name = &input.ident;
     let vis = &input.vis;
@@ -154,7 +168,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             match kind {
                 Kind::Pod => {
                     u.pod = true;
-                    u.in_ondisk = true;
+                    // Inline only if the parameter is actually stored inline. A
+                    // `Vec<T>` element lowers to a `VecDesc` (offset), so `T` must not
+                    // make `XOnDisk` generic over it (else `E0392`, T never used).
+                    u.in_ondisk = param_stored_inline(&field.ty, p);
                 }
                 Kind::Embed => {
                     u.blockish = true;
@@ -314,6 +331,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let mut ctor_params = Vec::new();
     let mut ctor_preps = Vec::new();
     let mut ctor_inits = Vec::new();
+    // Per-owning-child hand-back on a failed construction: the
+    // reconstruction expression and its `Self::Fields` element type.
+    let mut ctor_handback: Vec<TokenStream> = Vec::new();
+    let mut ctor_handback_ty: Vec<TokenStream> = Vec::new();
     // Post-write construction steps (`#[embed]` `BStack::copy`s the child into its
     // inline slot after the block's OnDisk is written).
     let mut ctor_post: Vec<TokenStream> = Vec::new();
@@ -328,6 +349,18 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
     for (fname, field) in &field_list {
         let kind = classify(field)?;
+        // The invariant inputs every `emit::*_field` lowering shares, bundled once so
+        // each emitter takes `(&ctx, inner_ty, nullable?)` instead of a 7–10-arg list.
+        let fctx = FieldCtx {
+            vis,
+            name,
+            fname,
+            field,
+            kind,
+            on_disk_ty: &on_disk_ty,
+            type_params: &type_params,
+            const_params: &const_params,
+        };
         // The public accessor name (`get_<field>`); `#fname` itself stays the
         // on-disk field / struct-literal name throughout.
 
@@ -399,21 +432,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // slot, lifetime-bound accessor, ctor wiring, per-kind cross-file teardown /
         // deep-clone, `bstack_move!` RAII duals, and `#[bstack_mut]` mutators).
         if let Some(ftarget) = foreign_inner(opt_inner) {
-            let fp = foreign_field(
-                vis,
-                fname,
-                field,
-                ftarget,
-                kind,
-                nullable,
-                &on_disk_ty,
-                &type_params,
-            )?;
+            let fp = foreign_field(&fctx, ftarget, nullable)?;
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
             mv_caps.extend(fp.mv_caps);
@@ -435,23 +461,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             vec_info(opt_inner)
         };
         if let Some(vinfo) = vinfo {
-            let fp = vec_field(
-                vis,
-                fname,
-                field,
-                opt_inner,
-                vinfo,
-                kind,
-                nullable,
-                &on_disk_ty,
-                &type_params,
-                &const_params,
-            )?;
+            let fp = vec_field(&fctx, opt_inner, vinfo, nullable)?;
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
             mv_caps.extend(fp.mv_caps);
@@ -468,21 +485,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `VecDesc`s are Pod bytes, but the data blocks need a real lifecycle, so it
         // must NOT fall through to the plain POD path. The element annotation names
         // the inner vectors' element ownership, exactly like a scalar `Vec<T>`.
-        if let Some(fp) = vec_array_field(
-            vis,
-            fname,
-            field,
-            opt_inner,
-            kind,
-            nullable,
-            &on_disk_ty,
-            &const_params,
-        )? {
+        if let Some(fp) = vec_array_field(&fctx, opt_inner, nullable)? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
             mv_caps.extend(fp.mv_caps);
@@ -496,22 +506,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // Stored flat as `[ForeignPtr; TOTAL]` inline (16 B each, no data block); each
         // slot's teardown / clone dispatches cross-file exactly like a scalar `Foreign`.
         // A null/unset slot is a `Foreign` whose offset is `0`. Must be annotated.
-        if let Some(fp) = foreign_array_field(
-            vis,
-            fname,
-            field,
-            opt_inner,
-            kind,
-            nullable,
-            &on_disk_ty,
-            &type_params,
-            &const_params,
-        )? {
+        if let Some(fp) = foreign_array_field(&fctx, opt_inner, nullable)? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
             mv_caps.extend(fp.mv_caps);
@@ -526,23 +528,15 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // array of `Pod` is `Pod`.) Stored **flat** as `[u64; N0*..*Nk]` inline
         // (no data block), one offset per leaf, with per-element ownership; the
         // accessor / ctor / move traffic in the nested `[[Handle; ..]; ..]` shape.
-        if let Some(fp) = block_array_field(
-            vis,
-            fname,
-            field,
-            opt_inner,
-            kind,
-            nullable,
-            &on_disk_ty,
-            &type_params,
-            &const_params,
-        )? {
+        if let Some(fp) = block_array_field(&fctx, opt_inner, nullable)? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             setters.extend(fp.setters);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             ctor_post.extend(fp.ctor_post);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
@@ -573,21 +567,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // *all* the foreign elements — they are freed / decremented / deep-cloned in
         // their own files at teardown / clone. `Option<Foreign<T>>` elements use the
         // offset-0 niche. (Concrete element types only for now — no generic params.)
-        if let Some(fp) = foreign_tuple_field(
-            vis,
-            name,
-            fname,
-            field,
-            inner_ty,
-            kind,
-            nullable,
-            &on_disk_ty,
-        )? {
+        if let Some(fp) = foreign_tuple_field(&fctx, inner_ty, nullable)? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
             mv_caps.extend(fp.mv_caps);
@@ -602,12 +589,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // packed struct of its (POD) elements is — alignment is irrelevant on disk
         // — so store it through a generated wrapper and rebuild the tuple on read.
         // `bstack_move!` hands back the tuple as one element (not flattened).
-        if let Some(fp) = pod_tuple_field(vis, name, fname, field, inner_ty, kind, &on_disk_ty)? {
+        if let Some(fp) = pod_tuple_field(&fctx, inner_ty)? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             mv_caps.extend(fp.mv_caps);
             mv_types.extend(fp.mv_types);
             mv_recon.extend(fp.mv_recon);
@@ -619,21 +608,14 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `#[embed] child: Block`: store the child's whole on-disk form INLINE
         // (`<Child as BStackBlock>::OnDisk`, header and all) instead of a `u64`
         // offset — an exclusively-owned inline block.
-        if let Some(fp) = embed_field(
-            vis,
-            fname,
-            field,
-            inner_ty,
-            kind,
-            nullable,
-            &on_disk_ty,
-            &type_params,
-        )? {
+        if let Some(fp) = embed_field(&fctx, inner_ty, nullable)? {
             on_disk_fields.extend(fp.on_disk_fields);
             accessors.extend(fp.accessors);
             ctor_params.extend(fp.ctor_params);
             ctor_preps.extend(fp.ctor_preps);
             ctor_inits.extend(fp.ctor_inits);
+            ctor_handback.extend(fp.ctor_handback);
+            ctor_handback_ty.extend(fp.ctor_handback_ty);
             ctor_post.extend(fp.ctor_post);
             drop_stmts.extend(fp.drop_stmts);
             clone_stmts.extend(fp.clone_stmts);
@@ -646,13 +628,15 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
         // Scalar fall-through (POD inline, or a single owned/strong/weak/ref block
         // reference): reader / mutators / ctor / teardown / clone / move.
-        let fp = scalar_field(vis, fname, field, inner_ty, kind, nullable, &on_disk_ty)?;
+        let fp = scalar_field(&fctx, inner_ty, nullable)?;
         on_disk_fields.extend(fp.on_disk_fields);
         accessors.extend(fp.accessors);
         setters.extend(fp.setters);
         ctor_params.extend(fp.ctor_params);
         ctor_preps.extend(fp.ctor_preps);
         ctor_inits.extend(fp.ctor_inits);
+        ctor_handback.extend(fp.ctor_handback);
+        ctor_handback_ty.extend(fp.ctor_handback_ty);
         drop_stmts.extend(fp.drop_stmts);
         clone_stmts.extend(fp.clone_stmts);
         mv_caps.extend(fp.mv_caps);
@@ -661,8 +645,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         pod_types.extend(fp.pod_types);
     }
 
-    // EightCC tags: readable prefix over a hash of `crate ++ type_name`. The
-    // control tag uses the same hash with the prefix lowercased.
+    // EightCC tags: a readable prefix over a hash of `crate ++ type_name`, with
+    // the type's `module_path!()` folded into the hash tail at runtime. The
+    // control tag is the data tag with a reserved hash bit toggled.
     let type_name = name.to_string();
     let crate_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
     let hash = fnv1a64(&format!("{crate_name}\0{type_name}"));
@@ -670,24 +655,26 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         || auto_prefix(&type_name),
         |t| t.bytes().collect::<Vec<u8>>(),
     );
-    let ctrl_prefix = attr.ctrl_tag.as_ref().map_or_else(
-        || {
-            data_prefix
-                .iter()
-                .map(u8::to_ascii_lowercase)
-                .collect::<Vec<u8>>()
-        },
-        |t| t.bytes().collect::<Vec<u8>>(),
-    );
     let data_tag = build_tag(hash, &data_prefix);
-    let ctrl_tag = build_tag(hash, &ctrl_prefix);
-    let data_eightcc = eightcc_expr(&data_tag.bytes);
-    let ctrl_eightcc = eightcc_expr(&ctrl_tag.bytes);
-    // For a generic block, fold each type argument's tag into the discriminant
-    // so distinct instantiations get distinct tags (the `eightcc()` body — always
+    // [BSTACK0005] A generic block's instantiations are distinguished only by the
+    // tag's *hash* bytes (`mix` perturbs bytes with the high bit set; an ASCII
+    // prefix byte is skipped). An 8-byte explicit tag leaves no hash bytes, so
+    // `mix` becomes the identity and EVERY instantiation shares one tag — a safe
+    // `bstack_cast!` then confuses instantiations of different sizes.
+    if !(type_params.is_empty() && const_params.is_empty()) && data_prefix.len() >= 8 {
+        return Err(Error::new_spanned(
+            &input.ident,
+            "[BSTACK0005] an explicit 8-byte tag override on a generic block leaves no \
+             hash bytes to distinguish instantiations — every instantiation would share \
+             one tag; shorten the tag (at most 4 bytes recommended)",
+        ));
+    }
+    let data_base = eightcc_expr(&data_tag.bytes);
+    // For a generic block, fold each type argument's tag into the discriminant so
+    // distinct instantiations get distinct tags (the `eightcc()` body — always
     // called at runtime — mixes them; the readable prefix stays the outer name's).
-    let data_eightcc = if type_params.is_empty() && const_params.is_empty() {
-        data_eightcc
+    let data_mixed = if type_params.is_empty() && const_params.is_empty() {
+        data_base
     } else {
         // A block parameter has its own `eightcc`; a POD one does not, so fold in
         // its byte size instead (distinct-size instantiations get distinct tags;
@@ -705,7 +692,44 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         let const_mixes = const_params
             .iter()
             .map(|c| quote!(.mix(::bstack_raii::EightCC::new((#c as u64).to_le_bytes()))));
-        quote!(#data_eightcc #(#mixes)* #(#const_mixes)*)
+        quote!(#data_base #(#mixes)* #(#const_mixes)*)
+    };
+    // Fold the module path so two same-named types in *different modules* of one
+    // crate get distinct tags (issue 2). `module_path!()` is a runtime constant
+    // evaluated in the type's own module; the on-disk header is stamped via this
+    // same `eightcc()`, and the RTTI registry records this same value, so all
+    // three stay consistent.
+    let data_eightcc = quote!(#data_mixed.mix_str(::core::module_path!()));
+
+    // Control-block tag (rc, weak). Default: the data tag with a reserved hash bit
+    // toggled — same readable prefix, structurally distinct (`with_ctrl_bit` can't
+    // collide with the data tag regardless of the prefix, unlike the old
+    // prefix-lowercasing — issue 36). Explicit `ctrl_tag =` override: its own
+    // readable prefix, still module-path-folded.
+    let (ctrl_eightcc, ctrl_truncated) = match attr.ctrl_tag.as_ref() {
+        None => (quote!(#data_eightcc.with_ctrl_bit()), false),
+        Some(t) => {
+            let ctrl_prefix = t.bytes().collect::<Vec<u8>>();
+            let ctrl_tag = build_tag(hash, &ctrl_prefix);
+            // [BSTACK0006] An explicit `ctrl_tag` equal to the data tag collapses
+            // the data/control distinction — a control block would then pass every
+            // data-block identity check. The default derivation can't reach this
+            // (`with_ctrl_bit` guarantees a difference), so only the override is
+            // checked.
+            if ctrl_tag.bytes == data_tag.bytes {
+                return Err(Error::new_spanned(
+                    &input.ident,
+                    "[BSTACK0006] the explicit `ctrl_tag` equals the data tag — a \
+                     control block would then pass every data-block identity check; \
+                     choose a distinct `ctrl_tag` (or omit it to auto-derive one)",
+                ));
+            }
+            let ctrl_base = eightcc_expr(&ctrl_tag.bytes);
+            (
+                quote!(#ctrl_base.mix_str(::core::module_path!())),
+                ctrl_tag.truncated,
+            )
+        }
     };
 
     // The warnings use the `deprecated` mechanism, so a real `#[allow(deprecated)]`
@@ -715,7 +739,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let allow_coerced_ref = attr.allow_coerced_ref || allow_deprecated;
 
     // Overlong `tag =` / `ctrl_tag =` overrides warn (unless silenced) + truncate.
-    let overlong_warning = if (data_tag.truncated || ctrl_tag.truncated) && !allow_overlong {
+    let overlong_warning = if (data_tag.truncated || ctrl_truncated) && !allow_overlong {
         let warn_fn = format_ident!("__bstack_tag_overlong_{}", name);
         let msg = format!(
             "#[bstack_block] on `{type_name}`: a tag override longer than 8 bytes was truncated; \
@@ -768,7 +792,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         quote!()
     };
 
-    let weakable_items = weakable_items(mode, name, &control, vis);
+    let weakable_items = weakable_items(mode, name, &control, &ctrl_eightcc, vis);
 
     let constructor = constructor(
         vis,
@@ -779,6 +803,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         &ctor_params,
         &ctor_preps,
         &ctor_inits,
+        &ctor_handback,
+        &ctor_handback_ty,
         &ctor_post,
     );
 
@@ -901,7 +927,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
                     })?;
                     ::std::result::Result::Ok(unsafe {
                         ::bstack_raii::BStackOwned::from_raw(
-                            <Self as ::bstack_raii::BStackBlock>::from_range(__dst),
+                            unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__dst) },
                         )
                     })
                 }
@@ -996,7 +1022,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
 
         impl #impl_g ::bstack_raii::BStackBlock for #name #ty_g #where_g {
             type OnDisk = #on_disk_ty;
-            fn from_range(range: ::bstack_raii::BStackRange) -> Self {
+            unsafe fn from_range(range: ::bstack_raii::BStackRange) -> Self {
                 #name(range #phantom_ctor)
             }
             fn range(&self) -> ::bstack_raii::BStackRange {
@@ -1029,15 +1055,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             }
         }
 
-        impl #impl_g ::bstack_raii::BStackDrop for #name #ty_g #where_g {
-            fn bstack_drop<__A: ::bstack_raii::BStackRaiiAllocator>(
-                self,
-                allocator: &__A,
-            ) -> ::std::io::Result<()> {
-                <Self as ::bstack_raii::BStackBlock>::__bstack_drop_children(self.0, allocator)?;
-                unsafe { ::bstack_raii::dealloc_range(allocator, self.0) }
-            }
-        }
+        // The handle is a pure view: no `BStackDrop`. Freeing goes through an
+        // affine owner (`BStackOwned<Self>` / a `*Ref` token), whose generic
+        // `bstack_drop` runs `__bstack_drop_children` + `dealloc_range` (see
+        // `teardown::drop_block`). This is the affine-handle fix.
 
         impl #impl_g #name #ty_g #where_g {
             #(#accessors)*

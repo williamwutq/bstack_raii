@@ -48,7 +48,7 @@ fn shared_ownership_demo(path: &std::path::Path) -> io::Result<()> {
     let config = Config::new(&alloc, 3, 0b1010)?;
     let mut sessions = Vec::new();
     for id in 0u64..3 {
-        sessions.push(Session::new(&alloc, id, config.try_clone()?)?);
+        sessions.push(Session::new(&alloc, id, config.try_clone()?).map_err(|e| e.into_source())?);
     }
 
     // A monitor observes the config without owning it.
@@ -100,7 +100,10 @@ fn durability_demo(path: &std::path::Path) -> io::Result<()> {
 
     // A later run reopens the same file and reads the persisted block back.
     let alloc = FirstFitBStackAllocator::new(BStack::open(path)?)?;
-    let cfg = <Config as BStackBlock>::from_range(saved);
+    // SAFETY: `saved` is the range of a real `Config` block persisted just above
+    // (its handle was `mem::forget`-ed, not freed), so it still names a valid
+    // `Config` in this reopened file. `from_range` is the raw handle constructor.
+    let cfg = unsafe { <Config as BStackBlock>::from_range(saved) };
     println!(
         "after reopen: config version {} (persisted across the close/reopen)",
         cfg.get_version(alloc.stack())?,

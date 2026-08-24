@@ -47,7 +47,7 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackCountingBloomFilter`]: header, counter-array
 /// pointer (`0` = none), counter count `m`, hash count `k`, and inserted-item
@@ -86,11 +86,23 @@ pub struct BStackCountingBloomFilter<K: Pod> {
 
 impl<K: Pod> BStackCountingBloomFilter<K> {
     /// The `k` counter indices for `key_bytes` (with possible repeats).
-    fn indices(m: u64, k: u64, key_bytes: &[u8]) -> Vec<u64> {
+    ///
+    /// `m`/`k` come straight from the on-disk handle; `new`/`with_capacity`
+    /// force `m >= 1` at construction, but a corrupted `m` field would
+    /// otherwise divide by zero here on every subsequent `contains`/`insert`/
+    /// `remove` — including through `BStackHashSet`/`BStackBTreeSet`'s
+    /// embedded filter.
+    fn indices(m: u64, k: u64, key_bytes: &[u8]) -> io::Result<Vec<u64>> {
+        if m == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt bloom filter: zero counter count",
+            ));
+        }
         let (h1, h2) = double_hash(key_bytes);
-        (0..k)
+        Ok((0..k)
             .map(|i| h1.wrapping_add(i.wrapping_mul(h2)) % m)
-            .collect()
+            .collect())
     }
 
     /// Collapse indices to distinct `(index, multiplicity)`, so a counter hit by
@@ -200,9 +212,12 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
         let handle = self.range.start();
         let [data, m, k] = read_fields::<3>(stack, handle + DATA_OFF)?;
         let key_bytes = bytemuck::bytes_of(key);
-        for idx in Self::indices(m, k, key_bytes) {
+        for idx in Self::indices(m, k, key_bytes)? {
             let mut b = [0u8; 1];
-            stack.get_into(data + idx, &mut b)?;
+            let off = data.checked_add(idx).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "bloom filter offset overflow")
+            })?;
+            stack.get_into(off, &mut b)?;
             if b[0] == 0 {
                 return Ok(false);
             }
@@ -228,8 +243,19 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     fn adjust<A: BStackRaiiAllocator>(&self, allocator: &A, key: &K, add: bool) -> io::Result<()> {
         let handle = self.range.start();
         let [data, m, k] = read_fields::<3>(allocator.stack(), handle + DATA_OFF)?;
-        let agg = Self::aggregate(Self::indices(m, k, bytemuck::bytes_of(key)));
+        let agg = Self::aggregate(Self::indices(m, k, bytemuck::bytes_of(key))?);
         let cn = agg.len();
+        // Precompute every counter's absolute offset up front (checked): `data`
+        // is an on-disk pointer that can be corrupted, and the generator
+        // closure below can't itself return `Result`.
+        let offs: Vec<u64> = agg
+            .iter()
+            .map(|&(idx, _)| {
+                data.checked_add(idx).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bloom filter offset overflow")
+                })
+            })
+            .collect::<io::Result<Vec<u64>>>()?;
 
         // Buffers that must outlive the whole `inplace_gen` call.
         let mut read_c = vec![0u8; cn];
@@ -252,7 +278,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
                 let b: &mut [u8] =
                     unsafe { core::mem::transmute::<&mut [u8], _>(&mut read_c[i..i + 1]) };
                 return Some(BStackGenOp::Read {
-                    offset: data + agg[i].0,
+                    offset: offs[i],
                     buf: b,
                 });
             }
@@ -271,7 +297,13 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
                 computed = true;
                 for i in 0..cn {
                     let mult = agg[i].1.min(255) as u8;
-                    new_c[i] = if add {
+                    new_c[i] = if !add && read_c[i] == 255 {
+                        // A counter that ever saturated has lost its true count, so it is
+                        // **pinned** at 255 forever — decrementing it could reach 0 while
+                        // members still map to it, causing a false negative (a present key
+                        // reported absent). The standard counting-bloom saturation rule.
+                        255
+                    } else if add {
                         read_c[i].saturating_add(mult)
                     } else {
                         read_c[i].saturating_sub(mult)
@@ -292,7 +324,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
                 // SAFETY: `new_c` outlives the call and is not mutated after compute.
                 let d: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(&new_c[i..i + 1]) };
                 return Some(BStackGenOp::Write {
-                    offset: data + agg[i].0,
+                    offset: offs[i],
                     data: d,
                 });
             }
@@ -308,12 +340,6 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
             }
             None
         })
-    }
-
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the filter was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
     }
 }
 
@@ -331,7 +357,7 @@ impl<K: Pod> crate::block::BStackEmbeddable for BStackCountingBloomFilter<K> {}
 impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
     type OnDisk = BloomOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackCountingBloomFilter {
             range,
             _marker: PhantomData,
@@ -386,14 +412,6 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
             n,
         };
         Ok(od)
-    }
-}
-
-impl<K: Pod> BStackDrop for BStackCountingBloomFilter<K> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 

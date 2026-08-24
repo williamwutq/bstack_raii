@@ -57,6 +57,7 @@ fn embed_sink_clone_is_independent() {
     let orig = h
         .handle()
         .get_child()
+        .unwrap()
         .get_owned(stack)
         .unwrap()
         .range()
@@ -64,6 +65,7 @@ fn embed_sink_clone_is_independent() {
     let clone = c
         .handle()
         .get_child()
+        .unwrap()
         .get_owned(stack)
         .unwrap()
         .range()
@@ -73,6 +75,7 @@ fn embed_sink_clone_is_independent() {
     assert_eq!(
         h.handle()
             .get_child()
+            .unwrap()
             .get_owned(stack)
             .unwrap()
             .get_v(stack)

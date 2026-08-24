@@ -86,8 +86,25 @@ impl<T: BStackBlock> BStackRef<T> {
             ));
         }
         let dst = &mut buf[..size];
-        // `OnDisk` is `#[repr(C, packed)]` (alignment 1), so any buffer address is
-        // adequately aligned and `from_bytes` will not panic on alignment.
+        // Macro-generated `OnDisk` types are `#[repr(C, packed)]` (alignment 1),
+        // but the hand-written stdlib ones are plain `#[repr(C)]` with `u64`
+        // fields (alignment 8), and nothing in the documented contract obliges
+        // the caller's buffer to be aligned — so check, and fail as an
+        // `io::Error` like every other contract violation here, rather than
+        // letting `from_bytes` panic.
+        if dst
+            .as_ptr()
+            .align_offset(core::mem::align_of::<T::OnDisk>())
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "read_on_disk: buffer not aligned to {} for T::OnDisk",
+                    core::mem::align_of::<T::OnDisk>()
+                ),
+            ));
+        }
         // `read_into` fills `min(dst.len(), block.len())`; for a fixed-size block
         // those are equal.
         let slice = unsafe { BStackSlice::from_raw_range(stack, self.range) };

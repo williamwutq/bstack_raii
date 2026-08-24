@@ -2,3 +2,8 @@
 **/target
 .DS_Store
 ._*
+
+# Fuzz-only vendored bstack snapshot (FUZZ.md Lever 2) — not shipped, not
+# checked in; regenerate from vendor/bstack/PIN.md's instructions.
+/vendor/bstack/*
+!/vendor/bstack/PIN.md

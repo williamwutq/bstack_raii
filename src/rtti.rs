@@ -71,11 +71,15 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::foreign::ForeignRepr;
 use crate::layout::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, EightCC,
-    RC_REFCOUNT_OFFSET,
+    RC_REFCOUNT_OFFSET, get_u64,
 };
 use crate::refcount;
 use crate::registry::{self, FileId, ForeignHostAllocator};
 use crate::small_map::SmallStringMap;
+use crate::wal::{
+    HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
+    wal_capacity_of, wal_set_idle,
+};
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
 /// `linkme` without the downstream crate depending on it directly. The generated
@@ -122,6 +126,51 @@ fn align8(n: u64) -> u64 {
 
 fn corrupt(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+/// Add two on-disk offsets/lengths, rejecting overflow. Every interpreter walk
+/// (`read_value` / `teardown` / `clone_value`) chains additions off a **root**
+/// offset that can be entirely attacker/caller-controlled (a forged pointer, or
+/// — as here — a fuzzed argument); an unchecked `+` either panics under
+/// `overflow-checks` or silently wraps to an unrelated in-bounds offset in a
+/// release build. Reject cleanly instead.
+fn add_off(a: u64, b: u64) -> io::Result<u64> {
+    a.checked_add(b)
+        .ok_or_else(|| corrupt("[BSTACK081A] RTTI offset arithmetic overflow"))
+}
+
+/// Multiply an on-disk element stride by an index, rejecting overflow — the
+/// `mul` counterpart of [`add_off`] for `Array`/`Vec` element offsets.
+fn mul_off(a: u64, b: u64) -> io::Result<u64> {
+    a.checked_mul(b)
+        .ok_or_else(|| corrupt("[BSTACK081A] RTTI offset arithmetic overflow"))
+}
+
+/// Narrow a compile-time-fixed layout quantity (a field's `offset_of!`, a POD
+/// field's `size_of`, or an array's element count) to the `u32` the RTTI wire
+/// format stores it as, panicking with a clear diagnostic instead of silently
+/// wrapping. Called from `#[bstack_class]`-generated schema-builder code
+/// (`RttiRegistration::build: fn() -> RttiType`, which cannot return `Result`),
+/// so the only way to trip this is a pathologically large compiled type (a
+/// multi-GiB inline field, or an array length in the billions) — never
+/// attacker-controlled data, but a silent wraparound here would otherwise
+/// persist a schema whose recorded offset/count doesn't match the real layout.
+#[doc(hidden)]
+pub fn rtti_narrow_u32(x: usize, what: &str) -> u32 {
+    u32::try_from(x).unwrap_or_else(|_| {
+        panic!("[BSTACK0817] RTTI {what} exceeds the maximum encodable size (u32)")
+    })
+}
+
+/// Error for an RTTI record component whose length overflows its fixed on-disk field
+/// width. Encode-side lengths (name, field/variant count, tuple arity, shape length,
+/// class-value length, body length) are written as `u8`/`u16`/`u32`; a type too large
+/// or too deeply nested to serialize is rejected at `append`/`sync` **before** a
+/// silently-truncated, permanently-unreadable record is written.
+fn too_large(what: &str, limit: &str) -> io::Error {
+    corrupt(format!(
+        "[BSTACK0817] RTTI {what} exceeds the maximum encodable size ({limit})"
+    ))
 }
 
 /// Build an RTTI-typed pointer: a [`ForeignRepr`] to `(file_id, offset)` tagged
@@ -171,8 +220,16 @@ pub struct AnyRef {
 
 impl AnyRef {
     /// Construct from a known tag + offset. Prefer [`RttiRegistry::any_ref`] (which
-    /// resolves the tag through the registry) or [`AnyRef::from_block`].
-    pub fn new(tag: EightCC, offset: u64) -> Self {
+    /// resolves the tag through the registry) or [`AnyRef::from_block`] — both are
+    /// safe because they read the tag from an authoritative source.
+    ///
+    /// # Safety
+    ///
+    /// `offset` must name a live block whose on-disk header carries exactly `tag`.
+    /// [`downcast`](Self::downcast) trusts the pair as given: a fabricated pair
+    /// yields an owning handle over an arbitrary range, whose safe `bstack_drop`
+    /// frees storage the caller does not own.
+    pub unsafe fn new(tag: EightCC, offset: u64) -> Self {
         Self { tag, offset }
     }
 
@@ -180,7 +237,7 @@ impl AnyRef {
     /// (`tag` at offset 8) — the no-registry path, one small read.
     pub fn from_block(data: &BStack, offset: u64) -> io::Result<Self> {
         let mut tag = [0u8; 8];
-        data.get_into(offset + HEADER_TAG_OFFSET, &mut tag)?;
+        data.get_into(add_off(offset, HEADER_TAG_OFFSET)?, &mut tag)?;
         Ok(Self {
             tag: EightCC(tag),
             offset,
@@ -206,7 +263,7 @@ impl AnyRef {
     /// else `None` — the RTTI `Any::downcast`. The handle borrows the block at this
     /// reference's offset (length recovered from `size_of::<T::OnDisk>()`).
     pub fn downcast<T: BStackBlock>(&self) -> Option<T> {
-        self.is::<T>().then(|| {
+        self.is::<T>().then(|| unsafe {
             T::from_range(BStackRange::new(
                 self.offset,
                 core::mem::size_of::<T::OnDisk>() as u64,
@@ -374,8 +431,15 @@ pub enum Shape {
     },
 }
 
+/// Maximum shape-tree nesting depth accepted when decoding an on-disk record. A real
+/// `#[bstack_class]` field nests only a handful of levels (e.g. `Option<Vec<[T; N]>>`);
+/// anything deeper is a corrupt or hand-forged record, and decoding it recursively
+/// would otherwise overflow the native stack. Generous relative to any real type, small
+/// relative to the stack.
+const MAX_SHAPE_DEPTH: usize = 64;
+
 impl Shape {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> io::Result<()> {
         use shape_tag as t;
         match self {
             Shape::Pod { width } => {
@@ -409,22 +473,25 @@ impl Shape {
             }
             Shape::Option(inner) => {
                 w.u8(t::OPTION);
-                inner.encode(w);
+                inner.encode(w)?;
             }
             Shape::Array { n, inner } => {
                 w.u8(t::ARRAY);
                 w.u32(*n);
-                inner.encode(w);
+                inner.encode(w)?;
             }
             Shape::Vec(inner) => {
                 w.u8(t::VEC);
-                inner.encode(w);
+                inner.encode(w)?;
             }
             Shape::Tuple(items) => {
                 w.u8(t::TUPLE);
-                w.u8(items.len() as u8);
+                // Arity is stored in one byte (a tuple's decode reads a `u8` count).
+                let arity = u8::try_from(items.len())
+                    .map_err(|_| too_large("tuple arity", "255 elements"))?;
+                w.u8(arity);
                 for it in items {
-                    it.encode(w);
+                    it.encode(w)?;
                 }
             }
             Shape::Class {
@@ -434,15 +501,32 @@ impl Shape {
             } => {
                 w.u8(t::CLASS);
                 w.u8(u8::from(*mutable));
-                inner.encode(w);
-                w.u32(value.len() as u32);
+                inner.encode(w)?;
+                let value_len = u32::try_from(value.len())
+                    .map_err(|_| too_large("class-variable value length", "4 GiB"))?;
+                w.u32(value_len);
                 w.bytes(value);
             }
         }
+        Ok(())
     }
 
     fn decode(r: &mut Reader) -> io::Result<Shape> {
+        Self::decode_at(r, 0)
+    }
+
+    /// Decode one shape at nesting `depth`, refusing to recurse past
+    /// [`MAX_SHAPE_DEPTH`]. Untrusted on-disk bytes drive the recursion (one nesting
+    /// tag per `Option` / `Array` / `Vec` / `Tuple` / `Class` level), so an
+    /// unbounded decode would let a corrupt record overflow the native stack during
+    /// `load_type` / `open`. (Width is already bounded — a tuple's arity is a `u8`.)
+    fn decode_at(r: &mut Reader, depth: usize) -> io::Result<Shape> {
         use shape_tag as t;
+        if depth >= MAX_SHAPE_DEPTH {
+            return Err(corrupt(
+                "[BSTACK0818] RTTI shape nesting exceeds the maximum depth",
+            ));
+        }
         let tag = r.u8()?;
         Ok(match tag {
             t::POD => Shape::Pod { width: r.u32()? },
@@ -455,26 +539,26 @@ impl Shape {
                 tag: r.eightcc()?,
                 kind: ForeignKind::from_u8(r.u8()?)?,
             },
-            t::OPTION => Shape::Option(Box::new(Shape::decode(r)?)),
+            t::OPTION => Shape::Option(Box::new(Shape::decode_at(r, depth + 1)?)),
             t::ARRAY => {
                 let n = r.u32()?;
                 Shape::Array {
                     n,
-                    inner: Box::new(Shape::decode(r)?),
+                    inner: Box::new(Shape::decode_at(r, depth + 1)?),
                 }
             }
-            t::VEC => Shape::Vec(Box::new(Shape::decode(r)?)),
+            t::VEC => Shape::Vec(Box::new(Shape::decode_at(r, depth + 1)?)),
             t::TUPLE => {
                 let k = r.u8()? as usize;
                 let mut items = Vec::with_capacity(k);
                 for _ in 0..k {
-                    items.push(Shape::decode(r)?);
+                    items.push(Shape::decode_at(r, depth + 1)?);
                 }
                 Shape::Tuple(items)
             }
             t::CLASS => {
                 let mutable = r.u8()? != 0;
-                let inner = Box::new(Shape::decode(r)?);
+                let inner = Box::new(Shape::decode_at(r, depth + 1)?);
                 let value_len = r.u32()? as usize;
                 let value = r.take(value_len)?.to_vec();
                 Shape::Class {
@@ -502,17 +586,22 @@ pub struct RttiField {
 }
 
 impl RttiField {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> io::Result<()> {
         let mut sw = Writer::default();
-        self.shape.encode(&mut sw);
+        self.shape.encode(&mut sw)?;
         let name = self.name.as_bytes();
+        let name_len =
+            u16::try_from(name.len()).map_err(|_| too_large("field name length", "65535 bytes"))?;
+        let shape_len = u16::try_from(sw.buf.len())
+            .map_err(|_| too_large("field shape encoding length", "65535 bytes"))?;
         w.u32(self.offset);
-        w.u16(name.len() as u16);
-        w.u16(sw.buf.len() as u16);
+        w.u16(name_len);
+        w.u16(shape_len);
         w.bytes(name);
         w.align(4); // name pad → shape 4-aligned
         w.bytes(&sw.buf);
         w.align(4); // end pad → next field 4-aligned
+        Ok(())
     }
 
     fn decode(r: &mut Reader) -> io::Result<RttiField> {
@@ -545,18 +634,23 @@ pub struct RttiVariant {
 }
 
 impl RttiVariant {
-    fn encode(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) -> io::Result<()> {
         w.align(8); // each variant is 8-aligned
         w.i64(self.disc_value);
         let name = self.name.as_bytes();
-        w.u16(name.len() as u16);
-        w.u16(self.fields.len() as u16);
+        let name_len = u16::try_from(name.len())
+            .map_err(|_| too_large("variant name length", "65535 bytes"))?;
+        let field_count = u16::try_from(self.fields.len())
+            .map_err(|_| too_large("variant field count", "65535 fields"))?;
+        w.u16(name_len);
+        w.u16(field_count);
         w.u32(0); // _pad
         w.bytes(name);
         w.align(8); // name pad → fields aligned
         for f in &self.fields {
-            f.encode(w);
+            f.encode(w)?;
         }
+        Ok(())
     }
 
     fn decode(r: &mut Reader) -> io::Result<RttiVariant> {
@@ -606,23 +700,29 @@ pub struct RttiType {
     pub rc: bool,
     /// Target has a control block (`rc, weak` mode).
     pub weak: bool,
+    /// The control block's tag (`Some` iff `weak`) — persisted so `swap` can confirm
+    /// a `weak` target's control block directly by its header tag, not only via its
+    /// forward data pointer.
+    pub ctrl_tag: Option<EightCC>,
     pub ondisk_size: u64,
     pub body: RttiBody,
 }
 
 /// Serialize a type's record **body** (the `TypeDesc`, without the record framing).
-pub fn encode_type(ty: &RttiType) -> Vec<u8> {
+pub fn encode_type(ty: &RttiType) -> io::Result<Vec<u8>> {
     let mut w = Writer::default();
 
-    let (flags_kind, disc_width, count, disc_off, payload_off) = match &ty.body {
-        RttiBody::Struct(fields) => (0u8, 0u8, fields.len() as u16, 0u16, 0u16),
-        RttiBody::Enum(e) => (
-            FLAG_ENUM,
-            e.disc_width,
-            e.variants.len() as u16,
-            e.disc_off,
-            e.payload_off,
-        ),
+    let raw_count = match &ty.body {
+        RttiBody::Struct(fields) => fields.len(),
+        RttiBody::Enum(e) => e.variants.len(),
+    };
+    let count = u16::try_from(raw_count).map_err(|_| match &ty.body {
+        RttiBody::Struct(_) => too_large("struct field count", "65535 fields"),
+        RttiBody::Enum(_) => too_large("enum variant count", "65535 variants"),
+    })?;
+    let (flags_kind, disc_width, disc_off, payload_off) = match &ty.body {
+        RttiBody::Struct(_) => (0u8, 0u8, 0u16, 0u16),
+        RttiBody::Enum(e) => (FLAG_ENUM, e.disc_width, e.disc_off, e.payload_off),
     };
     let mut flags = flags_kind;
     if ty.rc {
@@ -633,29 +733,34 @@ pub fn encode_type(ty: &RttiType) -> Vec<u8> {
     }
 
     let name = ty.name.as_bytes();
+    let name_len =
+        u16::try_from(name.len()).map_err(|_| too_large("type name length", "65535 bytes"))?;
     w.u8(flags);
     w.u8(disc_width);
-    w.u16(name.len() as u16);
+    w.u16(name_len);
     w.u16(count);
     w.u16(disc_off);
     w.u16(payload_off);
     w.u64(ty.ondisk_size);
+    // Control tag: zero for a non-weak type, the control-block tag for a
+    // weak one. Always 8 bytes so the header stays fixed-width.
+    w.eightcc(ty.ctrl_tag.unwrap_or(EightCC([0u8; 8])));
     w.bytes(name);
     w.align(8); // name pad → body 8-aligned
 
     match &ty.body {
         RttiBody::Struct(fields) => {
             for f in fields {
-                f.encode(&mut w);
+                f.encode(&mut w)?;
             }
         }
         RttiBody::Enum(e) => {
             for v in &e.variants {
-                v.encode(&mut w);
+                v.encode(&mut w)?;
             }
         }
     }
-    w.buf
+    Ok(w.buf)
 }
 
 /// Deserialize a type's record **body** back into an [`RttiType`], given its tag
@@ -669,10 +774,25 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
     let disc_off = r.u16()?;
     let payload_off = r.u16()?;
     let ondisk_size = r.u64()?;
+    let ctrl_tag_raw = r.eightcc()?;
     let name = r.string(name_len)?;
     r.align(8)?;
+    let weak = flags & FLAG_WEAK != 0;
 
     let body = if flags & FLAG_ENUM != 0 {
+        if disc_width > 8 {
+            // A discriminant is read into a `u64`; reject a corrupt wider width on
+            // load so no interpreter path later slices past an 8-byte buffer.
+            return Err(corrupt(
+                "[BSTACK0816] RTTI enum discriminant width exceeds 8 bytes",
+            ));
+        }
+        if disc_width == 0 {
+            // `disc_mask(0)` is 0 and a 0-byte read yields 0, so every variant
+            // search would silently match the first variant; a corrupt record
+            // must error, not mis-parse.
+            return Err(corrupt("[BSTACK0816] RTTI enum discriminant width is zero"));
+        }
         let mut variants = Vec::with_capacity(count);
         for _ in 0..count {
             variants.push(RttiVariant::decode(&mut r)?);
@@ -695,22 +815,25 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
         tag,
         name,
         rc: flags & FLAG_RC != 0,
-        weak: flags & FLAG_WEAK != 0,
+        weak,
+        ctrl_tag: weak.then_some(ctrl_tag_raw),
         ondisk_size,
         body,
     })
 }
 
-/// Frame a body into a full record: `eightcc + body_len + _pad + body`, padded to 8.
-fn encode_record(ty: &RttiType) -> Vec<u8> {
-    let body = encode_type(ty);
+/// Frame an already-encoded body into a full record: `eightcc + body_len + _pad +
+/// body`, padded to 8. Returns the framed record and the validated `body_len`.
+fn frame_record(tag: EightCC, body: &[u8]) -> io::Result<(Vec<u8>, u32)> {
+    let body_len =
+        u32::try_from(body.len()).map_err(|_| too_large("record body length", "4 GiB"))?;
     let mut w = Writer::default();
-    w.eightcc(ty.tag);
-    w.u32(body.len() as u32);
+    w.eightcc(tag);
+    w.u32(body_len);
     w.u32(0); // _pad
-    w.bytes(&body);
+    w.bytes(body);
     w.align(8); // whole record 8-aligned
-    w.buf
+    Ok((w.buf, body_len))
 }
 
 // -- Compile-time registration (linkme) ------------------------------------
@@ -785,6 +908,14 @@ impl RttiRegistry {
             self.stack.get_into(off, &mut header)?;
             let tag = EightCC(header[0..8].try_into().unwrap());
             let body_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
+            // Bound the untrusted length against the stack: a truncated or
+            // hand-edited record must fail as `InvalidData` here, not size a
+            // multi-GiB allocation in `load_type` (or scan past the end).
+            if RECORD_HEADER_LEN + body_len as u64 > len - off {
+                return Err(corrupt(
+                    "[BSTACK0800] RTTI record body length runs past the end of the schema stack",
+                ));
+            }
             self.index(tag, off, body_len)?;
             off += align8(RECORD_HEADER_LEN + body_len as u64);
         }
@@ -815,8 +946,11 @@ impl RttiRegistry {
                 "[BSTACK0800] duplicate RTTI eightcc — type already registered",
             ));
         }
-        let body_len = encode_type(ty).len() as u32;
-        let record = encode_record(ty);
+        // Encode once and validate every on-disk length fits its field width, so a
+        // type too large / deeply nested to serialize is rejected here rather than
+        // written as a silently-truncated, permanently-unreadable record.
+        let body = encode_type(ty)?;
+        let (record, body_len) = frame_record(ty.tag, &body)?;
         let offset = self.stack.push(&record)?;
         self.index(ty.tag, offset, body_len)
     }
@@ -832,30 +966,61 @@ impl RttiRegistry {
     pub fn sync_compiled(&mut self) -> io::Result<usize> {
         let mut appended = 0;
         // Guards a collision *within* the compiled-in set (two builders, one tag).
-        let mut seen: HashMap<EightCC, String> = HashMap::new();
+        let mut seen: HashMap<EightCC, RttiType> = HashMap::new();
         for reg in RTTI_TYPES.iter() {
             let ty = (reg.build)();
             if let Some(prev) = seen.get(&ty.tag) {
-                if *prev != ty.name {
+                if prev.name != ty.name {
                     return Err(corrupt(format!(
-                        "[BSTACK0806] RTTI eightcc collision: '{prev}' and '{}' \
+                        "[BSTACK0806] RTTI eightcc collision: '{}' and '{}' \
                          hash to one tag",
+                        prev.name, ty.name
+                    )));
+                }
+                // Same tag AND same name is still a collision when the layouts
+                // differ — the tag ignores the module path, so `v1::Node` and
+                // `v2::Node` arrive here as one name. Only a byte-identical
+                // layout is genuinely "the same type registered twice".
+                if !layouts_match(prev, &ty) {
+                    return Err(corrupt(format!(
+                        "[BSTACK0806] RTTI eightcc collision: two distinct types \
+                         both named '{}' (same-named types in different modules?) \
+                         share one tag",
                         ty.name
                     )));
                 }
                 continue; // same type registered twice — nothing to do
             }
-            seen.insert(ty.tag, ty.name.clone());
+            seen.insert(ty.tag, ty.clone());
 
             match self.ordinal_of(ty.tag) {
                 Some(ord) => {
-                    // Already on disk: verify it is the same type, else collision.
+                    // Already on disk: it must be the SAME type AND the SAME layout.
                     let existing = self.load_type(ord)?;
                     if existing.name != ty.name {
+                        // Different type, same tag — an eightcc collision.
                         return Err(corrupt(format!(
                             "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
                              compiled '{}' share one tag",
                             existing.name, ty.name
+                        )));
+                    }
+                    if !layouts_match(&existing, &ty) {
+                        // Same name, different layout: fields added / removed / reordered
+                        // / resized, `rc`/`weak` mode, `ondisk_size`, or a *const*
+                        // class-variable value changed. (A *mutable* class variable's
+                        // value is updated in place and so legitimately differs between
+                        // the compiled initial value and the persisted current one — it
+                        // is excluded from the comparison.) The eightcc is derived from
+                        // the name only, so neither it nor the name moved, but the
+                        // persisted offsets / shapes no longer describe the compiled
+                        // type. Reject rather than silently keep the stale descriptor.
+                        return Err(corrupt(format!(
+                            "[BSTACK0814] RTTI schema mismatch for '{}': the persisted \
+                             layout differs from the compiled type (a field was added, \
+                             removed, reordered, or resized). The on-disk data was \
+                             written against the old layout.",
+                            ty.name
                         )));
                     }
                 }
@@ -1038,10 +1203,17 @@ pub enum Moved {
     /// A whole vector, transferred as a unit (see [`VecRef`]). `None` if the vec slot
     /// was empty / null.
     Vec(Option<VecRef>),
-    /// A fixed reference **array**, moved element-by-element — its inline offset
-    /// storage lives in the freed shell, so unlike a vector there is no block to hand
-    /// back whole. `None` per null element.
+    /// A fixed reference **array** (`owned` / `strong` / `ref`), moved element-by-element
+    /// — its inline offset storage lives in the freed shell, so unlike a vector there is
+    /// no block to hand back whole. Each element is a **data** offset. `None` per null
+    /// element.
     List(Vec<Option<AnyRef>>),
+    /// A fixed **weak** reference array (`[#[bstack_weak] T; N]`), moved element-by-
+    /// element. Each element is its **control-block** offset — exactly like a scalar
+    /// [`Weak`](Self::Weak), and *unlike* a data-offset [`List`](Self::List) — so the
+    /// caller never mistakes control bytes for a `T` (e.g. `swap`ping one into a non-weak
+    /// slot). `None` per unset element.
+    WeakList(Vec<Option<AnyRef>>),
     /// A cross-file [`Foreign`](crate::Foreign) pointer, transferred whole (the target
     /// lives in another file and outlives the freed shell): tag, ownership kind, file
     /// id, and offset (`offset == 0` == null). The caller now owns the reference.
@@ -1169,6 +1341,26 @@ struct CloneState {
     bumps: Vec<u64>,
     /// Every freshly allocated range, so a failed clone frees its orphans.
     allocated: Vec<BStackRange>,
+    /// The in-flight intention-first WAL transaction: when the allocator
+    /// names a WAL anchor, each `alloc_copy` block is logged `Pending` before it is
+    /// used, so a **crash** mid-clone is reclaimed by [`wal::finish`](crate::wal::finish)
+    /// on the next open (the in-process error path already frees `allocated`). `None`
+    /// when the allocator opts out of reclamation or nothing has been allocated yet.
+    wal: Option<CloneWal>,
+}
+
+/// The in-flight intention-first WAL transaction of a `clone_value` walk — the file's
+/// WAL lock held for the descent, plus the persistent block's offset, entry-slot
+/// capacity, and how many entries have been published. Mirrors `clone::CloneWal`.
+struct CloneWal {
+    /// Holds the file's WAL lock until the clone completes / errors.
+    _held: HeldLock,
+    /// Offset of the persistent WAL block (moves if a grow reallocates it).
+    block_off: u64,
+    /// Entry slots the block currently has.
+    capacity: u64,
+    /// Entries published so far (== `CloneState::allocated.len()`).
+    logged: u64,
 }
 
 /// Bytes of a `VecDesc` (`data_off:u64` @0, `data_size:u64` @8) — the inline
@@ -1197,9 +1389,16 @@ fn read_u64_at(data: &BStack, off: u64) -> io::Result<u64> {
 fn read_foreign_repr(data: &BStack, off: u64) -> io::Result<(u64, u64)> {
     let mut b = [0u8; FOREIGN_REPR_LEN as usize];
     data.get_into(off, &mut b)?;
+    Ok(decode_foreign_repr(&b))
+}
+
+/// Decode a raw 16-byte `ForeignRepr` into `(file_id, offset)` — the in-memory
+/// counterpart of [`read_foreign_repr`], used on the bytes an atomic `swap` hands
+/// back. `b` must be at least [`FOREIGN_REPR_LEN`] bytes.
+fn decode_foreign_repr(b: &[u8]) -> (u64, u64) {
     let file_id = u32::from_le_bytes(b[0..4].try_into().unwrap()) as u64;
     let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
-    Ok((file_id, offset))
+    (file_id, offset)
 }
 
 impl RttiRegistry {
@@ -1256,16 +1455,22 @@ impl RttiRegistry {
                             // order (so they pop child-first into the marker).
                             let field_ops: Vec<Op> = fields
                                 .iter()
-                                .map(|f| Op::Shape {
-                                    shape: f.shape.clone(),
-                                    offset: block_off + f.offset as u64,
+                                .map(|f| -> io::Result<Op> {
+                                    Ok(Op::Shape {
+                                        shape: f.shape.clone(),
+                                        offset: add_off(block_off, f.offset as u64)?,
+                                    })
                                 })
-                                .collect();
+                                .collect::<io::Result<Vec<Op>>>()?;
                             work.push(Op::MakeBlock { tag: ty.tag, names });
                             work.extend(field_ops);
                         }
                         RttiBody::Enum(e) => {
-                            let raw = read_disc(data, block_off + e.disc_off as u64, e.disc_width)?;
+                            let raw = read_disc(
+                                data,
+                                add_off(block_off, e.disc_off as u64)?,
+                                e.disc_width,
+                            )?;
                             let mask = disc_mask(e.disc_width);
                             let variant = e
                                 .variants
@@ -1277,15 +1482,17 @@ impl RttiRegistry {
                                     ))
                                 })?;
                             let names = variant.fields.iter().map(|f| f.name.clone()).collect();
-                            let payload_base = block_off + e.payload_off as u64;
+                            let payload_base = add_off(block_off, e.payload_off as u64)?;
                             let field_ops: Vec<Op> = variant
                                 .fields
                                 .iter()
-                                .map(|f| Op::Shape {
-                                    shape: f.shape.clone(),
-                                    offset: payload_base + f.offset as u64,
+                                .map(|f| -> io::Result<Op> {
+                                    Ok(Op::Shape {
+                                        shape: f.shape.clone(),
+                                        offset: add_off(payload_base, f.offset as u64)?,
+                                    })
                                 })
-                                .collect();
+                                .collect::<io::Result<Vec<Op>>>()?;
                             work.push(Op::MakeEnum {
                                 tag: ty.tag,
                                 variant: variant.name.clone(),
@@ -1298,6 +1505,14 @@ impl RttiRegistry {
 
                 Op::Shape { shape, offset } => match shape {
                     Shape::Pod { width } => {
+                        // `width` is an untrusted record field; bound it against the
+                        // stack before sizing an allocation with it (the read after
+                        // would fail anyway — this fails first, without the alloc).
+                        if width as u64 > data.len()?.saturating_sub(offset) {
+                            return Err(corrupt(
+                                "[BSTACK0800] RTTI POD width runs past the end of the data stack",
+                            ));
+                        }
                         let mut buf = vec![0u8; width as usize];
                         data.get_into(offset, &mut buf)?;
                         results.push(Value::Pod(buf.into()));
@@ -1344,25 +1559,33 @@ impl RttiRegistry {
                         });
                     }
                     Shape::Option(inner) => {
-                        // The niche: a `0` in the leading u64 of the slot is `None`.
-                        if read_u64_at(data, offset)? == 0 {
-                            results.push(Value::Null);
-                        } else {
+                        // Niche location depends on the inner shape (a `Foreign`'s is
+                        // its offset word @8, not the leading word).
+                        if option_present(data, &inner, offset)? {
                             work.push(Op::MakeSome);
                             work.push(Op::Shape {
                                 shape: *inner,
                                 offset,
                             });
+                        } else {
+                            results.push(Value::Null);
                         }
                     }
                     Shape::Array { n, inner } => {
+                        // Charge the budget for all elements up front, as the `Vec`
+                        // arm does — `n` comes off an untrusted record, and the ops
+                        // are materialized eagerly, so an absurd count must fail
+                        // cleanly rather than pre-allocate past the budget.
+                        budget = budget.checked_sub(n as u64).ok_or_else(budget_exceeded)?;
                         let stride = self.shape_stride(&inner, &mut cache)?;
                         let elem_ops: Vec<Op> = (0..n as u64)
-                            .map(|i| Op::Shape {
-                                shape: (*inner).clone(),
-                                offset: offset + i * stride,
+                            .map(|i| -> io::Result<Op> {
+                                Ok(Op::Shape {
+                                    shape: (*inner).clone(),
+                                    offset: add_off(offset, mul_off(i, stride)?)?,
+                                })
                             })
-                            .collect();
+                            .collect::<io::Result<Vec<Op>>>()?;
                         work.push(Op::MakeArray(n as usize));
                         work.extend(elem_ops);
                     }
@@ -1371,18 +1594,26 @@ impl RttiRegistry {
                         if data_off == 0 {
                             results.push(Value::Vec(Box::default()));
                         } else {
-                            // `@0` is the byte length; the element count is
-                            // `byte_len / stride`.
-                            let base = data_off + BYTEVEC_HEADER;
+                            // `@0` is the byte length, validated against the block size
+                            // (`VecDesc.data_size` @8) so a forged length can't drive an
+                            // out-of-block read / petabyte allocation.
+                            let data_size = read_u64_at(data, add_off(offset, 8)?)?;
+                            let base = add_off(data_off, BYTEVEC_HEADER)?;
                             let stride = self.shape_stride(&inner, &mut cache)?;
                             let byte_len = read_u64_at(data, data_off)?;
-                            let len = byte_len.checked_div(stride).unwrap_or(0);
+                            let len = checked_vec_len(byte_len, data_size, stride)?;
+                            // Charge the budget for all elements up front — the ops are
+                            // materialized eagerly, so a huge (but in-block) length must
+                            // fail cleanly rather than pre-allocate past the budget.
+                            budget = budget.checked_sub(len).ok_or_else(budget_exceeded)?;
                             let elem_ops: Vec<Op> = (0..len)
-                                .map(|i| Op::Shape {
-                                    shape: (*inner).clone(),
-                                    offset: base + i * stride,
+                                .map(|i| -> io::Result<Op> {
+                                    Ok(Op::Shape {
+                                        shape: (*inner).clone(),
+                                        offset: add_off(base, mul_off(i, stride)?)?,
+                                    })
                                 })
-                                .collect();
+                                .collect::<io::Result<Vec<Op>>>()?;
                             work.push(Op::MakeVec(len as usize));
                             work.extend(elem_ops);
                         }
@@ -1395,7 +1626,7 @@ impl RttiRegistry {
                                 shape: it.clone(),
                                 offset: off,
                             });
-                            off += self.shape_stride(it, &mut cache)?;
+                            off = add_off(off, self.shape_stride(it, &mut cache)?)?;
                         }
                         work.push(Op::MakeTuple(items.len()));
                         work.extend(elem_ops);
@@ -1470,7 +1701,9 @@ impl RttiRegistry {
     pub fn any_ref(&self, ptr: ForeignRepr) -> Option<AnyRef> {
         let ord = self.resolve_ptr(ptr)?;
         let tag = self.tag_of(ord)?;
-        Some(AnyRef::new(tag, ptr.offset()))
+        // SAFETY: the tag is registry-authoritative for the pointer's type_index,
+        // and the offset is the typed pointer's own target.
+        Some(unsafe { AnyRef::new(tag, ptr.offset()) })
     }
 
     /// Interpret the structure an [`AnyRef`] points at into a [`Value`] tree — the
@@ -1484,8 +1717,16 @@ impl RttiRegistry {
     /// Tear down (free) the structure of type `ordinal` at `block_off` in `alloc`'s
     /// file — the interpreted equivalent of a generated `bstack_drop`.
     ///
-    /// The root **must already be detached** (unlinked from any parent): this frees
-    /// it unconditionally, so a still-linked root would corrupt its parent. The walk
+    /// # Safety
+    ///
+    /// `block_off` must name a live block of type `ordinal` that the caller owns,
+    /// and the root **must already be detached** (unlinked from any parent): this
+    /// frees it unconditionally, so a still-linked root leaves its parent pointing
+    /// at freed storage and a wrong offset frees ranges the caller does not own —
+    /// the same obligation that makes [`BStackBlock::from_range`] `unsafe`, reached
+    /// with a bare integer instead of a fabricated handle.
+    ///
+    /// The walk
     /// is **non-recursive**; it collects every block to reclaim then frees them all in
     /// one [`free_many`](BStackRaiiAllocator::free_many) (bulk when the allocator
     /// supports it, else sequential — orphan-only on a crash, never a torn structure).
@@ -1499,12 +1740,14 @@ impl RttiRegistry {
     /// nothing. Vectors free their data block plus any owning/shared element blocks.
     /// Cross-file `foreign` references (scalar or in a container) are torn down in the
     /// target's own file through the registry; a detached target file leaks.
-    pub fn teardown<A: BStackRaiiAllocator>(
+    pub unsafe fn teardown<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
         ordinal: RttiOrdinal,
         block_off: u64,
     ) -> io::Result<()> {
+        // Bound cross-file recursion (each `Foreign` hop recurses here natively).
+        let _depth = DepthGuard::enter()?;
         let data = alloc.stack();
         let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
         let mut work: Vec<TdOp> = vec![TdOp::Block {
@@ -1513,6 +1756,15 @@ impl RttiRegistry {
             emit: true,
         }];
         let mut to_free: Vec<BStackRange> = Vec::new();
+        // Destructive side effects are **collected** during the (read-only) walk and
+        // applied only after it completes, so a mid-walk error (unknown tag, budget,
+        // corrupt discriminant, a failed read) leaves the structure — and every shared
+        // refcount / cross-file target — untouched, and a retry re-does nothing.
+        // `to_free` is the home-file owned ranges; these are the shared / cross-file
+        // mutations that a mid-walk abort must not have started.
+        let mut strong_releases: Vec<(EightCC, u64)> = Vec::new(); // (tag, data offset)
+        let mut weak_releases: Vec<u64> = Vec::new(); // control offsets
+        let mut foreign_releases: Vec<(EightCC, ForeignKind, u64, u64)> = Vec::new();
         let mut budget: u64 = 4_000_000;
 
         while let Some(op) = work.pop() {
@@ -1540,12 +1792,16 @@ impl RttiRegistry {
                             for f in fields {
                                 work.push(TdOp::Shape {
                                     shape: f.shape.clone(),
-                                    offset: block_off + f.offset as u64,
+                                    offset: add_off(block_off, f.offset as u64)?,
                                 });
                             }
                         }
                         RttiBody::Enum(e) => {
-                            let raw = read_disc(data, block_off + e.disc_off as u64, e.disc_width)?;
+                            let raw = read_disc(
+                                data,
+                                add_off(block_off, e.disc_off as u64)?,
+                                e.disc_width,
+                            )?;
                             let mask = disc_mask(e.disc_width);
                             let variant = e
                                 .variants
@@ -1556,11 +1812,11 @@ impl RttiRegistry {
                                         "[BSTACK0808] no RTTI variant for discriminant {raw}"
                                     ))
                                 })?;
-                            let payload_base = block_off + e.payload_off as u64;
+                            let payload_base = add_off(block_off, e.payload_off as u64)?;
                             for f in &variant.fields {
                                 work.push(TdOp::Shape {
                                     shape: f.shape.clone(),
-                                    offset: payload_base + f.offset as u64,
+                                    offset: add_off(payload_base, f.offset as u64)?,
                                 });
                             }
                         }
@@ -1592,32 +1848,24 @@ impl RttiRegistry {
                     Shape::Strong(tag) => {
                         let data_off = read_u64_at(data, offset)?;
                         if data_off != 0 {
-                            self.release_strong(
-                                data,
-                                tag,
-                                data_off,
-                                &mut work,
-                                &mut to_free,
-                                &mut cache,
-                            )?;
+                            strong_releases.push((tag, data_off));
                         }
                     }
                     Shape::Weak(_) => {
                         // A weak field's slot holds the *control* offset directly.
                         let ctrl_off = read_u64_at(data, offset)?;
                         if ctrl_off != 0 {
-                            release_weak(data, ctrl_off, &mut to_free)?;
+                            weak_releases.push(ctrl_off);
                         }
                     }
                     Shape::Foreign { tag, kind } => {
-                        // Cross-file: resolve the target's file and tear it down there
-                        // (a self-contained transaction on that file), side-effecting
-                        // outside the home `to_free`.
+                        // Cross-file: the target's file + offset, torn down in the commit
+                        // phase (a self-contained transaction on that file).
                         let (file_id, off) = read_foreign_repr(data, offset)?;
-                        self.teardown_foreign(alloc, tag, kind, file_id, off)?;
+                        foreign_releases.push((tag, kind, file_id, off));
                     }
                     Shape::Option(inner) => {
-                        if read_u64_at(data, offset)? != 0 {
+                        if option_present(data, &inner, offset)? {
                             work.push(TdOp::Shape {
                                 shape: *inner,
                                 offset,
@@ -1625,11 +1873,18 @@ impl RttiRegistry {
                         }
                     }
                     Shape::Array { n, inner } => {
+                        // Charge for all elements up front — `n` is untrusted and
+                        // the ops are materialized eagerly (see the read walk).
+                        budget = budget.checked_sub(n as u64).ok_or_else(|| {
+                            corrupt(
+                                "[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)",
+                            )
+                        })?;
                         let stride = self.shape_stride(&inner, &mut cache)?;
                         for i in 0..n as u64 {
                             work.push(TdOp::Shape {
                                 shape: (*inner).clone(),
-                                offset: offset + i * stride,
+                                offset: add_off(offset, mul_off(i, stride)?)?,
                             });
                         }
                     }
@@ -1640,26 +1895,27 @@ impl RttiRegistry {
                                 shape: it.clone(),
                                 offset: off,
                             });
-                            off += self.shape_stride(it, &mut cache)?;
+                            off = add_off(off, self.shape_stride(it, &mut cache)?)?;
                         }
                     }
                     Shape::Vec(inner) => {
                         let data_off = read_u64_at(data, offset)?; // VecDesc.data_off @0
                         if data_off != 0 {
-                            let data_size = read_u64_at(data, offset + 8)?; // .data_size @8
+                            let data_size = read_u64_at(data, add_off(offset, 8)?)?; // .data_size @8
                             // A vector of owning/shared elements releases each element
                             // from the data block's element area too. The `@0` word is
                             // the byte length, so the count is `byte_len / stride`
                             // (stride = 8 for a `u64` offset, 16 for a `ForeignRepr`).
-                            let base = data_off + BYTEVEC_HEADER;
+                            let base = add_off(data_off, BYTEVEC_HEADER)?;
                             let stride = self.shape_stride(&inner, &mut cache)?;
                             let byte_len = read_u64_at(data, data_off)?;
-                            let len = byte_len.checked_div(stride).unwrap_or(0);
+                            let len = checked_vec_len(byte_len, data_size, stride)?;
                             match &*inner {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {
-                                        let e = read_u64_at(data, base + i * stride)?;
+                                        let e =
+                                            read_u64_at(data, add_off(base, mul_off(i, stride)?)?)?;
                                         if e != 0 {
                                             work.push(TdOp::Block {
                                                 ord,
@@ -1671,36 +1927,33 @@ impl RttiRegistry {
                                 }
                                 Shape::Strong(tag) => {
                                     for i in 0..len {
-                                        let e = read_u64_at(data, base + i * stride)?;
+                                        let e =
+                                            read_u64_at(data, add_off(base, mul_off(i, stride)?)?)?;
                                         if e != 0 {
-                                            self.release_strong(
-                                                data,
-                                                *tag,
-                                                e,
-                                                &mut work,
-                                                &mut to_free,
-                                                &mut cache,
-                                            )?;
+                                            strong_releases.push((*tag, e));
                                         }
                                     }
                                 }
                                 Shape::Weak(_) => {
                                     for i in 0..len {
-                                        let c = read_u64_at(data, base + i * stride)?;
+                                        let c =
+                                            read_u64_at(data, add_off(base, mul_off(i, stride)?)?)?;
                                         if c != 0 {
-                                            release_weak(data, c, &mut to_free)?;
+                                            weak_releases.push(c);
                                         }
                                     }
                                 }
                                 // A vector of `Foreign` pointers: each element is a
-                                // 16-byte `ForeignRepr`; tear its target down in the
-                                // target's own file (a null offset is a no-op).
+                                // 16-byte `ForeignRepr`; its target is torn down in its
+                                // own file in the commit phase (a null offset is a no-op).
                                 other if foreign_leaf(other).is_some() => {
                                     let (tag, kind) = foreign_leaf(other).unwrap();
                                     for i in 0..len {
-                                        let (file_id, foff) =
-                                            read_foreign_repr(data, base + i * stride)?;
-                                        self.teardown_foreign(alloc, tag, kind, file_id, foff)?;
+                                        let (file_id, foff) = read_foreign_repr(
+                                            data,
+                                            add_off(base, mul_off(i, stride)?)?,
+                                        )?;
+                                        foreign_releases.push((tag, kind, file_id, foff));
                                     }
                                 }
                                 // POD / `ref` elements own no sub-blocks.
@@ -1713,54 +1966,70 @@ impl RttiRegistry {
             }
         }
 
-        // Everything collected is orphaned (the root was detached), so free order is
-        // immaterial; one `free_many` reclaims the whole subtree.
-        alloc.free_many(to_free)
+        // --- Commit phase (the walk completed without error) ---
+        // Doing these only now means a walk that failed validation (unknown tag, budget,
+        // corrupt discriminant, a bad read) left no refcount decremented and no foreign
+        // target freed — so a retry decrements / frees each exactly once, not twice.
+        //
+        // Shared / cross-file releases run **before** the home `free_many`: a `Foreign`
+        // (or `strong`) that recurses — e.g. a cycle — then trips the depth guard while
+        // the home block is still present, so nothing is freed on that error rather than
+        // the root being freed and then double-freed through the cycle edge.
+        for (tag, data_off) in strong_releases {
+            self.commit_strong_release(alloc, tag, data_off)?;
+        }
+        for ctrl_off in weak_releases {
+            commit_weak_release(alloc, ctrl_off)?;
+        }
+        for (tag, kind, file_id, off) in foreign_releases {
+            self.teardown_foreign(alloc, tag, kind, file_id, off)?;
+        }
+        // Free children before parents (post-order): the walk collects ranges
+        // pre-order (a block before its sub-blocks — line above), so reverse. For a
+        // well-formed structure the order is immaterial (the sub-blocks are separate
+        // allocations). It matters only for a *forged* owned pointer into a parent's
+        // own interior (installable only via `unsafe`):
+        // freeing the parent *first* leaves the interior slice sitting inside a freed
+        // region, and applying it then writes a bogus free-list node (an actual
+        // corruption). Child-first keeps every free consistent — the forged interior
+        // just double-frees within the parent, which the allocator merges (or a
+        // debug allocator flags) rather than corrupting.
+        to_free.reverse();
+        // Route through the WAL (or the allocator's atomic bulk free) so a crash
+        // mid-free is reclaimed on the next open, matching the static teardown
+        // rather than leaking permanently.
+        // SAFETY: every range in `to_free` was collected by the walk from
+        // owned slots of the structure being torn down, in this file.
+        unsafe { crate::teardown::commit_home_frees(alloc, to_free) }
     }
 
-    /// Release one `strong` reference to the block at `data_off` of type `tag`. The
-    /// target's `weak` flag selects the release: an `rc` block's **inline refcount**,
-    /// or an `(rc, weak)` block's **control block** (reached through the data block's
-    /// `ctrl` back-pointer). Only when the last strong owner drops is the data block
-    /// scheduled to free (by pushing a `Block` op that walks + frees its subtree); a
-    /// control block frees when its own count (phantom weak included) hits zero.
-    fn release_strong(
+    /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown)):
+    /// decrement the target's strong count in its (home) file and, only if it was the last
+    /// owner, tear the data subtree down (its own transaction) and release the phantom weak,
+    /// freeing the control block if no real weak handles remain. The target's `weak` flag
+    /// selects the inline-refcount vs control-block path.
+    fn commit_strong_release<A: BStackRaiiAllocator>(
         &self,
-        data: &BStack,
+        alloc: &A,
         tag: EightCC,
         data_off: u64,
-        work: &mut Vec<TdOp>,
-        to_free: &mut Vec<BStackRange>,
-        cache: &mut HashMap<RttiOrdinal, RttiType>,
     ) -> io::Result<()> {
+        let data = alloc.stack();
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ord) {
-            e.insert(self.load_type(ord)?);
-        }
-        if cache[&ord].weak {
-            // `(rc, weak)`: decrement `ctrl.strong`; the last strong owner frees the
-            // data subtree and releases the phantom weak, freeing the control block if
-            // no real weak handles remain.
-            let ctrl_off = read_u64_at(data, data_off + CTRL_BACKPTR_OFFSET)?;
-            if refcount::fetch_sub(data, ctrl_off + CTRL_STRONG_OFFSET, 1)? == 1 {
-                work.push(TdOp::Block {
-                    ord,
-                    block_off: data_off,
-                    emit: true,
-                });
-                if refcount::fetch_sub(data, ctrl_off + CTRL_WEAK_OFFSET, 1)? == 1 {
-                    to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
+        if self.load_type(ord)?.weak {
+            let ctrl_off = read_u64_at(data, add_off(data_off, CTRL_BACKPTR_OFFSET)?)?;
+            if refcount::fetch_sub(data, add_off(ctrl_off, CTRL_STRONG_OFFSET)?, 1)? == 1 {
+                // SAFETY: this caller was the last strong owner (the fetch_sub hit
+                // zero), and `data_off` came from the owning slot being released.
+                unsafe { self.teardown(alloc, ord, data_off)? };
+                if refcount::fetch_sub(data, add_off(ctrl_off, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+                    // SAFETY: last weak released — the control block is unreferenced.
+                    unsafe { alloc.free_many([BStackRange::new(ctrl_off, CONTROL_SIZE)])? };
                 }
             }
-        } else {
-            // `rc`: decrement the inline refcount; the last owner frees the block.
-            if refcount::fetch_sub(data, data_off + RC_REFCOUNT_OFFSET, 1)? == 1 {
-                work.push(TdOp::Block {
-                    ord,
-                    block_off: data_off,
-                    emit: true,
-                });
-            }
+        } else if refcount::fetch_sub(data, add_off(data_off, RC_REFCOUNT_OFFSET)?, 1)? == 1 {
+            // SAFETY: as above — sole owner, slot-derived offset.
+            unsafe { self.teardown(alloc, ord, data_off)? };
         }
         Ok(())
     }
@@ -1813,25 +2082,31 @@ impl RttiRegistry {
         let data = target.stack();
         match kind {
             ForeignKind::Ref => Ok(()),
-            ForeignKind::Owned => self.teardown(target, ord, offset),
+            // SAFETY: `offset` came from the owning foreign slot being torn down;
+            // ownership of the target transfers with the slot.
+            ForeignKind::Owned => unsafe { self.teardown(target, ord, offset) },
             ForeignKind::Strong => {
                 if self.load_type(ord)?.weak {
-                    let ctrl = read_u64_at(data, offset + CTRL_BACKPTR_OFFSET)?;
-                    if refcount::fetch_sub(data, ctrl + CTRL_STRONG_OFFSET, 1)? == 1 {
-                        self.teardown(target, ord, offset)?;
-                        if refcount::fetch_sub(data, ctrl + CTRL_WEAK_OFFSET, 1)? == 1 {
-                            target.free_many([BStackRange::new(ctrl, CONTROL_SIZE)])?;
+                    let ctrl = read_u64_at(data, add_off(offset, CTRL_BACKPTR_OFFSET)?)?;
+                    if refcount::fetch_sub(data, add_off(ctrl, CTRL_STRONG_OFFSET)?, 1)? == 1 {
+                        // SAFETY: last strong owner; slot-derived offset.
+                        unsafe { self.teardown(target, ord, offset)? };
+                        if refcount::fetch_sub(data, add_off(ctrl, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+                            // SAFETY: last weak released — control block unreferenced.
+                            unsafe { target.free_many([BStackRange::new(ctrl, CONTROL_SIZE)])? };
                         }
                     }
-                } else if refcount::fetch_sub(data, offset + RC_REFCOUNT_OFFSET, 1)? == 1 {
-                    self.teardown(target, ord, offset)?;
+                } else if refcount::fetch_sub(data, add_off(offset, RC_REFCOUNT_OFFSET)?, 1)? == 1 {
+                    // SAFETY: last strong owner; slot-derived offset.
+                    unsafe { self.teardown(target, ord, offset)? };
                 }
                 Ok(())
             }
             ForeignKind::Weak => {
                 // A weak foreign's offset is the control offset.
-                if refcount::fetch_sub(data, offset + CTRL_WEAK_OFFSET, 1)? == 1 {
-                    target.free_many([BStackRange::new(offset, CONTROL_SIZE)])?;
+                if refcount::fetch_sub(data, add_off(offset, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+                    // SAFETY: last weak released — control block unreferenced.
+                    unsafe { target.free_many([BStackRange::new(offset, CONTROL_SIZE)])? };
                 }
                 Ok(())
             }
@@ -1895,22 +2170,26 @@ impl RttiRegistry {
         match kind {
             ForeignKind::Ref => Ok(()),
             ForeignKind::Owned => {
-                let new_target = self.clone_value(target, ord, src_target)?;
+                // SAFETY: `src_target` came from the source's validated foreign slot.
+                let new_target = unsafe { self.clone_value(target, ord, src_target)? };
                 // Repoint only the address word of the copied ForeignRepr.
-                home_data.set(new_off + (FOREIGN_REPR_LEN - 8), new_target.to_le_bytes())
+                home_data.set(
+                    add_off(new_off, FOREIGN_REPR_LEN - 8)?,
+                    new_target.to_le_bytes(),
+                )
             }
             ForeignKind::Strong => {
                 let off = if self.load_type(ord)?.weak {
-                    let ctrl = read_u64_at(tstack, src_target + CTRL_BACKPTR_OFFSET)?;
-                    ctrl + CTRL_STRONG_OFFSET
+                    let ctrl = read_u64_at(tstack, add_off(src_target, CTRL_BACKPTR_OFFSET)?)?;
+                    add_off(ctrl, CTRL_STRONG_OFFSET)?
                 } else {
-                    src_target + RC_REFCOUNT_OFFSET
+                    add_off(src_target, RC_REFCOUNT_OFFSET)?
                 };
                 refcount::fetch_add(tstack, off, 1)?;
                 Ok(())
             }
             ForeignKind::Weak => {
-                refcount::fetch_add(tstack, src_target + CTRL_WEAK_OFFSET, 1)?;
+                refcount::fetch_add(tstack, add_off(src_target, CTRL_WEAK_OFFSET)?, 1)?;
                 Ok(())
             }
         }
@@ -1944,21 +2223,21 @@ impl RttiRegistry {
             let (fields, field_base): (&[RttiField], u64) = match &ty.body {
                 RttiBody::Struct(f) => (f, base),
                 RttiBody::Enum(e) => {
-                    let raw = read_disc(data, base + e.disc_off as u64, e.disc_width)?;
+                    let raw = read_disc(data, add_off(base, e.disc_off as u64)?, e.disc_width)?;
                     let mask = disc_mask(e.disc_width);
                     let variant = e
                         .variants
                         .iter()
                         .find(|v| (v.disc_value as u64) & mask == raw)
                         .ok_or_else(|| set_error(format!("no variant for discriminant {raw}")))?;
-                    (&variant.fields, base + e.payload_off as u64)
+                    (&variant.fields, add_off(base, e.payload_off as u64)?)
                 }
             };
             let field = fields
                 .iter()
                 .find(|f| &f.name == seg)
                 .ok_or_else(|| set_error(format!("no field named `{seg}`")))?;
-            let field_off = field_base + field.offset as u64;
+            let field_off = add_off(field_base, field.offset as u64)?;
 
             if i + 1 == path.len() {
                 // A `#[bstack_static]` class variable lives in the schema record for
@@ -2027,7 +2306,15 @@ impl RttiRegistry {
     /// the instance). An `owned` / `strong` / `weak` field is *replaced*, not
     /// overwritten — that is [`swap`](Self::swap). Errors on any other target or a
     /// wrong-width value.
-    pub fn set(
+    ///
+    /// # Safety
+    ///
+    /// `block_off` must name a live block of type `ordinal`. The resolved write is
+    /// raw: with a wrong `block_off` the bytes land at an arbitrary in-file
+    /// location, and even with a right one a caller-chosen POD image overwrites
+    /// whatever invariant-bearing bytes the field holds (e.g. an inline `VecDesc`,
+    /// whose forged `data_off` a later safe drop would free).
+    pub unsafe fn set(
         &self,
         data: &BStack,
         ordinal: RttiOrdinal,
@@ -2050,13 +2337,18 @@ impl RttiRegistry {
                 }
             }
             // A `ref` is a bare `u64` target offset (a non-owning alias).
-            Shape::Ref(_) => {
+            Shape::Ref(t) => {
                 if value.len() != 8 {
                     return Err(set_error(format!(
                         "a `ref` field is an 8-byte offset, got {}",
                         value.len()
                     )));
                 }
+                // Validate the offset names a live block of the ref's type — an
+                // unchecked offset would let a later path descend into an arbitrary
+                // in-file location.
+                let target = get_u64(value);
+                verify_data_block(data, target, t)?;
             }
             _ => {
                 return Err(set_error(
@@ -2073,6 +2365,11 @@ impl RttiRegistry {
     /// the field takes ownership of `new`, and the old reference is handed back for
     /// the caller to reuse or tear down — no refcount changes (ownership moves, it is
     /// not duplicated).
+    ///
+    /// `new` is **validated** against the on-disk header before it is installed: a live
+    /// block of the field's type must sit at its offset (for a `weak` field, at the
+    /// control block's forward data pointer). This keeps a fabricated [`AnyRef`] from
+    /// pointing an owning slot at an arbitrary location — rejected with `[BSTACK0815]`.
     ///
     /// `new`'s [`tag`](AnyRef::tag) **must equal the field's declared type** (an
     /// eightcc mismatch is rejected), and the target must be an in-file reference
@@ -2097,14 +2394,17 @@ impl RttiRegistry {
                 ));
             }
         };
-        // A nullable reference swaps its inner target.
+        // A nullable reference swaps its inner target; remember the nullability —
+        // it gates whether a null `new` may be installed at all.
+        let nullable = matches!(shape, Shape::Option(_));
         if let Shape::Option(inner) = shape {
             shape = *inner;
         }
-        let tag = match shape {
+        let (tag, is_weak) = match shape {
             // `owned`/`strong`/`ref` hold a data offset; `weak` holds a control offset —
             // both are a single `u64` slot exchanged the same way (no refcount change).
-            Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) | Shape::Weak(t) => t,
+            Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) => (t, false),
+            Shape::Weak(t) => (t, true),
             Shape::Foreign { .. } => {
                 return Err(swap_error(
                     "a `foreign` reference names a cross-file target — use `swap_foreign`",
@@ -2117,9 +2417,69 @@ impl RttiRegistry {
                 "eightcc mismatch: `new` is not the field's type",
             ));
         }
-        let old = read_u64_at(data, offset)?;
-        data.set(offset, new.offset().to_le_bytes())?;
-        Ok((old != 0).then(|| AnyRef::new(tag, old)))
+        // A non-nullable slot must never hold the `0` niche: the generated walks
+        // treat non-nullable as proof of non-null, so installing a null here would
+        // persist a handle over offset 0 and derail every later read / teardown.
+        if new.offset() == 0 && !nullable {
+            return Err(swap_error(
+                "[BSTACK0815] RTTI mutator: a null reference cannot be installed \
+                 into a non-nullable field",
+            ));
+        }
+        // Validate that `new` actually names a live block of the field's type before
+        // installing its raw offset — an unchecked offset would let a later teardown
+        // free (or a path descend into) an arbitrary location.
+        if is_weak {
+            // `new`'s offset must name a *control* block. Validate it two ways:
+            // (1) directly — its own header tag must equal the target
+            // type's control tag, so a region that merely forward-points at a live
+            // target (an ordinary byte vector's data block whose bytes happen to line
+            // up) is rejected outright; (2) through its forward data pointer, then
+            // require the data block's backpointer to round-trip to `new` — the
+            // structural cross-check the direct tag alone does not give.
+            if new.offset() != 0 {
+                // (1) Direct: the control block's header tag. Enforced whenever the
+                // target type's schema records a control tag (every `weak` type does);
+                // if unresolvable, fall back to the forward-pointer check below.
+                let ctrl_tag = self
+                    .ordinal_of(tag)
+                    .and_then(|ord| self.load_type(ord).ok())
+                    .and_then(|t| t.ctrl_tag);
+                if let Some(ctrl_tag) = ctrl_tag {
+                    let mut hdr = [0u8; 8];
+                    data.get_into(add_off(new.offset(), HEADER_TAG_OFFSET)?, &mut hdr)?;
+                    if EightCC(hdr) != ctrl_tag {
+                        return Err(swap_error(format!(
+                            "[BSTACK0815] RTTI mutator: offset {} does not hold a live \
+                             control block of the target type (its header tag is not the \
+                             type's control tag)",
+                            new.offset()
+                        )));
+                    }
+                }
+                // (2) Forward data pointer + backpointer round-trip.
+                let data_ptr = read_u64_at(data, add_off(new.offset(), CTRL_DATA_OFFSET)?)?;
+                verify_data_block(data, data_ptr, tag)?;
+                let backptr = read_u64_at(data, add_off(data_ptr, CTRL_BACKPTR_OFFSET)?)?;
+                if backptr != new.offset() {
+                    return Err(swap_error(format!(
+                        "[BSTACK0815] RTTI mutator: offset {} is not the target's \
+                         control block (its backpointer names {backptr})",
+                        new.offset()
+                    )));
+                }
+            }
+        } else {
+            verify_data_block(data, new.offset(), tag)?;
+        }
+        // Atomic exchange: install the new offset and take the displaced one in one
+        // locked step, so concurrent callers each get the distinct old target they
+        // displaced — never both hand back an owning `AnyRef` to the same block.
+        let old_bytes = data.swap(offset, new.offset().to_le_bytes())?;
+        let old = u64::from_le_bytes(old_bytes[..8].try_into().unwrap());
+        // SAFETY: `old` was displaced from the field's own slot, which held a live
+        // target of the field's declared (schema-resolved) tag.
+        Ok((old != 0).then(|| unsafe { AnyRef::new(tag, old) }))
     }
 
     /// **Swap** the cross-file `Foreign` reference named by `path` to point at `new`,
@@ -2132,7 +2492,11 @@ impl RttiRegistry {
     ///
     /// `new.tag` **must equal the field's foreign target type** (an eightcc mismatch is
     /// rejected); `new.kind` is informational (the field's schema kind governs). The
-    /// path must resolve to a scalar `Foreign` (optionally `Option`-wrapped).
+    /// path must resolve to a scalar `Foreign` (optionally `Option`-wrapped). `new` is
+    /// **validated** against the target file's on-disk header before install — a live
+    /// block of the field's type must sit at `(file_id, offset)` — so the target's file
+    /// must be `attach`ed (or `SELF`); a fabricated or unresolvable pointer is rejected
+    /// with `[BSTACK0815]`.
     pub fn swap_foreign(
         &self,
         data: &BStack,
@@ -2149,6 +2513,7 @@ impl RttiRegistry {
                 ));
             }
         };
+        let nullable = matches!(shape, Shape::Option(_));
         if let Shape::Option(inner) = shape {
             shape = *inner;
         }
@@ -2165,16 +2530,41 @@ impl RttiRegistry {
                 "eightcc mismatch: `new` is not the field's foreign target type",
             ));
         }
-        // The old pointer (returned with the field's schema kind).
-        let (old_file, old_off) = read_foreign_repr(data, offset)?;
-        // Install the new 16-byte `ForeignRepr { file_id:u32, type_index:u32, offset:u64 }`
+        // As `swap`: a non-nullable slot must never hold the null niche.
+        if new.offset == 0 && !nullable {
+            return Err(swap_error(
+                "[BSTACK0815] RTTI mutator: a null foreign reference cannot be \
+                 installed into a non-nullable field",
+            ));
+        }
+        // Validate the new target names a live block of the field's type in its own
+        // file before installing the raw pointer — an unchecked `(file_id, offset)`
+        // would let a later cross-file teardown free an arbitrary range in that file.
+        if new.offset != 0 {
+            let fid = FileId::from_u64(new.file_id)
+                .ok_or_else(|| swap_error("invalid foreign file id in `new`"))?;
+            if fid.is_self() {
+                verify_data_block(data, new.offset, new.tag)?;
+            } else {
+                registry::with_host(fid, |h| verify_data_block(h.stack(), new.offset, new.tag))
+                    .ok_or_else(|| {
+                    swap_error(
+                        "the new target's file is not attached — cannot validate the pointer",
+                    )
+                })??;
+            }
+        }
+        // Build the new 16-byte `ForeignRepr { file_id:u32, type_index:u32, offset:u64 }`
         // (type_index = the target's ordinal + 1, per `typed_ptr`).
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let mut b = [0u8; FOREIGN_REPR_LEN as usize];
         b[0..4].copy_from_slice(&(new.file_id as u32).to_le_bytes());
         b[4..8].copy_from_slice(&(ord + 1).to_le_bytes());
         b[8..16].copy_from_slice(&new.offset.to_le_bytes());
-        data.set(offset, b)?;
+        // Atomic exchange of the whole 16-byte pointer, taking the old one this
+        // caller displaced.
+        let old_repr = data.swap(offset, b)?;
+        let (old_file, old_off) = decode_foreign_repr(&old_repr);
         Ok((old_off != 0).then_some(ForeignPtr {
             tag,
             kind,
@@ -2192,9 +2582,16 @@ impl RttiRegistry {
     /// children come out as [`AnyRef`]s (the child block stays alive); a `weak` comes
     /// out as its control [`AnyRef`]; a whole **vector** transfers as a [`VecRef`]
     /// (its data block untouched, exactly like a detached `BStackVec`); a flat reference
-    /// **array** is handed out element-by-element as a [`Moved::List`] (a foreign array
-    /// as a [`Moved::ForeignList`], a nested reference array as a [`Moved::Array`]) —
-    /// its inline storage dies with the shell. An **`#[embed]`** child (scalar or an
+    /// **array** is handed out element-by-element as a [`Moved::List`] (`owned`/`ref`,
+    /// data offsets) or a [`Moved::WeakList`] (`weak`, control-block offsets — kept
+    /// distinct so control bytes are never mistaken for a `T`); a foreign array comes out
+    /// as a [`Moved::ForeignList`], a nested reference array as a [`Moved::Array`] — the
+    /// inline storage dies with the shell.
+    ///
+    /// A `rc` / `(rc, weak)` root is disassembled only when the caller is its **sole**
+    /// strong owner (a try_unwrap, exactly like `bstack_move!` on a `BStackRc`); a shared
+    /// root is refused (`[BSTACK0819]`) untouched. For `(rc, weak)` the control block is
+    /// released as part of the disassembly. An **`#[embed]`** child (scalar or an
     /// array of them) is *materialized* — copied into a fresh block (so its
     /// grandchildren transfer with it) and returned as an `AnyRef`. A cross-file
     /// **`foreign`** pointer (scalar, in a vector kept whole, in an array, or a tuple
@@ -2205,7 +2602,14 @@ impl RttiRegistry {
     /// After this the block itself is gone; the caller owns every returned part and
     /// must reuse or tear each down. On any error nothing is freed *except* orphaned
     /// embed copies, so the object is left intact.
-    pub fn move_out<A: BStackRaiiAllocator>(
+    ///
+    /// # Safety
+    ///
+    /// `block_off` must name a live block of type `ordinal` that the caller owns,
+    /// already detached from any parent: the shell is freed unconditionally, so a
+    /// wrong offset frees storage the caller does not own and a still-linked root
+    /// leaves its parent pointing at freed storage.
+    pub unsafe fn move_out<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
         ordinal: RttiOrdinal,
@@ -2214,6 +2618,41 @@ impl RttiRegistry {
         let data = alloc.stack();
         let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
         let mut materialized: Vec<BStackRange> = Vec::new();
+
+        // Load the root type up front so reference counting is honoured before anything
+        // is touched. A `rc` / `(rc, weak)` root follows `bstack_move!`'s try_unwrap: only
+        // the *sole* strong owner may disassemble it. A shared root is refused untouched —
+        // freeing its shell would be a use-after-free for the other owners, and for
+        // `(rc, weak)` leave the control block naming freed data. `ctrl_off` is `Some` for
+        // the `(rc, weak)` case (its separate control block), `None` otherwise.
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ordinal) {
+            e.insert(self.load_type(ordinal)?);
+        }
+        let (strong_slot, ctrl_off) = {
+            let root = &cache[&ordinal];
+            if root.rc {
+                let (strong_slot, ctrl) = if root.weak {
+                    let c = read_u64_at(data, add_off(block_off, CTRL_BACKPTR_OFFSET)?)?;
+                    (add_off(c, CTRL_STRONG_OFFSET)?, Some(c))
+                } else {
+                    (add_off(block_off, RC_REFCOUNT_OFFSET)?, None)
+                };
+                // Atomic try-unwrap, exactly as `BStackRc::try_move`: claim sole
+                // ownership by CAS `strong: 1 -> 0`, so a concurrent clone/upgrade
+                // either beats the move (the CAS fails cleanly) or is refused by
+                // the zero count for the whole field walk — never both succeeding.
+                if !refcount::cas(data, strong_slot, 1, 0)? {
+                    let strong = read_u64_at(data, strong_slot)?;
+                    return Err(corrupt(format!(
+                        "[BSTACK0819] RTTI move_out of a shared reference-counted block \
+                         (strong count {strong}); only the sole owner may disassemble it"
+                    )));
+                }
+                (Some(strong_slot), ctrl)
+            } else {
+                (None, None)
+            }
+        };
 
         let map = match self.move_fields(
             alloc,
@@ -2226,14 +2665,38 @@ impl RttiRegistry {
             Ok(m) => m,
             Err(e) => {
                 // Object untouched; only orphaned embed copies (if any) are reclaimed.
-                let _ = alloc.free_many(std::mem::take(&mut materialized));
+                // Restore the strong count the CAS took, so the still-intact object
+                // keeps its sole owner.
+                if let Some(slot) = strong_slot {
+                    let _ = refcount::fetch_add(data, slot, 1);
+                }
+                // SAFETY: `materialized` are this call's own embed copies.
+                let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
                 return Err(e);
             }
         };
-        // Free the shell only — children / vec data / embed copies are all transferred.
-        let shell = BStackRange::new(block_off, cache[&ordinal].ondisk_size);
-        if let Err(e) = alloc.free_many([shell]) {
-            let _ = alloc.free_many(std::mem::take(&mut materialized));
+        // The strong count is already 0 (claimed by the CAS above), so no
+        // outstanding weak can upgrade to the data block being freed.
+        // Free the shell only — children / vec data / embed copies are all
+        // transferred — plus, for `(rc, weak)`, the control block once its phantom
+        // weak is released and no real weak handles remain (else it stays, with
+        // strong == 0 refusing any upgrade).
+        let mut to_free = vec![BStackRange::new(block_off, cache[&ordinal].ondisk_size)];
+        if let Some(ctrl_off) = ctrl_off
+            && refcount::fetch_sub(data, add_off(ctrl_off, CTRL_WEAK_OFFSET)?, 1)? == 1
+        {
+            to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
+        }
+        // Route through the WAL (or the allocator's atomic bulk free) like the
+        // static `bstack_move!` shell teardown, so a crash after the fields moved
+        // out but before these frees commit is reclaimed on the next open, not
+        // leaked permanently.
+        // SAFETY: the shell is the caller-owned root (its fields already moved out);
+        // the control block, if included, has no remaining references; both live in
+        // this file.
+        if let Err(e) = unsafe { crate::teardown::commit_home_frees(alloc, to_free) } {
+            // SAFETY: `materialized` are this call's own embed copies.
+            let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
             return Err(e);
         }
         Ok(map)
@@ -2260,7 +2723,8 @@ impl RttiRegistry {
             match &ty.body {
                 RttiBody::Struct(f) => (f.clone(), block_off),
                 RttiBody::Enum(e) => {
-                    let raw = read_disc(data, block_off + e.disc_off as u64, e.disc_width)?;
+                    let raw =
+                        read_disc(data, add_off(block_off, e.disc_off as u64)?, e.disc_width)?;
                     let mask = disc_mask(e.disc_width);
                     let variant = e
                         .variants
@@ -2271,7 +2735,10 @@ impl RttiRegistry {
                                 "[BSTACK0808] no RTTI variant for discriminant {raw}"
                             ))
                         })?;
-                    (variant.fields.clone(), block_off + e.payload_off as u64)
+                    (
+                        variant.fields.clone(),
+                        add_off(block_off, e.payload_off as u64)?,
+                    )
                 }
             }
         };
@@ -2286,11 +2753,20 @@ impl RttiRegistry {
                 alloc,
                 data,
                 &f.shape,
-                base + f.offset as u64,
+                add_off(base, f.offset as u64)?,
                 cache,
                 materialized,
             )?;
-            map.insert(f.name.clone(), moved);
+            // A duplicate field name (a corrupt schema) would silently replace —
+            // and so discard — the first field's transferred ownership. Error
+            // instead: the caller's error path reclaims `materialized`, and per
+            // move_out's contract nothing else has been freed yet.
+            if map.insert(f.name.clone(), moved).is_some() {
+                return Err(corrupt(format!(
+                    "[BSTACK0800] RTTI record has two fields named '{}'",
+                    f.name
+                )));
+            }
         }
         Ok(map)
     }
@@ -2309,17 +2785,26 @@ impl RttiRegistry {
     ) -> io::Result<Moved> {
         Ok(match shape {
             Shape::Pod { width } => {
+                // Untrusted width: bound against the stack before allocating.
+                if *width as u64 > data.len()?.saturating_sub(off) {
+                    return Err(corrupt(
+                        "[BSTACK0800] RTTI POD width runs past the end of the data stack",
+                    ));
+                }
                 let mut buf = vec![0u8; *width as usize];
                 data.get_into(off, &mut buf)?;
                 Moved::Pod(buf.into())
             }
+            // SAFETY (all `AnyRef::new` in this fn): each offset is read from the
+            // moved-out block's own slot (or is a block this fn just allocated),
+            // and each tag is the slot's schema-declared element tag.
             Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
                 let child = read_u64_at(data, off)?;
-                Moved::Ref((child != 0).then(|| AnyRef::new(*tag, child)))
+                Moved::Ref((child != 0).then(|| unsafe { AnyRef::new(*tag, child) }))
             }
             Shape::Weak(tag) => {
                 let ctrl = read_u64_at(data, off)?;
-                Moved::Weak((ctrl != 0).then(|| AnyRef::new(*tag, ctrl)))
+                Moved::Weak((ctrl != 0).then(|| unsafe { AnyRef::new(*tag, ctrl) }))
             }
             Shape::Embed(tag) => {
                 // Materialize the inline child into a standalone block (its offsets are
@@ -2333,7 +2818,7 @@ impl RttiRegistry {
                 let range = slice.as_range();
                 materialized.push(range);
                 data.copy(off, range.start(), size)?;
-                Moved::Ref(Some(AnyRef::new(*tag, range.start())))
+                Moved::Ref(Some(unsafe { AnyRef::new(*tag, range.start()) }))
             }
             Shape::Foreign { tag, kind } => {
                 // The target lives in another file; hand its pointer to the caller.
@@ -2356,7 +2841,7 @@ impl RttiRegistry {
                 } else {
                     Moved::Vec(Some(VecRef {
                         data_off,
-                        data_size: read_u64_at(data, off + 8)?,
+                        data_size: read_u64_at(data, add_off(off, 8)?)?,
                         elem: (**inner).clone(),
                     }))
                 }
@@ -2365,10 +2850,10 @@ impl RttiRegistry {
                 if let Some((tag, kind)) = foreign_leaf(inner) {
                     // A foreign array: each element is a 16-byte `ForeignRepr` inline
                     // in the shell; hand every cross-file pointer back to the caller.
-                    let mut list = Vec::with_capacity(*n as usize);
+                    let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
                         let (file_id, offset) =
-                            read_foreign_repr(data, off + i * FOREIGN_REPR_LEN)?;
+                            read_foreign_repr(data, add_off(off, mul_off(i, FOREIGN_REPR_LEN)?)?)?;
                         list.push(ForeignPtr {
                             tag,
                             kind,
@@ -2377,13 +2862,24 @@ impl RttiRegistry {
                         });
                     }
                     Moved::ForeignList(list)
-                } else if let Some(tag) = element_ref_tag(inner) {
-                    // A flat reference array (`owned` / `strong` / `weak` / `ref`, opt):
-                    // each element is a `u64` offset at `off + i*8`.
-                    let mut list = Vec::with_capacity(*n as usize);
+                } else if let Some(tag) = weak_element_tag(inner) {
+                    // A weak array (`[#[bstack_weak] T; N]`, opt): each element is a
+                    // `u64` **control-block** offset at `off + i*8`. Kept distinct from a
+                    // data-ref list (`Moved::WeakList`, the array analog of `Moved::Weak`)
+                    // so a control offset is never handed back as if it named a `T`.
+                    let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
-                        let e = read_u64_at(data, off + i * 8)?;
-                        list.push((e != 0).then(|| AnyRef::new(tag, e)));
+                        let e = read_u64_at(data, add_off(off, mul_off(i, 8)?)?)?;
+                        list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
+                    }
+                    Moved::WeakList(list)
+                } else if let Some(tag) = element_ref_tag(inner) {
+                    // A flat data-reference array (`owned` / `strong` / `ref`, opt): each
+                    // element is a `u64` **data** offset at `off + i*8`.
+                    let mut list = Vec::new(); // no capacity hint: `n` is untrusted
+                    for i in 0..*n as u64 {
+                        let e = read_u64_at(data, add_off(off, mul_off(i, 8)?)?)?;
+                        list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
                     }
                     Moved::List(list)
                 } else if let Shape::Embed(etag) = &**inner {
@@ -2396,25 +2892,25 @@ impl RttiRegistry {
                         e.insert(self.load_type(ord)?);
                     }
                     let size = cache[&ord].ondisk_size;
-                    let mut list = Vec::with_capacity(*n as usize);
+                    let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
                         let range = alloc.alloc(size)?.as_range();
                         materialized.push(range);
-                        data.copy(off + i * size, range.start(), size)?;
-                        list.push(Some(AnyRef::new(*etag, range.start())));
+                        data.copy(add_off(off, mul_off(i, size)?)?, range.start(), size)?;
+                        list.push(Some(unsafe { AnyRef::new(*etag, range.start()) }));
                     }
                     Moved::List(list)
                 } else if matches!(&**inner, Shape::Array { .. }) && shape_has_reference(inner) {
                     // A nested reference array (`[[T; M]; N]`, …): move each outer
                     // element (itself a container) as its own `Moved`.
                     let stride = self.shape_stride(inner, cache)?;
-                    let mut parts = Vec::with_capacity(*n as usize);
+                    let mut parts = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
                         parts.push(self.move_field(
                             alloc,
                             data,
                             inner,
-                            off + i * stride,
+                            add_off(off, mul_off(i, stride)?)?,
                             cache,
                             materialized,
                         )?);
@@ -2425,7 +2921,7 @@ impl RttiRegistry {
                     return Err(move_unsupported());
                 } else {
                     // A POD array (nested or not): the whole inline run of bytes.
-                    let total = *n as u64 * self.shape_stride(inner, cache)?;
+                    let total = mul_off(*n as u64, self.shape_stride(inner, cache)?)?;
                     let mut buf = vec![0u8; total as usize];
                     data.get_into(off, &mut buf)?;
                     Moved::Pod(buf.into())
@@ -2440,14 +2936,14 @@ impl RttiRegistry {
                     let mut eo = off;
                     for it in items {
                         parts.push(self.move_field(alloc, data, it, eo, cache, materialized)?);
-                        eo += self.shape_stride(it, cache)?;
+                        eo = add_off(eo, self.shape_stride(it, cache)?)?;
                     }
                     Moved::Tuple(parts)
                 } else {
                     // A POD aggregate: its inline bytes (sum of element strides).
                     let mut total = 0u64;
                     for it in items {
-                        total += self.shape_stride(it, cache)?;
+                        total = add_off(total, self.shape_stride(it, cache)?)?;
                     }
                     let mut buf = vec![0u8; total as usize];
                     data.get_into(off, &mut buf)?;
@@ -2473,19 +2969,47 @@ impl RttiRegistry {
     /// scalar or inside a `vec` / array / tuple — are handled per their kind in the
     /// target's own file (`owned` deep-copied there, `strong` / `weak` bumped, `ref`
     /// aliased); a detached target file is a hard error.
-    pub fn clone_value<A: BStackRaiiAllocator>(
+    ///
+    /// # Safety
+    ///
+    /// `src_off` must name a live block of type `ordinal`. The walk reads and
+    /// deep-copies whatever bytes sit there as that type's layout: a wrong offset
+    /// duplicates arbitrary storage into new blocks, bumps refcounts at whatever
+    /// offsets the misread slots hold, and hands back a root whose later teardown
+    /// frees ranges derived from those misreads.
+    pub unsafe fn clone_value<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
         ordinal: RttiOrdinal,
         src_off: u64,
     ) -> io::Result<u64> {
+        // Bound cross-file recursion (each `Foreign` hop recurses here natively).
+        let _depth = DepthGuard::enter()?;
         let data = alloc.stack();
         let mut st = CloneState::default();
         match self.clone_build(alloc, data, ordinal, src_off, &mut st) {
-            Ok(new_root) => Ok(new_root),
+            Ok(new_root) => {
+                // Success: the intention-first-logged allocations are now real blocks.
+                // Mark the WAL transaction idle so `finish` keeps them instead of
+                // reclaiming (a clone logs only `Alloc` entries, so idling == "these
+                // are real"). A crash before this leaves them `Pending` and reclaimable
+                // — correct, since `clone_value` has not returned the tree yet.
+                if let Some(w) = st.wal.as_ref() {
+                    wal_set_idle(alloc, w.block_off)?;
+                }
+                Ok(new_root)
+            }
             Err(e) => {
-                // Reclaim the orphaned partial clone (leak-free error path).
-                let _ = alloc.free_many(std::mem::take(&mut st.allocated));
+                // Reclaim the orphaned partial clone (leak-free error path). With a WAL
+                // transaction in flight, abandon it — `finish_at_locked` frees exactly
+                // the still-`Pending` `Alloc`s (== `st.allocated`) and marks the block
+                // idle, the same path a crash takes. Otherwise free the ranges directly.
+                if st.wal.is_some() {
+                    let _ = finish_at_locked(alloc);
+                } else {
+                    // SAFETY: `st.allocated` are this clone's own partial allocations.
+                    let _ = unsafe { alloc.free_many(std::mem::take(&mut st.allocated)) };
+                }
                 Err(e)
             }
         }
@@ -2524,13 +3048,17 @@ impl RttiRegistry {
                             for f in fields {
                                 work.push(CloneOp::Field {
                                     shape: f.shape.clone(),
-                                    src_off: src_off + f.offset as u64,
-                                    new_off: new_off + f.offset as u64,
+                                    src_off: add_off(src_off, f.offset as u64)?,
+                                    new_off: add_off(new_off, f.offset as u64)?,
                                 });
                             }
                         }
                         RttiBody::Enum(e) => {
-                            let raw = read_disc(data, src_off + e.disc_off as u64, e.disc_width)?;
+                            let raw = read_disc(
+                                data,
+                                add_off(src_off, e.disc_off as u64)?,
+                                e.disc_width,
+                            )?;
                             let mask = disc_mask(e.disc_width);
                             let variant = e
                                 .variants
@@ -2541,13 +3069,13 @@ impl RttiRegistry {
                                         "[BSTACK0808] no RTTI variant for discriminant {raw}"
                                     ))
                                 })?;
-                            let sp = src_off + e.payload_off as u64;
-                            let np = new_off + e.payload_off as u64;
+                            let sp = add_off(src_off, e.payload_off as u64)?;
+                            let np = add_off(new_off, e.payload_off as u64)?;
                             for f in &variant.fields {
                                 work.push(CloneOp::Field {
                                     shape: f.shape.clone(),
-                                    src_off: sp + f.offset as u64,
-                                    new_off: np + f.offset as u64,
+                                    src_off: add_off(sp, f.offset as u64)?,
+                                    new_off: add_off(np, f.offset as u64)?,
                                 });
                             }
                         }
@@ -2566,13 +3094,17 @@ impl RttiRegistry {
                             for f in fields {
                                 work.push(CloneOp::Field {
                                     shape: f.shape.clone(),
-                                    src_off: src_base + f.offset as u64,
-                                    new_off: new_base + f.offset as u64,
+                                    src_off: add_off(src_base, f.offset as u64)?,
+                                    new_off: add_off(new_base, f.offset as u64)?,
                                 });
                             }
                         }
                         RttiBody::Enum(e) => {
-                            let raw = read_disc(data, src_base + e.disc_off as u64, e.disc_width)?;
+                            let raw = read_disc(
+                                data,
+                                add_off(src_base, e.disc_off as u64)?,
+                                e.disc_width,
+                            )?;
                             let mask = disc_mask(e.disc_width);
                             let variant = e
                                 .variants
@@ -2583,13 +3115,13 @@ impl RttiRegistry {
                                         "[BSTACK0808] no RTTI variant for discriminant {raw}"
                                     ))
                                 })?;
-                            let sp = src_base + e.payload_off as u64;
-                            let np = new_base + e.payload_off as u64;
+                            let sp = add_off(src_base, e.payload_off as u64)?;
+                            let np = add_off(new_base, e.payload_off as u64)?;
                             for f in &variant.fields {
                                 work.push(CloneOp::Field {
                                     shape: f.shape.clone(),
-                                    src_off: sp + f.offset as u64,
-                                    new_off: np + f.offset as u64,
+                                    src_off: add_off(sp, f.offset as u64)?,
+                                    new_off: add_off(np, f.offset as u64)?,
                                 });
                             }
                         }
@@ -2632,7 +3164,7 @@ impl RttiRegistry {
                     Shape::Weak(_) => {
                         let ctrl = read_u64_at(data, src_off)?;
                         if ctrl != 0 {
-                            st.bumps.push(ctrl + CTRL_WEAK_OFFSET);
+                            st.bumps.push(add_off(ctrl, CTRL_WEAK_OFFSET)?);
                         }
                     }
                     Shape::Foreign { tag, kind } => {
@@ -2642,8 +3174,9 @@ impl RttiRegistry {
                     }
                     Shape::Option(inner) => {
                         // The slot (and its `0` niche) is already copied; only a
-                        // present reference needs its child cloned / bumped.
-                        if read_u64_at(data, src_off)? != 0 {
+                        // present reference needs its child cloned / bumped. The niche
+                        // location depends on the inner shape (`Foreign` → offset @8).
+                        if option_present(data, &inner, src_off)? {
                             work.push(CloneOp::Field {
                                 shape: *inner,
                                 src_off,
@@ -2652,12 +3185,20 @@ impl RttiRegistry {
                         }
                     }
                     Shape::Array { n, inner } => {
+                        // Charge for all elements up front — `n` is untrusted and
+                        // the ops are materialized eagerly (see the read walk).
+                        budget = budget.checked_sub(n as u64).ok_or_else(|| {
+                            corrupt(
+                                "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)",
+                            )
+                        })?;
                         let stride = self.shape_stride(&inner, &mut st.cache)?;
                         for i in 0..n as u64 {
+                            let delta = mul_off(i, stride)?;
                             work.push(CloneOp::Field {
                                 shape: (*inner).clone(),
-                                src_off: src_off + i * stride,
-                                new_off: new_off + i * stride,
+                                src_off: add_off(src_off, delta)?,
+                                new_off: add_off(new_off, delta)?,
                             });
                         }
                     }
@@ -2671,14 +3212,14 @@ impl RttiRegistry {
                                 new_off: no,
                             });
                             let s = self.shape_stride(it, &mut st.cache)?;
-                            so += s;
-                            no += s;
+                            so = add_off(so, s)?;
+                            no = add_off(no, s)?;
                         }
                     }
                     Shape::Vec(inner) => {
                         let src_data = read_u64_at(data, src_off)?; // VecDesc.data_off
                         if src_data != 0 {
-                            let data_size = read_u64_at(data, src_off + 8)?;
+                            let data_size = read_u64_at(data, add_off(src_off, 8)?)?;
                             let new_data = self.alloc_copy(alloc, data, src_data, data_size, st)?;
                             // Repoint the (freshly-copied) descriptor's data pointer;
                             // its size word was copied verbatim.
@@ -2687,23 +3228,27 @@ impl RttiRegistry {
                             // (8 per `u64` offset, 16 per `ForeignRepr`).
                             let stride = self.shape_stride(&inner, &mut st.cache)?;
                             let byte_len = read_u64_at(data, src_data)?;
-                            let len = byte_len.checked_div(stride).unwrap_or(0);
-                            let sbase = src_data + BYTEVEC_HEADER;
-                            let nbase = new_data + BYTEVEC_HEADER;
+                            let len = checked_vec_len(byte_len, data_size, stride)?;
+                            let sbase = add_off(src_data, BYTEVEC_HEADER)?;
+                            let nbase = add_off(new_data, BYTEVEC_HEADER)?;
                             match &*inner {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {
-                                        let e = read_u64_at(data, sbase + i * stride)?;
+                                        let delta = mul_off(i, stride)?;
+                                        let e = read_u64_at(data, add_off(sbase, delta)?)?;
                                         if e != 0 {
-                                            st.patches.push((nbase + i * stride, e));
+                                            st.patches.push((add_off(nbase, delta)?, e));
                                             work.push(CloneOp::Block { src_off: e, ord });
                                         }
                                     }
                                 }
                                 Shape::Strong(tag) => {
                                     for i in 0..len {
-                                        let e = read_u64_at(data, sbase + i * stride)?;
+                                        let e = read_u64_at(
+                                            data,
+                                            add_off(sbase, mul_off(i, stride)?)?,
+                                        )?;
                                         if e != 0 {
                                             let off = self.strong_bump_off(data, *tag, e, st)?;
                                             st.bumps.push(off);
@@ -2712,9 +3257,12 @@ impl RttiRegistry {
                                 }
                                 Shape::Weak(_) => {
                                     for i in 0..len {
-                                        let c = read_u64_at(data, sbase + i * stride)?;
+                                        let c = read_u64_at(
+                                            data,
+                                            add_off(sbase, mul_off(i, stride)?)?,
+                                        )?;
                                         if c != 0 {
-                                            st.bumps.push(c + CTRL_WEAK_OFFSET);
+                                            st.bumps.push(add_off(c, CTRL_WEAK_OFFSET)?);
                                         }
                                     }
                                 }
@@ -2725,8 +3273,9 @@ impl RttiRegistry {
                                 other if foreign_leaf(other).is_some() => {
                                     let (tag, kind) = foreign_leaf(other).unwrap();
                                     for i in 0..len {
-                                        let so = sbase + i * stride;
-                                        let no = nbase + i * stride;
+                                        let delta = mul_off(i, stride)?;
+                                        let so = add_off(sbase, delta)?;
+                                        let no = add_off(nbase, delta)?;
                                         self.clone_foreign(alloc, data, tag, kind, so, no)?;
                                     }
                                 }
@@ -2770,9 +3319,64 @@ impl RttiRegistry {
     ) -> io::Result<u64> {
         let slice = alloc.alloc(size)?;
         let range = slice.as_range();
+        // Log the allocation intention-first so a crash mid-clone leaves it
+        // reclaimable, keeping the WAL's live entries in lockstep with `allocated`: if
+        // logging fails, undo the alloc and log nothing.
+        if alloc.wal_anchor().is_some()
+            && let Err(e) = Self::wal_log_alloc(alloc, st, range)
+        {
+            let _ = alloc.dealloc(slice);
+            return Err(e);
+        }
         st.allocated.push(range);
         data.copy(src_off, range.start(), size)?;
         Ok(range.start())
+    }
+
+    /// Log a just-made clone allocation to the intention-first WAL, (lazily) beginning
+    /// the transaction (and taking the file's WAL lock) on the first call. Mirrors
+    /// [`crate::clone::ClonePlan`]'s `wal_log_alloc`: a cheap append while the block
+    /// has spare slots, a full re-`persist_at` (which grows the block) when it is full.
+    /// `st.allocated` does **not** yet contain `range` (the caller pushes it only after
+    /// this succeeds), so the grow path logs all of `allocated` *plus* `range`.
+    fn wal_log_alloc<A: BStackRaiiAllocator>(
+        alloc: &A,
+        st: &mut CloneState,
+        range: BStackRange,
+    ) -> io::Result<()> {
+        match &mut st.wal {
+            None => {
+                let held = HeldLock::acquire(alloc)?;
+                let mut log = WalLog::with_capacity(1);
+                log.append(WalEntry::alloc(WalStatus::Pending, range));
+                let block = persist_at(alloc, &log, WalStatus::Pending)?;
+                st.wal = Some(CloneWal {
+                    _held: held,
+                    block_off: block.start(),
+                    capacity: wal_capacity_of(block),
+                    logged: 1,
+                });
+                Ok(())
+            }
+            Some(w) if w.logged < w.capacity => {
+                wal_append_alloc(alloc, w.block_off, w.logged, range)?;
+                w.logged += 1;
+                Ok(())
+            }
+            Some(_) => {
+                let mut log = WalLog::with_capacity(st.allocated.len() + 1);
+                for &r in &st.allocated {
+                    log.append(WalEntry::alloc(WalStatus::Pending, r));
+                }
+                log.append(WalEntry::alloc(WalStatus::Pending, range));
+                let block = persist_at(alloc, &log, WalStatus::Pending)?;
+                let w = st.wal.as_mut().unwrap();
+                w.block_off = block.start();
+                w.capacity = wal_capacity_of(block);
+                w.logged = st.allocated.len() as u64 + 1;
+                Ok(())
+            }
+        }
     }
 
     /// The counter offset to bump when cloning a `strong` reference to `data_child`
@@ -2789,10 +3393,10 @@ impl RttiRegistry {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         self.ensure_type(ord, st)?;
         if st.cache[&ord].weak {
-            let ctrl = read_u64_at(data, data_child + CTRL_BACKPTR_OFFSET)?;
-            Ok(ctrl + CTRL_STRONG_OFFSET)
+            let ctrl = read_u64_at(data, add_off(data_child, CTRL_BACKPTR_OFFSET)?)?;
+            add_off(ctrl, CTRL_STRONG_OFFSET)
         } else {
-            Ok(data_child + RC_REFCOUNT_OFFSET)
+            add_off(data_child, RC_REFCOUNT_OFFSET)
         }
     }
 
@@ -2819,11 +3423,11 @@ impl RttiRegistry {
             Shape::Foreign { .. } => FOREIGN_REPR_LEN,
             Shape::Vec(_) => VECDESC_LEN,
             Shape::Option(inner) => self.shape_stride(inner, cache)?,
-            Shape::Array { n, inner } => *n as u64 * self.shape_stride(inner, cache)?,
+            Shape::Array { n, inner } => mul_off(*n as u64, self.shape_stride(inner, cache)?)?,
             Shape::Tuple(items) => {
                 let mut sum = 0u64;
                 for it in items {
-                    sum += self.shape_stride(it, cache)?;
+                    sum = add_off(sum, self.shape_stride(it, cache)?)?;
                 }
                 sum
             }
@@ -2856,6 +3460,39 @@ fn swap_error(msg: impl std::fmt::Display) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("[BSTACK0810] RTTI swap: {msg}"),
     )
+}
+
+/// Error for a mutator ([`set`](RttiRegistry::set) / [`swap`](RttiRegistry::swap) /
+/// [`swap_foreign`](RttiRegistry::swap_foreign)) whose caller-supplied target offset
+/// does not name a live block of the field's declared type.
+fn bad_target(off: u64, want: EightCC, found: Option<EightCC>) -> io::Error {
+    let found = match found {
+        Some(t) => format!("found {t:?}"),
+        None => "out of bounds or unreadable".to_string(),
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "[BSTACK0815] RTTI mutator: offset {off} does not hold a live {want:?} block ({found})"
+        ),
+    )
+}
+
+/// Verify a **live block of type `tag`** sits at `off` in `data` (`off == 0` is the null
+/// sentinel, allowed). The safe RTTI mutators install caller-supplied offsets into
+/// owning slots; without this check a fabricated [`AnyRef`] / [`ForeignPtr`] could point
+/// a slot at an arbitrary location that a later teardown would free (recursively, for
+/// `owned`) or a later path would descend into — the same hazard `Foreign::new` /
+/// `raw_<field>_slice` are `unsafe` for, but here checkable against the on-disk header.
+fn verify_data_block(data: &BStack, off: u64, tag: EightCC) -> io::Result<()> {
+    if off == 0 {
+        return Ok(());
+    }
+    match AnyRef::from_block(data, off) {
+        Ok(a) if a.tag() == tag => Ok(()),
+        Ok(a) => Err(bad_target(off, tag, Some(a.tag()))),
+        Err(_) => Err(bad_target(off, tag, None)),
+    }
 }
 
 fn move_unsupported() -> io::Error {
@@ -2895,6 +3532,18 @@ fn element_ref_tag(shape: &Shape) -> Option<EightCC> {
     }
 }
 
+/// The tag of a **weak** reference leaf (optionally `Option`-wrapped) — its slot holds a
+/// `u64` *control-block* offset, not a data offset. `None` for any non-weak shape. Lets
+/// `move_out` hand a weak array back as a [`Moved::WeakList`] distinct from a data-ref
+/// [`Moved::List`].
+fn weak_element_tag(shape: &Shape) -> Option<EightCC> {
+    match shape {
+        Shape::Weak(t) => Some(*t),
+        Shape::Option(inner) => weak_element_tag(inner),
+        _ => None,
+    }
+}
+
 /// The `(tag, kind)` of a cross-file `Foreign` leaf (optionally `Option`-wrapped) —
 /// its slot is a 16-byte [`ForeignRepr`]. `None` for any non-foreign shape. Used to
 /// drive the per-element foreign path in a `Vec` / array / tuple.
@@ -2904,6 +3553,130 @@ fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
         Shape::Option(inner) => foreign_leaf(inner),
         _ => None,
     }
+}
+
+/// Whether an `Option<inner>` slot at `base` is `Some`. The null niche's **location
+/// depends on the inner shape**: a `Foreign` slot is a 16-byte `ForeignRepr`
+/// `{ file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }` whose niche is the target
+/// `offset` word at byte 8 — *not* the leading `file_id|type_index` word (which is
+/// `0` for a present untyped SELF-file pointer, so testing it would misread a live
+/// pointer as `None`). Every other offset-bearing inner — a block reference (`owned` /
+/// `strong` / `weak` / `ref`) or a `Vec` descriptor (`data_off`) — uses the leading
+/// `u64`.
+fn option_present(data: &BStack, inner: &Shape, base: u64) -> io::Result<bool> {
+    Ok(match inner {
+        Shape::Foreign { .. } => read_foreign_repr(data, base)?.1 != 0,
+        _ => read_u64_at(data, base)? != 0,
+    })
+}
+
+/// Whether two type descriptors describe the **same layout** — equal in everything a
+/// persisted instance depends on, EXCEPT the current *value* of a **mutable** class
+/// variable. A mutable `#[bstack_static]` is updated in place (`set_class_value`), so
+/// its persisted value legitimately differs from the compiled type's initial value;
+/// a raw `existing == ty` would flag that as a schema change. Everything else — field
+/// offsets / shapes / order, `rc`/`weak` mode, `ondisk_size`, and *const* class-var
+/// values — must match.
+fn layouts_match(a: &RttiType, b: &RttiType) -> bool {
+    fn strip_shape(shape: &mut Shape) {
+        match shape {
+            Shape::Class {
+                mutable,
+                inner,
+                value,
+            } => {
+                if *mutable {
+                    value.clear();
+                }
+                strip_shape(inner);
+            }
+            Shape::Option(inner) | Shape::Vec(inner) | Shape::Array { inner, .. } => {
+                strip_shape(inner)
+            }
+            Shape::Tuple(items) => items.iter_mut().for_each(strip_shape),
+            _ => {}
+        }
+    }
+    fn strip(ty: &RttiType) -> RttiType {
+        let mut t = ty.clone();
+        match &mut t.body {
+            RttiBody::Struct(fields) => fields.iter_mut().for_each(|f| strip_shape(&mut f.shape)),
+            RttiBody::Enum(e) => e
+                .variants
+                .iter_mut()
+                .for_each(|v| v.fields.iter_mut().for_each(|f| strip_shape(&mut f.shape))),
+        }
+        t
+    }
+    strip(a) == strip(b)
+}
+
+/// The interpret-budget-exhausted error (a corrupt schema/data pair, or a cycle).
+fn budget_exceeded() -> io::Error {
+    corrupt("[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)")
+}
+
+thread_local! {
+    /// The current cross-file RTTI recursion depth. The interpreter is non-recursive
+    /// *within* a file (a work-list), but `teardown` / `clone_value` recurse **natively**
+    /// at each `Foreign` hop (through `teardown_foreign_in` / `clone_foreign_in`), each
+    /// starting a fresh per-node budget — so the in-file cycle guard can't see across
+    /// files. A foreign cycle (`A --owns--> B --owns--> A`, or a SELF back-edge) would
+    /// drive unbounded native recursion → stack-overflow abort. [`DepthGuard`] bounds it.
+    static RTTI_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Native cross-file recursion cap. Each hop costs a few KB of native stack (a per-file
+/// teardown/clone frame plus the two foreign helpers), so this stays well under the
+/// smallest default thread stack (≈2 MiB) with wide margin — yet is far deeper than any
+/// sane cross-file `Foreign` chain (the *in-file* walk is non-recursive and unbounded).
+const MAX_RTTI_DEPTH: u32 = 100;
+
+/// A scope guard bounding cross-file RTTI recursion (see [`RTTI_DEPTH`]). Created at the
+/// top of `teardown` / `clone_value`; increments the depth, decrements on drop (so an
+/// error/panic unwinds it cleanly), and refuses to enter past [`MAX_RTTI_DEPTH`].
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> io::Result<Self> {
+        let depth = RTTI_DEPTH.with(|c| {
+            let n = c.get() + 1;
+            c.set(n);
+            n
+        });
+        if depth > MAX_RTTI_DEPTH {
+            RTTI_DEPTH.with(|c| c.set(c.get() - 1)); // undo: no guard is returned
+            return Err(corrupt(
+                "[BSTACK0807] RTTI cross-file recursion too deep (a foreign cycle?)",
+            ));
+        }
+        Ok(DepthGuard)
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        RTTI_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// The element count of a vec data block, **validated against the block's own size**.
+///
+/// The `@0` word is the byte length; a corrupt/forged value must never drive a read or
+/// free past the block. `byte_len` must fit the block's element region
+/// (`data_size - header`) — otherwise the walk would materialize a petabyte-sized
+/// allocation (abort) or, in teardown, read `u64`s from neighboring **live** blocks and
+/// free ranges over them. The bound also keeps `base + i*stride` from wrapping. Returns
+/// `byte_len / stride`.
+fn checked_vec_len(byte_len: u64, data_size: u64, stride: u64) -> io::Result<u64> {
+    let usable = data_size.saturating_sub(BYTEVEC_HEADER);
+    if byte_len > usable {
+        return Err(corrupt(format!(
+            "[BSTACK0813] RTTI vector length ({byte_len} bytes) exceeds its data block \
+             ({usable} usable bytes) — corrupt length word"
+        )));
+    }
+    Ok(byte_len.checked_div(stride).unwrap_or(0))
 }
 
 fn clone_unsupported() -> io::Error {
@@ -2916,9 +3689,13 @@ fn clone_unsupported() -> io::Error {
 /// Release one `weak` reference whose control block is at `ctrl_off`: decrement
 /// `ctrl.weak`; the last weak handle (or phantom) frees the control block. The data
 /// block is never touched by a weak drop.
-fn release_weak(data: &BStack, ctrl_off: u64, to_free: &mut Vec<BStackRange>) -> io::Result<()> {
-    if refcount::fetch_sub(data, ctrl_off + CTRL_WEAK_OFFSET, 1)? == 1 {
-        to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
+/// Release one deferred `weak` reference (commit phase of teardown): decrement the
+/// control block's weak count and free the control block if this was the last handle.
+fn commit_weak_release<A: BStackRaiiAllocator>(alloc: &A, ctrl_off: u64) -> io::Result<()> {
+    let data = alloc.stack();
+    if refcount::fetch_sub(data, add_off(ctrl_off, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+        // SAFETY: last weak released — the control block is unreferenced.
+        unsafe { alloc.free_many([BStackRange::new(ctrl_off, CONTROL_SIZE)])? };
     }
     Ok(())
 }
@@ -2935,8 +3712,17 @@ fn disc_mask(width: u8) -> u64 {
 
 /// Read a `width`-byte discriminant at `off`, zero-extended to `u64`.
 fn read_disc(data: &BStack, off: u64, width: u8) -> io::Result<u64> {
-    let mut b = [0u8; 8];
     let w = width as usize;
+    if w > 8 {
+        // A discriminant fits in a `u64`; a wider width is a corrupt schema. Return
+        // `Err` rather than index a `[u8; 8]` out of bounds (`disc_mask` already
+        // tolerates `>= 8`). `decode_type` rejects such records on load, so this is
+        // a defensive backstop.
+        return Err(corrupt(
+            "[BSTACK0816] RTTI enum discriminant width exceeds 8 bytes",
+        ));
+    }
+    let mut b = [0u8; 8];
     data.get_into(off, &mut b[..w])?;
     Ok(u64::from_le_bytes(b))
 }
@@ -2961,6 +3747,7 @@ fn class_value_slot(body: &[u8], target: &str) -> io::Result<Option<(usize, usiz
     let _disc_off = r.u16()?;
     let _payload_off = r.u16()?;
     let _ondisk_size = r.u64()?;
+    let _ctrl_tag = r.eightcc()?; // control tag — same fixed-header slot
     let _name = r.string(name_len)?;
     r.align(8)?;
     // Only structs carry class variables; an enum's `count` is its variants.
@@ -2993,6 +3780,16 @@ fn class_value_within_shape(r: &mut Reader) -> io::Result<Option<(usize, usize, 
     let mutable = r.u8()? != 0;
     let _inner = Shape::decode(r)?;
     let value_len = r.u32()? as usize;
+    // The value slot `[pos, pos + value_len)` must lie fully within this record's
+    // body. Without this check a corrupt `value_len` flows into `set_class_value`,
+    // which then writes `value_len` bytes at an offset past the record — tearing a
+    // neighboring schema record from a safe call.
+    if r.pos
+        .checked_add(value_len)
+        .is_none_or(|end| end > r.buf.len())
+    {
+        return Err(class_error("value length exceeds the record body"));
+    }
     Ok(Some((r.pos, value_len, mutable)))
 }
 
@@ -3029,6 +3826,7 @@ mod tests {
             name: "my_sample_type".to_string(),
             rc: true,
             weak: false,
+            ctrl_tag: None,
             ondisk_size: 64,
             body: RttiBody::Struct(vec![
                 RttiField {
@@ -3065,6 +3863,7 @@ mod tests {
             name: "expr_node".to_string(),
             rc: false,
             weak: false,
+            ctrl_tag: None,
             ondisk_size: 48,
             body: RttiBody::Enum(RttiEnum {
                 disc_width: 2,
@@ -3104,7 +3903,7 @@ mod tests {
     #[test]
     fn rtti_codec_struct_roundtrips() {
         let ty = sample_struct();
-        let body = encode_type(&ty);
+        let body = encode_type(&ty).unwrap();
         let back = decode_type(ty.tag, &body).unwrap();
         assert_eq!(ty, back);
     }
@@ -3112,7 +3911,7 @@ mod tests {
     #[test]
     fn rtti_codec_enum_roundtrips() {
         let ty = sample_enum();
-        let body = encode_type(&ty);
+        let body = encode_type(&ty).unwrap();
         let back = decode_type(ty.tag, &body).unwrap();
         assert_eq!(ty, back);
     }
@@ -3125,6 +3924,7 @@ mod tests {
             name: "sync_reg_a".to_string(),
             rc: false,
             weak: false,
+            ctrl_tag: None,
             ondisk_size: 16,
             body: RttiBody::Struct(vec![RttiField {
                 name: "x".to_string(),
@@ -3140,6 +3940,7 @@ mod tests {
             name: "sync_reg_b".to_string(),
             rc: false,
             weak: false,
+            ctrl_tag: None,
             ondisk_size: 24,
             body: RttiBody::Struct(vec![RttiField {
                 name: "child".to_string(),
@@ -3235,5 +4036,131 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // A persisted enum record with `disc_width > 8` must be rejected on
+    // load, not later slice an 8-byte discriminant buffer out of bounds.
+    #[test]
+    fn decode_rejects_oversize_enum_discriminant_width() {
+        let mut body = encode_type(&sample_enum()).unwrap();
+        // Sanity: a well-formed enum record round-trips.
+        assert!(decode_type(sample_enum().tag, &body).is_ok());
+        // Header layout is `[flags u8][disc_width u8]…`; corrupt the width to 9.
+        body[1] = 9;
+        let err = decode_type(sample_enum().tag, &body).unwrap_err();
+        assert!(err.to_string().contains("[BSTACK0816]"), "got: {err}");
+    }
+
+    // A `CLASS` field whose encoded `value_len` runs past the record
+    // body must be rejected, so `set_class_value` never writes into a neighboring record.
+    #[test]
+    fn class_value_slot_rejects_value_len_past_body() {
+        // Build a struct body with one mutable `CLASS` field "cv", exactly as the walker
+        // parses it: header, then `offset/fname_len/shape_len/fname`, then the shape.
+        fn body_with_value_len(value_len: u32, value: &[u8]) -> Vec<u8> {
+            let mut w = Writer { buf: Vec::new() };
+            w.u8(0); // flags: struct (not enum), not rc/weak
+            w.u8(0); // disc_width
+            w.u16(2); // name_len ("ty")
+            w.u16(1); // count = 1 field
+            w.u16(0); // disc_off
+            w.u16(0); // payload_off
+            w.u64(0); // ondisk_size
+            w.eightcc(EightCC([0u8; 8])); // ctrl_tag
+            w.bytes(b"ty");
+            w.align(8);
+            // field header
+            w.u32(0); // offset
+            w.u16(2); // fname_len ("cv")
+            w.u16(0); // shape_len (unused for the target field)
+            w.bytes(b"cv");
+            w.align(4);
+            // CLASS shape: tag, mutable, inner POD{width}, value_len, value bytes
+            w.u8(shape_tag::CLASS);
+            w.u8(1); // mutable
+            w.u8(shape_tag::POD);
+            w.u32(value.len() as u32);
+            w.u32(value_len); // the (possibly corrupt) declared value length
+            w.bytes(value);
+            w.buf
+        }
+
+        // Well-formed: value_len matches the trailing bytes → located.
+        let ok = body_with_value_len(5, &[0xC5; 5]);
+        let (_, len, mutable) = class_value_slot(&ok, "cv").unwrap().unwrap();
+        assert_eq!((len, mutable), (5, true));
+
+        // Corrupt: value_len far exceeds the body → rejected, not returned as a slot.
+        let bad = body_with_value_len(u32::MAX, &[0xC5; 5]);
+        let err = class_value_slot(&bad, "cv").unwrap_err();
+        assert!(err.to_string().contains("[BSTACK0812]"), "got: {err}");
+    }
+
+    // Encode-side lengths are written into fixed-width fields (u8 tuple
+    // arity, u16 name/count, u32 value/body). A component that overflows its field must
+    // be rejected on encode, not silently truncated into an unreadable record.
+    #[test]
+    fn encode_rejects_components_overflowing_their_length_fields() {
+        fn ty_with(name: String, shape: Shape) -> RttiType {
+            RttiType {
+                tag: cc("Big"),
+                name,
+                rc: false,
+                weak: false,
+                ctrl_tag: None,
+                ondisk_size: 8,
+                body: RttiBody::Struct(vec![RttiField {
+                    name: "f".to_string(),
+                    offset: 0,
+                    shape,
+                }]),
+            }
+        }
+
+        // Tuple arity is a `u8`: 256 elements overflow → rejected.
+        let over = ty_with(
+            "t".to_string(),
+            Shape::Tuple(vec![Shape::Pod { width: 1 }; 256]),
+        );
+        assert!(
+            encode_type(&over)
+                .unwrap_err()
+                .to_string()
+                .contains("[BSTACK0817]"),
+        );
+        // 255 elements fit the `u8` arity → fine.
+        let ok = ty_with(
+            "t".to_string(),
+            Shape::Tuple(vec![Shape::Pod { width: 1 }; 255]),
+        );
+        assert!(encode_type(&ok).is_ok());
+
+        // A type name longer than the `u16` name-length field is rejected.
+        let long = ty_with("x".repeat(70_000), Shape::Pod { width: 8 });
+        assert!(
+            encode_type(&long)
+                .unwrap_err()
+                .to_string()
+                .contains("[BSTACK0817]"),
+        );
+    }
+
+    // `Shape::decode` recurses one frame per nesting tag over untrusted
+    // bytes; a deeply-nested corrupt record must be rejected (not overflow the stack).
+    #[test]
+    fn shape_decode_rejects_excessive_nesting() {
+        // A legal nesting depth decodes fine: `Option^10<Pod>`.
+        let mut ok = vec![shape_tag::OPTION; 10];
+        ok.push(shape_tag::POD);
+        ok.extend_from_slice(&8u32.to_le_bytes());
+        assert!(Shape::decode(&mut Reader::new(&ok)).is_ok());
+
+        // Past the bound the decode is refused before recursing further. The `Pod` leaf
+        // is well-formed, so only the depth guard (not truncation) can reject this.
+        let mut deep = vec![shape_tag::OPTION; MAX_SHAPE_DEPTH + 5];
+        deep.push(shape_tag::POD);
+        deep.extend_from_slice(&8u32.to_le_bytes());
+        let err = Shape::decode(&mut Reader::new(&deep)).unwrap_err();
+        assert!(err.to_string().contains("[BSTACK0818]"), "got: {err}");
     }
 }

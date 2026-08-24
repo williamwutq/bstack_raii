@@ -452,13 +452,21 @@ impl RegistryStore {
         while cur + 8 <= buf.len() {
             let len = u64::from_le_bytes(buf[cur..cur + 8].try_into().unwrap()) as usize;
             cur += 8;
-            if cur + len > buf.len() {
-                // Truncated trailing record — shouldn't happen (push is atomic), but
-                // stop rather than misparse.
-                break;
+            // `checked_add`, not `cur + len > buf.len()`: a forged `len` near
+            // `usize::MAX` would wrap that unchecked sum below `cur`, passing
+            // the bounds check and then slicing `buf[cur..cur+len]` with
+            // `start > end`, which panics.
+            match cur.checked_add(len) {
+                Some(end) if end <= buf.len() => {
+                    paths.push(bytes_to_path(&buf[cur..end]));
+                    cur = end;
+                }
+                _ => {
+                    // Truncated or forged trailing record — shouldn't happen
+                    // (push is atomic), but stop rather than misparse.
+                    break;
+                }
             }
-            paths.push(bytes_to_path(&buf[cur..cur + len]));
-            cur += len;
         }
         Ok(paths)
     }
@@ -565,7 +573,30 @@ impl<'h> FileRegistry<'h> {
         let id = self.register_path(path)?;
         let stack_key = core::ptr::from_ref(host.stack()) as usize;
         let mut g = self.inner.write();
-        g.live[(id.0 - 1) as usize] = Some(host); // register_path returns a 1-based id
+        let idx = (id.0 - 1) as usize; // register_path returns a 1-based id
+        // One host may be live under only one id: attaching the same host under a
+        // second path would alias it (`live[]` holding it twice while `by_stack`
+        // can name only one id), leaving the reverse map inconsistent with the
+        // live table. Re-attaching under the *same* id is the ordinary idempotent
+        // case and falls through.
+        if let Some(&prev) = g.by_stack.get(&stack_key)
+            && prev != id
+            && table_index(prev).is_some_and(|p| g.live[p].is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attach: this host is already attached under a different FileId",
+            ));
+        }
+        // Re-attaching an id that is already live (e.g. the same path with a different
+        // host): drop the *replaced* host's reverse-map entry, else its stale
+        // `by_stack` key survives — two stacks would then map to one id, and the old
+        // key would outlive even a later `detach` (which only prunes the current host).
+        if let Some(old) = g.live[idx].take() {
+            let old_key = core::ptr::from_ref(old.stack()) as usize;
+            g.by_stack.remove(&old_key);
+        }
+        g.live[idx] = Some(host);
         g.by_stack.insert(stack_key, id);
         Ok(id)
     }
@@ -582,7 +613,12 @@ impl<'h> FileRegistry<'h> {
             .get_mut(idx)
             .and_then(|slot| slot.take())
             .map(|host| core::ptr::from_ref(host.stack()) as usize);
-        if let Some(k) = stack_key {
+        // Prune the reverse entry only if it still names *this* id — after an
+        // address reuse (or a historical aliasing), the key may belong to another
+        // live id, whose entry must survive this detach.
+        if let Some(k) = stack_key
+            && g.by_stack.get(&k) == Some(&id)
+        {
             g.by_stack.remove(&k);
         }
     }

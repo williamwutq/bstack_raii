@@ -33,7 +33,7 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::teardown::{BStackDrop, dealloc_range};
 
 /// The on-disk image of a [`BStackBTreeSet`]: header, root node pointer (`0` =
 /// empty), key count, and the embedded Bloom filter's handle offset.
@@ -58,6 +58,20 @@ const BLOOM_SIZE: u64 = size_of::<BloomOnDisk>() as u64;
 
 const T: usize = 8;
 const MAXKEYS: usize = 2 * T - 1; // 15
+
+/// Structural depth bound for every descent. A `T = 8` B-tree cannot exceed
+/// ~22 levels even at `u64::MAX` entries, so a deeper chain of child pointers
+/// is corruption (or a cycle) and must fail as `InvalidData` — not spin, grow
+/// a frame stack without bound, or overflow the native stack in the recursive
+/// walks.
+const MAX_TREE_DEPTH: u32 = 64;
+
+fn depth_exceeded() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "B-tree deeper than the structural bound (corrupt child pointer or a cycle?)",
+    )
+}
 const MAXCHILDREN: usize = 2 * T; // 16
 
 const NKEYS_OFF: usize = HEADER_SIZE as usize; // 16
@@ -133,9 +147,11 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
 
     fn bloom(&self, stack: &BStack) -> io::Result<BStackCountingBloomFilter<K>> {
         let off = read_u64(stack, self.range.start() + BLOOM_OFF)?;
-        Ok(<BStackCountingBloomFilter<K> as BStackBlock>::from_range(
-            BStackRange::new(off, BLOOM_SIZE),
-        ))
+        Ok(unsafe {
+            <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                off, BLOOM_SIZE,
+            ))
+        })
     }
 
     /// Allocate an empty set with a default-sized Bloom filter.
@@ -166,9 +182,11 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             // SAFETY: a freshly allocated block owned by no other handle.
             Ok(range) => Ok(unsafe { BStackOwned::from_raw(Self::from_range(range)) }),
             Err(e) => {
-                let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(
-                    BStackRange::new(bloom_off, BLOOM_SIZE),
-                );
+                let bloom = unsafe {
+                    <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                        bloom_off, BLOOM_SIZE,
+                    ))
+                };
                 let _ = unsafe { BStackOwned::from_raw(bloom) }.bstack_drop(allocator);
                 Err(e)
             }
@@ -189,6 +207,15 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         let mut b = vec![0u8; Self::node_size() as usize];
         stack.get_into(off, &mut b)?;
         let nkeys = get_u64(&b[NKEYS_OFF..]) as usize;
+        // `nkeys` is an on-disk field; a corrupted value indexes `b` (a fixed
+        // `node_size()`-byte buffer) past its end, panicking on a plain
+        // `contains` read. No real node ever exceeds `MAXKEYS`.
+        if nkeys > MAXKEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt B-tree node: key count exceeds capacity",
+            ));
+        }
         let leaf = get_u64(&b[LEAF_OFF..]) != 0;
         let ksize = Self::ksize();
         let children_off = Self::children_off();
@@ -376,10 +403,21 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         let children_off = Self::children_off();
         let mut scratch = Scratch::new();
         let node_size = Self::node_size() as usize;
+        let mut depth = 0u32;
         while off != 0 {
+            depth += 1;
+            if depth > MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let buf = scratch.buf(node_size);
             stack.get_into(off, buf)?;
             let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
+            if nkeys > MAXKEYS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupt B-tree node: key count exceeds capacity",
+                ));
+            }
             let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
             let mut i = nkeys;
             for j in 0..nkeys {
@@ -401,11 +439,22 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         Ok(false)
     }
 
-    /// The number of keys in the node at `off`.
+    /// The number of keys in the node at `off`. `off` comes from a parent
+    /// node's on-disk `children` array — untrusted.
     fn child_nkeys(stack: &BStack, off: u64) -> io::Result<usize> {
+        let pos = off.checked_add(NKEYS_OFF as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "corrupt B-tree child offset")
+        })?;
         let mut b = [0u8; 8];
-        stack.get_into(off + NKEYS_OFF as u64, &mut b)?;
-        Ok(get_u64(&b) as usize)
+        stack.get_into(pos, &mut b)?;
+        let nkeys = get_u64(&b) as usize;
+        if nkeys > MAXKEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt B-tree node: key count exceeds capacity",
+            ));
+        }
+        Ok(nkeys)
     }
 
     /// The rightmost / leftmost key bytes in the subtree at `off`.
@@ -614,8 +663,12 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
                                 dealloc_range(allocator, BStackRange::new(*off, build.node_size))
                             };
                         }
-                        // Tree updated; now decrement the filter.
-                        self.bloom(stack)?.remove(allocator, key)?;
+                        // Tree updated (the durable commit above); decrement the filter
+                        // best-effort. A failure (or a failure to read the filter)
+                        // leaves the counter over-high — extra false positives only, a
+                        // later `contains` still probes the tree, never a false negative
+                        // — so it must not turn this completed removal into an `Err`.
+                        let _ = self.bloom(stack).and_then(|b| b.remove(allocator, key));
                         Ok(true)
                     }
                     Err(e) => {
@@ -696,10 +749,13 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     /// A lazy in-order iterator over all keys, ascending. Reads nodes on demand;
     /// yields `io::Result`. Do not mutate the set's structure while iterating.
     pub fn iter<'a>(&self, stack: &'a BStack) -> io::Result<BTreeSetIter<'a, K>> {
-        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let [root, len] = read_fields::<2>(stack, self.range.start() + ROOT_OFF)?;
         let frames = Self::descend_left(stack, root)?;
         Ok(BTreeSetIter {
             stack,
+            block_off: self.range.start(),
+            root0: root,
+            len0: len,
             frames,
             hi: None,
             _marker: PhantomData,
@@ -708,10 +764,13 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
 
     /// A lazy in-order iterator over the keys with `lo <= key <= hi`, ascending.
     pub fn range<'a>(&self, stack: &'a BStack, lo: K, hi: K) -> io::Result<BTreeSetIter<'a, K>> {
-        let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
+        let [root, len] = read_fields::<2>(stack, self.range.start() + ROOT_OFF)?;
         let frames = Self::seek(stack, root, &lo)?;
         Ok(BTreeSetIter {
             stack,
+            block_off: self.range.start(),
+            root0: root,
+            len0: len,
             frames,
             hi: Some(hi),
             _marker: PhantomData,
@@ -722,6 +781,9 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     fn descend_left(stack: &BStack, mut cur: u64) -> io::Result<Vec<(BNode, usize)>> {
         let mut frames = Vec::new();
         while cur != 0 {
+            if frames.len() as u32 >= MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let n = Self::read_node(stack, cur)?;
             let next = if n.leaf { 0 } else { n.children[0] };
             let leaf = n.leaf;
@@ -738,6 +800,9 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     fn seek(stack: &BStack, mut cur: u64, lo: &K) -> io::Result<Vec<(BNode, usize)>> {
         let mut frames = Vec::new();
         while cur != 0 {
+            if frames.len() as u32 >= MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let n = Self::read_node(stack, cur)?;
             let (i, exact) = Self::search(&n, lo);
             let descend = if n.leaf || exact {
@@ -754,24 +819,22 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         Ok(frames)
     }
 
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the set was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
-    }
-
     fn drop_subtree<A: BStackRaiiAllocator>(
         stack: &BStack,
         off: u64,
         allocator: &A,
+        depth: u32,
     ) -> io::Result<()> {
         if off == 0 {
             return Ok(());
         }
+        if depth >= MAX_TREE_DEPTH {
+            return Err(depth_exceeded());
+        }
         let nb = Self::read_node(stack, off)?;
         if !nb.leaf {
             for &c in &nb.children {
-                Self::drop_subtree(stack, c, allocator)?;
+                Self::drop_subtree(stack, c, allocator, depth + 1)?;
             }
         }
         // SAFETY: the set solely owns each node block.
@@ -784,20 +847,30 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         off: u64,
         allocator: &A,
         plan: &mut ClonePlan,
+        depth: u32,
     ) -> io::Result<u64> {
         if off == 0 {
             return Ok(0);
         }
+        if depth >= MAX_TREE_DEPTH {
+            return Err(depth_exceeded());
+        }
         let mut buf = vec![0u8; Self::node_size() as usize];
         stack.get_into(off, &mut buf)?;
         let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
+        if nkeys > MAXKEYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt B-tree node: key count exceeds capacity",
+            ));
+        }
         let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
         let children_off = Self::children_off();
         if !leaf {
             for i in 0..=nkeys {
                 let co = children_off + i * 8;
                 let child = get_u64(&buf[co..]);
-                let new_child = Self::clone_subtree(stack, child, allocator, plan)?;
+                let new_child = Self::clone_subtree(stack, child, allocator, plan, depth + 1)?;
                 buf[co..co + 8].copy_from_slice(&new_child.to_le_bytes());
             }
         }
@@ -821,7 +894,7 @@ impl<K: Pod + Ord> crate::block::BStackEmbeddable for BStackBTreeSet<K> {}
 impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     type OnDisk = TreeSetOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackBTreeSet {
             range,
             _marker: PhantomData,
@@ -840,12 +913,14 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     ) -> io::Result<()> {
         let handle = range.start();
         let [root, _len, bloom_off] = read_fields::<3>(allocator.stack(), handle + ROOT_OFF)?;
-        Self::drop_subtree(allocator.stack(), root, allocator)?;
+        Self::drop_subtree(allocator.stack(), root, allocator, 0)?;
         if bloom_off != 0 {
             // SAFETY: the set solely owns its embedded Bloom filter.
-            let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(
-                BStackRange::new(bloom_off, BLOOM_SIZE),
-            );
+            let bloom = unsafe {
+                <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                    bloom_off, BLOOM_SIZE,
+                ))
+            };
             unsafe { BStackOwned::from_raw(bloom) }.bstack_drop(allocator)?;
         }
         Ok(())
@@ -861,10 +936,12 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
         let handle = self.range.start();
         let [root, len, bloom_off] = read_fields::<3>(allocator.stack(), handle + ROOT_OFF)?;
 
-        let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan)?;
-        let bloom = <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
-            bloom_off, BLOOM_SIZE,
-        ));
+        let new_root = Self::clone_subtree(allocator.stack(), root, allocator, plan, 0)?;
+        let bloom = unsafe {
+            <BStackCountingBloomFilter<K> as BStackBlock>::from_range(BStackRange::new(
+                bloom_off, BLOOM_SIZE,
+            ))
+        };
         let new_bloom = bloom.__bstack_clone_into(allocator, plan)?.start();
 
         let od = TreeSetOnDisk {
@@ -877,14 +954,6 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
             bloom: new_bloom,
         };
         Ok(od)
-    }
-}
-
-impl<K: Pod + Ord> BStackDrop for BStackBTreeSet<K> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 
@@ -909,6 +978,11 @@ impl<K: Pod + Ord> TryCloneIn for BStackBTreeSet<K> {
 /// [`BStackBTreeSet::range`].
 pub struct BTreeSetIter<'a, K: Pod + Ord> {
     stack: &'a BStack,
+    /// The set handle block, re-read each step to detect mutation.
+    block_off: u64,
+    /// The `(root, len)` at construction — a change means it was mutated.
+    root0: u64,
+    len0: u64,
     frames: Vec<(BNode, usize)>,
     hi: Option<K>,
     _marker: PhantomData<fn() -> K>,
@@ -918,6 +992,27 @@ impl<'a, K: Pod + Ord> Iterator for BTreeSetIter<'a, K> {
     type Item = io::Result<K>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Fail fast if the set was mutated during iteration: a path-copying
+        // insert / remove frees the old path and swaps the root, so the cached
+        // `frames` name freed nodes. A changed `(root, len)` means the snapshot is
+        // stale.
+        if !self.frames.is_empty() {
+            match read_fields::<2>(self.stack, self.block_off + ROOT_OFF) {
+                Ok([root, len]) if root == self.root0 && len == self.len0 => {}
+                Ok(_) => {
+                    self.frames.clear();
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "BStackBTreeSet was mutated during iteration (its root changed); \
+                         the iterator is invalidated",
+                    )));
+                }
+                Err(e) => {
+                    self.frames.clear();
+                    return Some(Err(e));
+                }
+            }
+        }
         loop {
             let (node, i) = self.frames.last()?;
             let i = *i;

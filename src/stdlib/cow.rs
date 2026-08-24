@@ -93,7 +93,7 @@ impl<T: BStackBlock> BStackCow<T> {
     /// `cow.handle().get_field(stack)`. Works for both variants; carries no
     /// ownership (dropping it frees nothing).
     pub fn handle(&self) -> T {
-        <T as BStackBlock>::from_range(self.range())
+        unsafe { <T as BStackBlock>::from_range(self.range()) }
     }
 
     /// Collapse to an owned block, deep-copying if currently borrowed.
@@ -108,7 +108,7 @@ impl<T: BStackBlock> BStackCow<T> {
         match self {
             BStackCow::Owned(o) => Ok(o),
             BStackCow::Borrowed(r) => {
-                <T as BStackBlock>::from_range(r.into_range()).try_clone_in(allocator)
+                unsafe { <T as BStackBlock>::from_range(r.into_range()) }.try_clone_in(allocator)
             }
         }
     }
@@ -129,8 +129,8 @@ impl<T: BStackBlock> BStackCow<T> {
     {
         if let BStackCow::Borrowed(r) = self {
             // `BStackRef` is `Copy`; take the range out before we overwrite it.
-            let owned =
-                <T as BStackBlock>::from_range((*r).into_range()).try_clone_in(allocator)?;
+            let owned = unsafe { <T as BStackBlock>::from_range((*r).into_range()) }
+                .try_clone_in(allocator)?;
             *self = BStackCow::Owned(owned);
         }
         match self {

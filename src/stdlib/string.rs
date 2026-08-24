@@ -12,6 +12,13 @@
 //! [`BStackBlock`] (composable as a field, referenced, cloned). The UTF-8 bytes
 //! live in their own block; mutating the contents reallocates only that block and
 //! swaps the handle's `{data, len}` in one atomic write.
+//!
+//! **Concurrency:** atomic per call and external-lock-free. [`set`](BStackString::set)
+//! (and the `push_str` / `push` / `truncate` / `clear` mutators that funnel
+//! through it) exchange the `{data, len}` pair with a single atomic
+//! [`bstack::BStack::swap`], so two concurrent callers each free the distinct old
+//! bytes block they displaced — last-writer-wins on the contents, never a double
+//! free.
 
 use core::mem::size_of;
 use std::io;
@@ -25,7 +32,7 @@ use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
 use crate::owned::BStackOwned;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackString`]: header, a pointer to the UTF-8 bytes
 /// block (`0` = empty), and the byte length. `#[repr(C)]`, `u64` fields only —
@@ -108,11 +115,21 @@ impl BStackString {
     /// Read the raw UTF-8 bytes.
     pub fn read_bytes(&self, stack: &BStack) -> io::Result<Vec<u8>> {
         let [data, len] = read_fields::<2>(stack, self.range.start() + DATA_OFF)?;
-        let len = len as usize;
-        let mut buf = vec![0u8; len];
-        if len != 0 {
-            stack.get_into(data, &mut buf)?;
+        if len == 0 {
+            return Ok(Vec::new());
         }
+        // `len` is an on-disk field; a corrupted value near `u64::MAX` would
+        // otherwise size an allocation the process can't satisfy — `vec![0u8;
+        // len]` aborts via `handle_alloc_error` on failure, uncatchable unlike
+        // a panic. A string's bytes can never exceed the file itself.
+        if len > stack.len()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt string length exceeds file size",
+            ));
+        }
+        let mut buf = vec![0u8; len as usize];
+        stack.get_into(data, &mut buf)?;
         Ok(buf)
     }
 
@@ -126,31 +143,40 @@ impl BStackString {
     /// and freeing the old one.
     ///
     /// The new bytes are written to a fresh block first, then the handle's
-    /// `{data, len}` pair is updated in one atomic write (a crash before it leaves
-    /// the old string intact; after it, the new). The old bytes block is then
-    /// freed (leak-only on a crash in between).
+    /// `{data, len}` pair is exchanged for the old one in a single atomic
+    /// [`BStack::swap`]: the read of the old pointer and the write of the new
+    /// happen together under one lock, so two concurrent `set`s each take (and
+    /// free) the *distinct* block they displaced — never the same block twice.
+    /// A crash before the swap leaves the old string intact;
+    /// after it, the new. The old bytes block is then freed (leak-only on a crash
+    /// in between).
     pub fn set<A: BStackRaiiAllocator>(&self, allocator: &A, s: &str) -> io::Result<()> {
         let handle = self.range.start();
         let stack = allocator.stack();
         let newlen = s.len() as u64;
         let newdata = Self::alloc_bytes(allocator, s.as_bytes())?;
 
-        let [old_data, old_len] = read_fields::<2>(stack, handle + DATA_OFF)?;
-
-        // `data` and `len` are contiguous — swap both in one 16-byte write.
+        // `data` and `len` are contiguous — exchange both in one atomic 16-byte
+        // swap, taking the pair this caller displaced.
         let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&newdata.to_le_bytes());
         buf[8..16].copy_from_slice(&newlen.to_le_bytes());
-        if let Err(e) = stack.set(handle + DATA_OFF, buf) {
-            if newdata != 0 {
-                // SAFETY: never linked into the handle; reclaim it.
-                let _ = unsafe { dealloc_range(allocator, BStackRange::new(newdata, newlen)) };
+        let old = match stack.swap(handle + DATA_OFF, buf) {
+            Ok(o) => o,
+            Err(e) => {
+                if newdata != 0 {
+                    // SAFETY: never linked into the handle; reclaim it.
+                    let _ = unsafe { dealloc_range(allocator, BStackRange::new(newdata, newlen)) };
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
+        let old_data = u64::from_le_bytes(old[0..8].try_into().unwrap());
+        let old_len = u64::from_le_bytes(old[8..16].try_into().unwrap());
 
         if old_data != 0 {
-            // SAFETY: the handle no longer points at the old bytes block.
+            // SAFETY: this caller's swap displaced exactly this block; the handle
+            // no longer points at it and no other caller took the same old pair.
             let _ = unsafe { dealloc_range(allocator, BStackRange::new(old_data, old_len)) };
         }
         Ok(())
@@ -219,12 +245,6 @@ impl BStackString {
     pub fn contains(&self, stack: &BStack, needle: &str) -> io::Result<bool> {
         Ok(self.to_string(stack)?.contains(needle))
     }
-
-    /// Attach an allocator to make an auto-freeing [`AutoDrop`] guard.
-    pub fn auto<A: BStackRaiiAllocator>(self, allocator: &A) -> AutoDrop<'_, Self, A> {
-        // SAFETY: sole ownership was asserted when the string was created.
-        unsafe { AutoDrop::from_raw(self, allocator) }
-    }
 }
 
 impl BStackCast for BStackString {
@@ -240,7 +260,7 @@ impl crate::block::BStackEmbeddable for BStackString {}
 impl BStackBlock for BStackString {
     type OnDisk = StringOnDisk;
 
-    fn from_range(range: BStackRange) -> Self {
+    unsafe fn from_range(range: BStackRange) -> Self {
         BStackString { range }
     }
 
@@ -272,6 +292,14 @@ impl BStackBlock for BStackString {
         let [data, len] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
 
         let new_data = if len != 0 {
+            // See `read_bytes`: a corrupted `len` must not size an unbounded
+            // allocation — bound it by the file's own size first.
+            if len > allocator.stack().len()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupt string length exceeds file size",
+                ));
+            }
             let mut bytes = vec![0u8; len as usize];
             allocator.stack().get_into(data, &mut bytes)?;
             let dst = plan.alloc_raw(allocator, len)?;
@@ -290,14 +318,6 @@ impl BStackBlock for BStackString {
             len,
         };
         Ok(od)
-    }
-}
-
-impl BStackDrop for BStackString {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        Self::__bstack_drop_children(self.range, allocator)?;
-        // SAFETY: sole ownership of the handle block was asserted at construction.
-        unsafe { dealloc_range(allocator, self.range) }
     }
 }
 
