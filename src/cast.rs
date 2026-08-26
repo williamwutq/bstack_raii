@@ -13,7 +13,7 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStackOwnedSlice, BStackSlice};
 
 use crate::block::BStackBlock;
-use crate::layout::EightCC;
+use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::teardown::AutoDrop;
 

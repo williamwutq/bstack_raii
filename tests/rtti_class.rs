@@ -8,7 +8,7 @@
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::registry;
-use bstack_raii::rtti::{self, AnyRef, ForeignKind, ForeignPtr, Moved, RttiBody, Shape, Value};
+use bstack_raii::rtti::{self, AnyRef, OwnershipKind, ForeignPtr, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
     BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, WidePtr,
     TryClone, bstack_class, rtti_path,
@@ -1275,14 +1275,14 @@ fn bstack_class_foreign_shapes() {
         f[0].shape,
         Shape::Foreign {
             tag: point_tag,
-            kind: ForeignKind::Owned
+            kind: OwnershipKind::Owned
         }
     );
     assert_eq!(
         f[1].shape,
         Shape::Foreign {
             tag: point_tag,
-            kind: ForeignKind::Ref
+            kind: OwnershipKind::Ref
         }
     );
 
@@ -1296,14 +1296,14 @@ fn bstack_class_foreign_shapes() {
         g[0].shape,
         Shape::Foreign {
             tag: <RCell as BStackCast>::eightcc(),
-            kind: ForeignKind::Strong
+            kind: OwnershipKind::Strong
         }
     );
     assert_eq!(
         g[1].shape,
         Shape::Foreign {
             tag: <WCell as BStackCast>::eightcc(),
-            kind: ForeignKind::Weak
+            kind: OwnershipKind::Weak
         }
     );
 
@@ -1341,7 +1341,7 @@ fn interpret_reads_foreign_pointer() {
         fields[0].1,
         Value::Foreign {
             tag: point_tag,
-            kind: ForeignKind::Owned,
+            kind: OwnershipKind::Owned,
             file_id: 0,
             offset: p1_off,
         }
@@ -1350,7 +1350,7 @@ fn interpret_reads_foreign_pointer() {
         fields[1].1,
         Value::Foreign {
             tag: point_tag,
-            kind: ForeignKind::Ref,
+            kind: OwnershipKind::Ref,
             file_id: 0,
             offset: p2_off,
         }
@@ -1519,7 +1519,7 @@ fn interpret_clone_foreign_owned_across_files() {
     else {
         panic!("owned_f should be a foreign");
     };
-    assert_eq!(kind, ForeignKind::Owned);
+    assert_eq!(kind, OwnershipKind::Owned);
     assert_ne!(file_id, 0);
     assert_ne!(
         new_target, leaf_off,
@@ -1541,7 +1541,7 @@ fn interpret_clone_foreign_owned_across_files() {
     let Value::Foreign { kind: rk, .. } = fields[1].1 else {
         panic!("ref_f should be a foreign");
     };
-    assert_eq!(rk, ForeignKind::Ref);
+    assert_eq!(rk, OwnershipKind::Ref);
 
     registry::detach(fid);
     drop(reg);
@@ -1587,7 +1587,7 @@ fn interpret_move_out_foreign() {
         moved["owned_f"],
         Moved::Foreign {
             tag: point_tag,
-            kind: ForeignKind::Owned,
+            kind: OwnershipKind::Owned,
             file_id: fid.get() as u64,
             offset: leaf_off,
         }
@@ -1596,7 +1596,7 @@ fn interpret_move_out_foreign() {
         moved["ref_f"],
         Moved::Foreign {
             tag: point_tag,
-            kind: ForeignKind::Ref,
+            kind: OwnershipKind::Ref,
             file_id: 0,
             offset: hp_off,
         }
@@ -1623,7 +1623,7 @@ fn bstack_class_foreign_container_shapes() {
     let pt = <Point as BStackCast>::eightcc();
     let f = Shape::Foreign {
         tag: pt,
-        kind: ForeignKind::Owned,
+        kind: OwnershipKind::Owned,
     };
 
     let fv = reg
@@ -1885,13 +1885,13 @@ fn interpret_foreign_array_across_files() {
             vec![
                 ForeignPtr {
                     tag: pt,
-                    kind: ForeignKind::Owned,
+                    kind: OwnershipKind::Owned,
                     file_id: fid.get() as u64,
                     offset: o0,
                 },
                 ForeignPtr {
                     tag: pt,
-                    kind: ForeignKind::Owned,
+                    kind: OwnershipKind::Owned,
                     file_id: fid.get() as u64,
                     offset: o1,
                 },
@@ -1956,7 +1956,7 @@ fn interpret_foreign_tuple_across_files() {
         parts[0],
         Moved::Foreign {
             tag: pt,
-            kind: ForeignKind::Owned,
+            kind: OwnershipKind::Owned,
             file_id: fid.get() as u64,
             offset: po,
         }
@@ -2021,7 +2021,7 @@ fn bstack_class_complex_enum_variant_shapes() {
     let fv = |n: &str| e2.variants.iter().find(|v| v.name == n).unwrap();
     let f = Shape::Foreign {
         tag: pt,
-        kind: ForeignKind::Owned,
+        kind: OwnershipKind::Owned,
     };
     assert_eq!(fv("Many").fields[0].shape, Shape::Vec(Box::new(f.clone())));
     assert_eq!(
@@ -2424,7 +2424,7 @@ fn interpret_swap_foreign_across_files() {
 
     let new = ForeignPtr {
         tag: ptag,
-        kind: ForeignKind::Owned,
+        kind: OwnershipKind::Owned,
         file_id: fid.get() as u64,
         offset: o2,
     };
@@ -2435,7 +2435,7 @@ fn interpret_swap_foreign_across_files() {
         old,
         Some(ForeignPtr {
             tag: ptag,
-            kind: ForeignKind::Owned,
+            kind: OwnershipKind::Owned,
             file_id: fid.get() as u64,
             offset: o1,
         })
@@ -2763,7 +2763,7 @@ fn interpret_foreign_cycle_recursion_bounded() {
         rtti_path!(me),
         ForeignPtr {
             tag: ftag,
-            kind: ForeignKind::Owned,
+            kind: OwnershipKind::Owned,
             file_id: 0,
             offset: a_off,
         },

@@ -21,7 +21,7 @@ use bstack::BStackRange;
 
 use crate::block::{BStackBlock, BStackWeakable};
 use crate::layout;
-use crate::refcount;
+use crate::io_core::refcount;
 use crate::reference::BStackRef;
 use crate::teardown::{BStackDrop, dealloc_range};
 

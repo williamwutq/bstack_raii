@@ -42,10 +42,12 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
-use super::util::{SmallBuf, alloc_image, read_fields, read_u64, w8};
+use super::util::{alloc_image, read_fields, read_u64, w8};
+use crate::util::small_buf::SmallBuf;
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
+use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::teardown::dealloc_range;
 

@@ -18,7 +18,8 @@ use bstack::BStackRange;
 
 use crate::block::BStackWeakable;
 use crate::handle::WeakRef;
-use crate::layout::{self, BlockHeader, EightCC, put_u64};
+use crate::layout::{self, BlockHeader, put_u64};
+use crate::primitives::EightCC;
 use crate::reference::BStackRef;
 use crate::replace::ReplaceError;
 use crate::shared::{BStackRc, BStackWeak};
@@ -143,6 +144,8 @@ impl_source_error!(ConstructError<F>);
 /// gate (`bstack_cast!`, `AnyRef::from_block`, `verify_data_block`) validates. No
 /// non-test code path needs it; generated constructors stamp their header inline.
 #[cfg(test)]
+// MOVE(TEST, ALLOC) requires EightCC, BStackRaiiAllocator, BStackRange
+// the function allocates a block and stamps header for testing purposes
 pub(crate) fn alloc_block<A: BStackRaiiAllocator>(
     allocator: &A,
     tag: EightCC,
@@ -197,7 +200,7 @@ pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u
 /// value read from it is released as a control-block reference: a wrong offset
 /// decrements (and can free) a control block at whatever offset that location
 /// happens to hold.
-pub unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocator>(
     allocator: &'w A,
     field_off: u64,
     new_weak: BStackWeak<'w, T, A>,
@@ -274,7 +277,7 @@ pub unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocator>(
 /// declared target type `T` in `allocator`'s file: the u64 read there is
 /// treated as a control-block offset and its counters are read and written —
 /// a wrong offset manufactures an owning `BStackRc` from arbitrary bytes.
-pub unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllocator>(
     allocator: &'a A,
     field_off: u64,
 ) -> io::Result<Option<BStackRc<'a, T, A>>> {

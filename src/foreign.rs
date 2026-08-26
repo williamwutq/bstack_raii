@@ -41,66 +41,13 @@ use crate::handle::{OwnedRef, WeakRef};
 use crate::layout;
 use crate::owned::BStackOwned;
 use crate::primitives::{BrandedWidePtr, Offset, WidePtr};
-use crate::refcount;
+use crate::io_core::refcount;
 use crate::reference::BStackRef;
 #[cfg(test)]
 use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::BStackDrop;
-
-/// **Read-side `SELF` resolution**. A stored [`WidePtr`] whose
-/// `file_id == 0` (`SELF`) is only meaningful *relative to the file it was read
-/// from*; handed out unchanged, an in-memory `SELF` pointer can be stored into a
-/// different file, whose later owning teardown / clone would then free or copy the
-/// wrong file's block. This rebinds a `SELF` pointer to the reading file's
-/// **registered** [`FileId`], so the escaped pointer is *explicit* and routes
-/// correctly no matter where it is later stored. An explicit pointer (and the
-/// `offset == 0` null niche) pass through unchanged.
-///
-/// **When the home file is not registered the `SELF` pointer is passed through as-is**
-/// (not an error): a `SELF` pointer that reached storage through *safe* code was
-/// minted by [`Foreign::from_local`] / `bstack_cast!`, both of which require the file
-/// to be registered — so the safe surface is always resolvable here. An
-/// unregistered file's `SELF` can only have been minted through the `unsafe`
-/// [`Foreign::new`] / [`Foreign::at`], whose contract already forbids moving it to
-/// another file. Returns `io::Result` for signature symmetry with the fallible read
-/// paths that call it; it currently never errors. The inverse is
-/// [`home_relative_repr`], applied on write.
-pub fn resolve_self_repr(repr: WidePtr, home: &BStack) -> io::Result<WidePtr> {
-    if !repr.is_self() || repr.is_null() {
-        return Ok(repr);
-    }
-    match registry::id_of_host(home) {
-        // Rebind the `SELF` pointer to the reading file's explicit id, keeping its
-        // type tag and address.
-        Some(id) => Ok(WidePtr::with_parts(id, repr.type_id(), repr.offset())),
-        // NOTE: This does not resolve completely, will this be an issue downstream the call stack?
-        // Unregistered home: no id to resolve against. A safe SELF can't reach here
-        // (its minting required registration); leave an unsafe-minted one as-is.
-        None => Ok(repr),
-    }
-}
-
-/// **Write-side `SELF` re-encoding**, the inverse of
-/// [`resolve_self_repr`]. An explicit pointer whose target file **is** the home file
-/// being written is stored back as `file_id == 0` (`SELF`), so the on-disk encoding
-/// stays portable across re-attaches (file ids are assigned per attach). A pointer to
-/// any other file stays explicit; an already-`SELF` pointer (only mintable through
-/// `unsafe`) is left as-is — after resolve-on-read a legitimate in-memory `SELF`
-/// means "home", so writing it as `SELF` is correct.
-pub fn home_relative_repr(repr: WidePtr, home: &BStack) -> WidePtr {
-    if repr.is_self() {
-        return repr;
-    }
-    if let Some(id) = registry::id_of_host(home) {
-        if repr.file() == id {
-            // Target is the home file ⇒ re-encode as `SELF`, keeping type + address.
-            return WidePtr::with_parts(FileId::SELF, repr.type_id(), repr.offset());
-        }
-    }
-    repr
-}
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or
@@ -588,7 +535,6 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
     }
 }
 
-// NOTE: the below probably should not be free functions
 // ---------------------------------------------------------------------------
 // Cross-file teardown helpers.
 //
@@ -612,7 +558,7 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
 /// # Safety
 /// `offset` names a live `T` block, in the file `alloc` addresses, exclusively owned
 /// by this foreign pointer (freed exactly once).
-pub unsafe fn foreign_drop_owned<T: BStackBlock, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn foreign_drop_owned<T: BStackBlock, A: BStackRaiiAllocator>(
     alloc: &A,
     offset: u64,
 ) -> io::Result<()> {
@@ -630,7 +576,7 @@ pub unsafe fn foreign_drop_owned<T: BStackBlock, A: BStackRaiiAllocator>(
 /// # Safety
 /// `offset` names a live shared `T` data block in the file `alloc` addresses, holding
 /// one strong reference on behalf of this foreign pointer.
-pub unsafe fn foreign_drop_strong<T: BStackShared, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn foreign_drop_strong<T: BStackShared, A: BStackRaiiAllocator>(
     alloc: &A,
     offset: u64,
 ) -> io::Result<()> {
@@ -648,7 +594,7 @@ pub unsafe fn foreign_drop_strong<T: BStackShared, A: BStackRaiiAllocator>(
 /// # Safety
 /// `ctrl_offset` names a live `T::Control` block in the file `alloc` addresses,
 /// holding one weak reference on behalf of this foreign pointer.
-pub unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     alloc: &A,
     ctrl_offset: u64,
 ) -> io::Result<()> {
@@ -686,7 +632,7 @@ pub unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
 /// # Safety
 /// `offset` names a live `T` block, in the file `alloc` addresses, owned by this
 /// foreign pointer.
-pub unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackRaiiAllocator>(
     alloc: &A,
     offset: u64,
 ) -> io::Result<u64> {
@@ -702,7 +648,7 @@ pub unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackRaiiAllo
 ///
 /// # Safety
 /// `offset` names a live shared `T` data block in the file `alloc` addresses.
-pub unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocator>(
     alloc: &A,
     offset: u64,
 ) -> io::Result<()> {
@@ -725,7 +671,10 @@ pub unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocator>(
 ///
 /// # Safety
 /// `ctrl_offset` names a live `T::Control` block in the file `alloc` addresses.
-pub unsafe fn foreign_clone_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
+// `T` documents the target and keeps the signature parallel to the other three
+// helpers (and to `BStackWeakable::foreign_clone_weak`); the increment is offset-only.
+#[allow(clippy::extra_unused_type_parameters)]
+pub(crate) unsafe fn foreign_clone_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     alloc: &A,
     ctrl_offset: u64,
 ) -> io::Result<()> {

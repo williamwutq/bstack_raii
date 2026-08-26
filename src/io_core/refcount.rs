@@ -16,26 +16,18 @@
 
 use std::io;
 
-use crate::layout::get_u64;
 use bstack::BStack;
 
-#[inline]
-fn overflow_err() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "refcount overflow")
-}
+use crate::layout::get_u64;
+use crate::util::io_errorfn;
 
-#[inline]
-fn underflow_err() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "refcount underflow")
-}
+io_errorfn!(overflow_err, InvalidData, "refcount overflow");
+io_errorfn!(underflow_err, InvalidData, "refcount underflow");
 
-/// A counter offset near `u64::MAX` (so the fixed 8-byte counter range can't be
-/// formed) can only come from a corrupted/forged on-disk pointer — every caller
-/// derives `offset` from a stored back-pointer, `Foreign` target, or field value.
-#[inline]
-fn corrupt_offset_err() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "refcount offset overflow")
-}
+// A counter offset near `u64::MAX` (so the fixed 8-byte counter range can't be
+// formed) can only come from a corrupted/forged on-disk pointer — every caller
+// derives `offset` from a stored back-pointer, `Foreign` target, or field value.
+io_errorfn!(corrupt_offset_err, InvalidData, "refcount offset overflow");
 
 /// Compare-and-swap the counter at `offset`: set it to `new` iff it currently
 /// equals `expected`. Returns whether the swap happened. The atomic "try-unwrap"

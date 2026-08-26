@@ -69,12 +69,12 @@ use linkme::distributed_slice;
 use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackCast};
 use crate::layout::read_u64_at;
-use crate::primitives::WidePtr;
+use crate::primitives::{EightCC, WidePtr};
 use crate::layout::{
-    CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, EightCC,
+    CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET,
     RC_REFCOUNT_OFFSET, get_u64,
 };
-use crate::refcount;
+use crate::io_core::refcount;
 use crate::registry::{self, FileId, ForeignHostAllocator};
 use crate::util::small_map::SmallStringMap;
 use crate::wal::{
@@ -393,39 +393,10 @@ impl<'a> Reader<'a> {
 
 // -- Parsed, in-memory schema (structure only) -----------------------------
 
-// NOTE: important: The four kind, `owned` / `strong` / `weak` / `ref` is used almost
-// universally in this crate, so we may want to create ownership.rs that provide this
-// as a OwnershipKind enum instead of putting it here in RTTI
-/// The ownership relationship a [`Foreign`](crate::Foreign) pointer has with its
-/// target **in the target's own file** — the cross-file analog of the in-file
-/// `owned` / `strong` / `weak` / `ref` kinds, selecting teardown / clone behavior.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ForeignKind {
-    /// `#[bstack_owned] Foreign<T>` — exclusively owns the target (freed / deep-cloned).
-    Owned,
-    /// `#[bstack_strong] Foreign<T>` — a strong reference (refcount bumped / decremented).
-    Strong,
-    /// `#[bstack_weak] Foreign<T>` — a weak reference (weak count bumped / decremented).
-    Weak,
-    /// `#[bstack_ref] Foreign<T>` — a non-owning alias (copied; frees nothing).
-    Ref,
-}
-
-impl ForeignKind {
-    fn from_u8(v: u8) -> io::Result<Self> {
-        Ok(match v {
-            0 => ForeignKind::Owned,
-            1 => ForeignKind::Strong,
-            2 => ForeignKind::Weak,
-            3 => ForeignKind::Ref,
-            other => {
-                return Err(corrupt(format!(
-                    "[BSTACK0803] unknown RTTI foreign kind {other:#04x}"
-                )));
-            }
-        })
-    }
-}
+/// The four ownership kinds an interpreted reference can carry — re-exported from
+/// [the primitives](crate::primitives::OwnershipKind), the crate-wide vocabulary.
+/// A `Foreign` leaf, a struct field, and a variant payload all classify with it.
+pub use crate::primitives::OwnershipKind;
 
 /// The info-complex node — a field's type structure, its leaves carrying the RAII
 /// kind the interpreter dispatches on.
@@ -443,7 +414,7 @@ pub enum Shape {
     /// ownership kind of the target *in its own file* (which drives teardown / clone).
     Foreign {
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
     },
     Option(Box<Shape>),
     Array {
@@ -566,10 +537,14 @@ impl Shape {
             t::WEAK => Shape::Weak(r.eightcc()?),
             t::REF => Shape::Ref(r.eightcc()?),
             t::EMBED => Shape::Embed(r.eightcc()?),
-            t::FOREIGN => Shape::Foreign {
-                tag: r.eightcc()?,
-                kind: ForeignKind::from_u8(r.u8()?)?,
-            },
+            t::FOREIGN => {
+                let tag = r.eightcc()?;
+                let kb = r.u8()?;
+                let kind = OwnershipKind::from_u8(kb).ok_or_else(|| {
+                    corrupt(format!("[BSTACK0803] unknown RTTI foreign kind {kb:#04x}"))
+                })?;
+                Shape::Foreign { tag, kind }
+            }
             t::OPTION => Shape::Option(Box::new(Shape::decode_at(r, depth + 1)?)),
             t::ARRAY => {
                 let n = r.u32()?;
@@ -1184,7 +1159,7 @@ pub enum Value {
     /// target's tag, ownership kind, file id (`0` == the current file), and offset.
     Foreign {
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
         file_id: u64,
         offset: u64,
     },
@@ -1251,7 +1226,7 @@ pub enum Moved {
     /// id, and offset (`offset == 0` == null). The caller now owns the reference.
     Foreign {
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
         file_id: u64,
         offset: u64,
     },
@@ -1279,7 +1254,7 @@ pub enum Moved {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForeignPtr {
     pub tag: EightCC,
-    pub kind: ForeignKind,
+    pub kind: OwnershipKind,
     pub file_id: u64,
     pub offset: u64,
 }
@@ -1775,7 +1750,7 @@ impl RttiRegistry {
         // mutations that a mid-walk abort must not have started.
         let mut strong_releases: Vec<(EightCC, u64)> = Vec::new(); // (tag, data offset)
         let mut weak_releases: Vec<u64> = Vec::new(); // control offsets
-        let mut foreign_releases: Vec<(EightCC, ForeignKind, u64, u64)> = Vec::new();
+        let mut foreign_releases: Vec<(EightCC, OwnershipKind, u64, u64)> = Vec::new();
         let mut budget: u64 = 4_000_000;
 
         while let Some(op) = work.pop() {
@@ -2056,11 +2031,11 @@ impl RttiRegistry {
         &self,
         home: &A,
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
         file_id: u64,
         offset: u64,
     ) -> io::Result<()> {
-        if offset == 0 || matches!(kind, ForeignKind::Ref) {
+        if offset == 0 || matches!(kind, OwnershipKind::Ref) {
             return Ok(()); // null, or a non-owning alias
         }
         if file_id == 0 {
@@ -2088,17 +2063,17 @@ impl RttiRegistry {
         &self,
         target: &A,
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
         offset: u64,
     ) -> io::Result<()> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let data = target.stack();
         match kind {
-            ForeignKind::Ref => Ok(()),
+            OwnershipKind::Ref => Ok(()),
             // SAFETY: `offset` came from the owning foreign slot being torn down;
             // ownership of the target transfers with the slot.
-            ForeignKind::Owned => unsafe { self.teardown(target, ord, offset) },
-            ForeignKind::Strong => {
+            OwnershipKind::Owned => unsafe { self.teardown(target, ord, offset) },
+            OwnershipKind::Strong => {
                 if self.load_type(ord)?.weak {
                     let ctrl = read_u64_at(data, add_off(offset, CTRL_BACKPTR_OFFSET)?)?;
                     if refcount::fetch_sub(data, add_off(ctrl, CTRL_STRONG_OFFSET)?, 1)? == 1 {
@@ -2115,7 +2090,7 @@ impl RttiRegistry {
                 }
                 Ok(())
             }
-            ForeignKind::Weak => {
+            OwnershipKind::Weak => {
                 // A weak foreign's offset is the control offset.
                 if refcount::fetch_sub(data, add_off(offset, CTRL_WEAK_OFFSET)?, 1)? == 1 {
                     // SAFETY: last weak released — control block unreferenced.
@@ -2140,11 +2115,11 @@ impl RttiRegistry {
         home: &A,
         home_data: &BStack,
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
         src_off: u64,
         new_off: u64,
     ) -> io::Result<()> {
-        if matches!(kind, ForeignKind::Ref) {
+        if matches!(kind, OwnershipKind::Ref) {
             return Ok(()); // aliased — the copied slot is correct
         }
         let __wp = WidePtr::read_from_stack(home_data, src_off)?;
@@ -2175,15 +2150,15 @@ impl RttiRegistry {
         target: &A,
         home_data: &BStack,
         tag: EightCC,
-        kind: ForeignKind,
+        kind: OwnershipKind,
         src_target: u64,
         new_off: u64,
     ) -> io::Result<()> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let tstack = target.stack();
         match kind {
-            ForeignKind::Ref => Ok(()),
-            ForeignKind::Owned => {
+            OwnershipKind::Ref => Ok(()),
+            OwnershipKind::Owned => {
                 // SAFETY: `src_target` came from the source's validated foreign slot.
                 let new_target = unsafe { self.clone_value(target, ord, src_target)? };
                 // Repoint only the address word of the copied WidePtr.
@@ -2192,7 +2167,7 @@ impl RttiRegistry {
                     new_target.to_le_bytes(),
                 )
             }
-            ForeignKind::Strong => {
+            OwnershipKind::Strong => {
                 let off = if self.load_type(ord)?.weak {
                     let ctrl = read_u64_at(tstack, add_off(src_target, CTRL_BACKPTR_OFFSET)?)?;
                     add_off(ctrl, CTRL_STRONG_OFFSET)?
@@ -2202,7 +2177,7 @@ impl RttiRegistry {
                 refcount::fetch_add(tstack, off, 1)?;
                 Ok(())
             }
-            ForeignKind::Weak => {
+            OwnershipKind::Weak => {
                 refcount::fetch_add(tstack, add_off(src_target, CTRL_WEAK_OFFSET)?, 1)?;
                 Ok(())
             }
@@ -3564,7 +3539,7 @@ fn weak_element_tag(shape: &Shape) -> Option<EightCC> {
 /// The `(tag, kind)` of a cross-file `Foreign` leaf (optionally `Option`-wrapped) —
 /// its slot is a 16-byte [`WidePtr`]. `None` for any non-foreign shape. Used to
 /// drive the per-element foreign path in a `Vec` / array / tuple.
-fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
+fn foreign_leaf(shape: &Shape) -> Option<(EightCC, OwnershipKind)> {
     match shape {
         Shape::Foreign { tag, kind } => Some((*tag, *kind)),
         Shape::Option(inner) => foreign_leaf(inner),

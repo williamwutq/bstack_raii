@@ -206,27 +206,27 @@ fn refcount_ops() {
     // A single u64 counter living in the mutable region.
     let off = stack.push(1u64.to_le_bytes()).unwrap();
 
-    assert_eq!(crate::refcount::load(&stack, off).unwrap(), 1);
-    assert_eq!(crate::refcount::fetch_add(&stack, off, 5).unwrap(), 1); // returns prev
-    assert_eq!(crate::refcount::load(&stack, off).unwrap(), 6);
-    assert_eq!(crate::refcount::fetch_sub(&stack, off, 2).unwrap(), 6);
-    assert_eq!(crate::refcount::load(&stack, off).unwrap(), 4);
+    assert_eq!(crate::io_core::refcount::load(&stack, off).unwrap(), 1);
+    assert_eq!(crate::io_core::refcount::fetch_add(&stack, off, 5).unwrap(), 1); // returns prev
+    assert_eq!(crate::io_core::refcount::load(&stack, off).unwrap(), 6);
+    assert_eq!(crate::io_core::refcount::fetch_sub(&stack, off, 2).unwrap(), 6);
+    assert_eq!(crate::io_core::refcount::load(&stack, off).unwrap(), 4);
     assert_eq!(
-        crate::refcount::increment_if_nonzero(&stack, off).unwrap(),
+        crate::io_core::refcount::increment_if_nonzero(&stack, off).unwrap(),
         Some(5)
     );
 
     // Drive to zero, then confirm zero is terminal for increment_if_nonzero.
-    assert_eq!(crate::refcount::fetch_sub(&stack, off, 5).unwrap(), 5);
-    assert_eq!(crate::refcount::load(&stack, off).unwrap(), 0);
+    assert_eq!(crate::io_core::refcount::fetch_sub(&stack, off, 5).unwrap(), 5);
+    assert_eq!(crate::io_core::refcount::load(&stack, off).unwrap(), 0);
     assert_eq!(
-        crate::refcount::increment_if_nonzero(&stack, off).unwrap(),
+        crate::io_core::refcount::increment_if_nonzero(&stack, off).unwrap(),
         None
     );
-    assert_eq!(crate::refcount::load(&stack, off).unwrap(), 0);
+    assert_eq!(crate::io_core::refcount::load(&stack, off).unwrap(), 0);
 
     // Underflow is an error, not a wrap.
-    assert!(crate::refcount::fetch_sub(&stack, off, 1).is_err());
+    assert!(crate::io_core::refcount::fetch_sub(&stack, off, 1).is_err());
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn rc_weak_lifecycle() {
 
     let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
     let weak_off = ctrl.start() + layout::CTRL_WEAK_OFFSET;
-    let load = |o: u64| crate::refcount::load(alloc.stack(), o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(alloc.stack(), o).unwrap();
 
     // Initial state and the wired back/forward pointers.
     assert_eq!(load(strong_off), 1);
@@ -315,7 +315,7 @@ fn concurrent_clone_drop() {
     });
 
     // Only the main handle survives.
-    assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
+    assert_eq!(crate::io_core::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
     // Clean teardown: strong -> 0 frees the data block, the phantom release
     // drives weak (1) -> 0 and frees the control block.
     drop(rc);
@@ -355,8 +355,8 @@ fn concurrent_upgrade_downgrade() {
     });
 
     // Both counts returned to their pre-thread values.
-    assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
-    assert_eq!(crate::refcount::load(alloc.stack(), weak_off).unwrap(), 2);
+    assert_eq!(crate::io_core::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
+    assert_eq!(crate::io_core::refcount::load(alloc.stack(), weak_off).unwrap(), 2);
 
     drop(weak); // weak 2 -> 1
     drop(rc); // strong -> 0 frees data; phantom release frees control
@@ -505,7 +505,7 @@ fn macro_rc_weak_with_child() {
 
     let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
     let weak_off = ctrl.start() + layout::CTRL_WEAK_OFFSET;
-    let load = |o: u64| crate::refcount::load(alloc.stack(), o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(alloc.stack(), o).unwrap();
     assert_eq!(load(strong_off), 1);
     assert_eq!(load(weak_off), 1);
 
@@ -564,7 +564,7 @@ fn macro_strong_child() {
     let child_ctrl = alloc_control(&alloc, ctrl_tag(), child, child_ctrl_size).unwrap();
     let strong_off = child_ctrl.start() + layout::CTRL_STRONG_OFFSET;
     // A second, keep-alive strong owner besides the parent's `s` field.
-    crate::refcount::fetch_add(alloc.stack(), strong_off, 1).unwrap(); // strong = 2
+    crate::io_core::refcount::fetch_add(alloc.stack(), strong_off, 1).unwrap(); // strong = 2
 
     let parent = alloc_block(&alloc, MacroStrongParent::eightcc(), parent_size).unwrap();
     // `s` is the first user field, right after the header.
@@ -581,7 +581,7 @@ fn macro_strong_child() {
     let owned =
         unsafe { BStackOwned::from_raw(<MacroStrongParent as BStackBlock>::from_range(parent)) };
     owned.bstack_drop(&alloc).unwrap();
-    assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1); // child survives
+    assert_eq!(crate::io_core::refcount::load(alloc.stack(), strong_off).unwrap(), 1); // child survives
 
     // Release the keep-alive: strong -> 0 frees the child data + control block.
     MacroStrongChild::drop_strong_ref(unsafe { BStackRef::from_range(child) }, &alloc).unwrap();
@@ -790,21 +790,21 @@ fn macro_clone_bumps_shared_refcount() {
     // Resolve the child's strong-count offset: parent.s (first user field) ->
     // data block -> ctrl back-pointer -> strong counter.
     let s_data =
-        crate::refcount::load(stack, parent.handle().range().start() + layout::HEADER_SIZE)
+        crate::io_core::refcount::load(stack, parent.handle().range().start() + layout::HEADER_SIZE)
             .unwrap();
-    let ctrl = crate::refcount::load(stack, s_data + layout::CTRL_BACKPTR_OFFSET).unwrap();
+    let ctrl = crate::io_core::refcount::load(stack, s_data + layout::CTRL_BACKPTR_OFFSET).unwrap();
     let strong_off = ctrl + layout::CTRL_STRONG_OFFSET;
-    assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 2);
+    assert_eq!(crate::io_core::refcount::load(stack, strong_off).unwrap(), 2);
 
     // Deep-cloning the parent must make the clone's `s` acquire its OWN strong
     // reference (a shared child is re-referenced, not deep-copied): 2 -> 3.
     let clone = parent.try_clone_in(&alloc).unwrap();
-    assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 3);
+    assert_eq!(crate::io_core::refcount::load(stack, strong_off).unwrap(), 3);
 
     // Both parents release their strong ref: 3 -> 1. `rc_keep` still holds one.
     clone.bstack_drop(&alloc).unwrap();
     parent.bstack_drop(&alloc).unwrap();
-    assert_eq!(crate::refcount::load(stack, strong_off).unwrap(), 1);
+    assert_eq!(crate::io_core::refcount::load(stack, strong_off).unwrap(), 1);
     assert_eq!(rc_keep.handle().get_val(stack).unwrap(), 5);
     drop(rc_keep);
 }
@@ -2004,7 +2004,7 @@ fn strong_of(stack: &BStack, data_off: u64) -> u64 {
         .get_into(data_off + layout::CTRL_BACKPTR_OFFSET, &mut buf)
         .unwrap();
     let ctrl = u64::from_le_bytes(buf);
-    crate::refcount::load(stack, ctrl + layout::CTRL_STRONG_OFFSET).unwrap()
+    crate::io_core::refcount::load(stack, ctrl + layout::CTRL_STRONG_OFFSET).unwrap()
 }
 
 #[test]
@@ -3379,16 +3379,16 @@ fn macro_strong_array() {
 
     // Cloning the holder re-references each shared child: strong count +1.
     let d0 = arr[0].range().start();
-    let ctrl0 = crate::refcount::load(stack, d0 + layout::CTRL_BACKPTR_OFFSET).unwrap();
+    let ctrl0 = crate::io_core::refcount::load(stack, d0 + layout::CTRL_BACKPTR_OFFSET).unwrap();
     let strong0 = ctrl0 + layout::CTRL_STRONG_OFFSET;
-    let before = crate::refcount::load(stack, strong0).unwrap(); // keep0 + h = 2
+    let before = crate::io_core::refcount::load(stack, strong0).unwrap(); // keep0 + h = 2
     let clone = h.try_clone_in(&alloc).unwrap();
-    assert_eq!(crate::refcount::load(stack, strong0).unwrap(), before + 1);
+    assert_eq!(crate::io_core::refcount::load(stack, strong0).unwrap(), before + 1);
 
     // Tear both holders down: element 0's count returns to keep0's alone.
     clone.bstack_drop(&alloc).unwrap();
     h.bstack_drop(&alloc).unwrap();
-    assert_eq!(crate::refcount::load(stack, strong0).unwrap(), before - 1);
+    assert_eq!(crate::io_core::refcount::load(stack, strong0).unwrap(), before - 1);
     assert_eq!(keep0.handle().get_val(stack).unwrap(), 5);
     drop(keep0);
 }
@@ -5723,7 +5723,7 @@ fn macro_weak_setter_hands_new_weak_back_on_commit_fault() {
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let stack = alloc.stack();
-    let load = |o: u64| crate::refcount::load(stack, o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(stack, o).unwrap();
 
     let a = WNode::new(&alloc, 1).unwrap(); // strong = 1, weak = 1
     let b = WNode::new(&alloc, 2).unwrap();
@@ -7360,7 +7360,7 @@ fn foreign_self_pointer_resolves_on_read_and_reencodes_on_write() {
     // another file), and a pointer to the home file is re-encoded back to SELF on
     // write (so the on-disk form stays portable across re-attaches). Two registered
     // files make the cross-file distinction observable.
-    use crate::foreign::{home_relative_repr, resolve_self_repr};
+    use crate::registry::{home_relative_repr, resolve_self_repr};
     use crate::{Foreign, WidePtr, registry};
     use std::sync::Arc;
 
@@ -7486,7 +7486,7 @@ fn foreign_rc_into_local_rc_self_resolves_and_frees() {
     let ctrl = alloc_control(&alloc, ctrl_tag(), data, ctrl_size).unwrap();
     let data_off = data.start();
     let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
-    assert_eq!(crate::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
+    assert_eq!(crate::io_core::refcount::load(alloc.stack(), strong_off).unwrap(), 1);
 
     // The holder adopts the initial strong = 1 via a SELF foreign.
     let h = ForeignStrongHolder::new(&alloc, 1, unsafe {
@@ -7525,8 +7525,8 @@ fn foreign_weak_into_local_weak_self_decrements() {
     let weak_off = ctrl_off + layout::CTRL_WEAK_OFFSET;
     // `alloc_control` leaves weak = 1 (the strong owners' phantom); add one for the
     // holder we are about to create (construction does not bump).
-    crate::refcount::fetch_add(alloc.stack(), weak_off, 1).unwrap();
-    let load = |o: u64| crate::refcount::load(alloc.stack(), o).unwrap();
+    crate::io_core::refcount::fetch_add(alloc.stack(), weak_off, 1).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(alloc.stack(), o).unwrap();
     assert_eq!(load(weak_off), 2);
 
     // A weak foreign holder points at the CONTROL block.
@@ -7571,7 +7571,7 @@ fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
     let data_off = data.start();
     let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
     assert_eq!(
-        crate::refcount::load(foreign_alloc.stack(), strong_off).unwrap(),
+        crate::io_core::refcount::load(foreign_alloc.stack(), strong_off).unwrap(),
         1
     );
     let grown = foreign_alloc.stack().len().unwrap();
@@ -7930,7 +7930,7 @@ fn macro_foreign_strong_clone_bumps_count_across_files() {
     let reg = registry::get().unwrap();
     let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
 
-    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(arc_b.stack(), o).unwrap();
     assert_eq!(load(strong_off), 1);
 
     // One strong owner across the boundary; cloning it makes two.
@@ -7980,14 +7980,14 @@ fn macro_foreign_weak_clone_bumps_count_across_files() {
     let weak_off = ctrl_off + layout::CTRL_WEAK_OFFSET;
     // alloc_control leaves strong=1, weak=1 (the phantom the strong owners hold). Add
     // one weak for the holder we are about to create (construction does not bump).
-    crate::refcount::fetch_add(arc_b.stack(), weak_off, 1).unwrap();
+    crate::io_core::refcount::fetch_add(arc_b.stack(), weak_off, 1).unwrap();
 
     let reg_file = TempStack::new();
     let _ = registry::init(&reg_file.path);
     let reg = registry::get().unwrap();
     let fid = reg.attach(&foreign.path, arc_b.clone()).unwrap();
 
-    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(arc_b.stack(), o).unwrap();
     assert_eq!(load(weak_off), 2); // phantom + holder
 
     // A weak foreign holder points at the CONTROL block; cloning it bumps weak.
@@ -8413,7 +8413,7 @@ fn macro_foreign_strong_vec_across_files() {
         strong_offs.push(c.start() + layout::CTRL_STRONG_OFFSET);
         links.push(unsafe { Foreign::<MacroStrongChild>::new(fid, d.start()) });
     }
-    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(arc_b.stack(), o).unwrap();
     for &o in &strong_offs {
         assert_eq!(load(o), 1);
     }
@@ -8794,7 +8794,7 @@ fn macro_foreign_strong_enum_variant() {
     let d = alloc_block(&*arc_b, MacroStrongChild::eightcc(), ds).unwrap();
     let ctrl = alloc_control(&*arc_b, ctrl_tag(), d, cs).unwrap();
     let strong_off = ctrl.start() + layout::CTRL_STRONG_OFFSET;
-    let load = |o: u64| crate::refcount::load(arc_b.stack(), o).unwrap();
+    let load = |o: u64| crate::io_core::refcount::load(arc_b.stack(), o).unwrap();
     assert_eq!(load(strong_off), 1);
 
     let e = ForeignStrongEnum::new(

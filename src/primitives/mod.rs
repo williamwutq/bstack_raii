@@ -35,12 +35,16 @@
 // TypeId/Offset/NonNullOffset land before the fat pointer that composes them.
 #![allow(dead_code, unused_imports)]
 
+mod eightcc;
 mod file_id;
 mod offset;
+mod ownership;
 mod type_id;
 mod wide_ptr;
 
+pub use eightcc::EightCC;
 pub use file_id::{FileId, ResolvedFileId, UnresolvedFileIdError};
 pub use offset::{NonNullOffset, NullOffsetError, Offset};
+pub use ownership::{InvalidOwnershipKind, OwnershipKind};
 pub use type_id::{ResolvedTypeId, TypeId, UntypedTypeIdError};
 pub use wide_ptr::{BrandedWidePtr, WidePtr};

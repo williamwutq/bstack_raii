@@ -68,7 +68,7 @@ mod handle;
 mod layout;
 mod owned;
 mod primitives;
-mod refcount;
+mod io_core;
 mod reference;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
 pub mod registry;
@@ -108,7 +108,8 @@ pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
 pub use primitives::WidePtr;
 pub use handback::HandBack;
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
-pub use layout::{BlockHeader, EightCC, get_u64};
+pub use layout::{BlockHeader, get_u64};
+pub use primitives::EightCC;
 pub use owned::BStackOwned;
 pub use reference::BStackRef;
 pub use registry::ForeignHostAllocator;
@@ -263,15 +264,12 @@ pub mod __private {
     // it; no downstream code names it, so it lives here rather than in the prelude — the
     // `on_unimplemented` message fires regardless of visibility.
     pub use crate::block::BStackEmbeddable;
-    /// Constructor plumbing for `(rc, weak)` and `#[bstack_weak]` lowerings —
-    /// moved out of the prelude because their raw `field_off` / minted-image
-    /// arguments carry `dealloc_range`-class obligations (`set_weak_field` /
-    /// `upgrade_weak_field` are additionally `unsafe fn`).
-    pub use crate::construct::{build_control_payload, set_weak_field, upgrade_weak_field};
-    pub use crate::foreign::{
-        foreign_clone_owned, foreign_clone_strong, foreign_clone_weak, foreign_drop_owned,
-        foreign_drop_strong, foreign_drop_weak, home_relative_repr, resolve_self_repr,
-    };
+    /// Control-block image builder for `(rc, weak)` lowerings — plumbing kept out of
+    /// the prelude. (The `#[bstack_weak]` field operations and the cross-file
+    /// teardown / clone helpers are now methods on the capability traits
+    /// [`BStackBlock`] / [`BStackShared`] / [`BStackWeakable`].)
+    pub use crate::construct::build_control_payload;
+    pub use crate::registry::{home_relative_repr, resolve_self_repr};
     /// Add a compile-time field-offset constant to a block's base offset,
     /// rejecting overflow. Generated accessors call this instead of a bare
     /// `+`: the base (`self.0.start()` or similar) can originate from an

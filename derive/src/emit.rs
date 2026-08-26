@@ -352,9 +352,11 @@ pub(crate) fn block_vec_move(
 /// `#[bstack_ref]` owns nothing → empty. Shared with the scalar `Foreign` field.
 pub(crate) fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
     let helper = match kind {
-        Kind::Owned => quote!(::bstack_raii::__private::foreign_drop_owned),
-        Kind::Strong => quote!(::bstack_raii::__private::foreign_drop_strong),
-        Kind::Weak => quote!(::bstack_raii::__private::foreign_drop_weak),
+        Kind::Owned => quote!(<#ftarget as ::bstack_raii::BStackBlock>::foreign_drop),
+        Kind::Strong => {
+            quote!(<#ftarget as ::bstack_raii::BStackShared>::foreign_drop_strong)
+        }
+        Kind::Weak => quote!(<#ftarget as ::bstack_raii::BStackWeakable>::foreign_drop_weak),
         _ => return quote!(),
     };
     quote! {
@@ -362,7 +364,7 @@ pub(crate) fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
         if __off != 0 {
             let __fid = __fp.file_id();
             if __fid == 0 {
-                unsafe { #helper::<#ftarget, _>(allocator, __off)?; }
+                unsafe { #helper::<_>(allocator, __off)?; }
             } else if let ::core::option::Option::Some(__id) =
                 ::bstack_raii::registry::FileId::from_u64(__fid)
             {
@@ -370,7 +372,7 @@ pub(crate) fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
                     ::bstack_raii::registry::host_arc(__id)
                 {
                     let __adapter = ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                    unsafe { #helper::<#ftarget, _>(&__adapter, __off)?; }
+                    unsafe { #helper::<_>(&__adapter, __off)?; }
                 }
             }
         }
@@ -424,7 +426,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                             let __new_off = unsafe {
-                                ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
+                                <#ftarget as ::bstack_raii::BStackBlock>::foreign_clone::<_>(&__adapter, __off)? };
                             ::bstack_raii::WidePtr::from_raw(__fid, __fp.type_index(), __new_off)
                         } else {
                             #malformed
@@ -453,7 +455,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 .ok_or_else(|| #err)?;
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { ::bstack_raii::__private::foreign_clone_strong::<#ftarget, _>(&__adapter, __off)?; }
+                            unsafe { <#ftarget as ::bstack_raii::BStackShared>::foreign_clone_strong::<_>(&__adapter, __off)?; }
                         } else {
                             #malformed
                         }
@@ -480,7 +482,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 .ok_or_else(|| #err)?;
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { ::bstack_raii::__private::foreign_clone_weak::<#ftarget, _>(&__adapter, __off)?; }
+                            unsafe { <#ftarget as ::bstack_raii::BStackWeakable>::foreign_clone_weak::<_>(&__adapter, __off)?; }
                         } else {
                             #malformed
                         }
@@ -515,7 +517,7 @@ pub(crate) fn accessor(
             > {
                 let __field = ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
                 // SAFETY (emitted): `__field` is this block's own weak-field slot.
-                unsafe { ::bstack_raii::__private::upgrade_weak_field(allocator, __field) }
+                unsafe { ::bstack_raii::BStackWeakable::upgrade_weak_field(allocator, __field) }
             }
         };
     }
@@ -1805,7 +1807,7 @@ pub(crate) fn weak_setter(
                 }
             };
             // SAFETY (emitted): `__field` is this block's own weak-field slot.
-            unsafe { ::bstack_raii::__private::set_weak_field(allocator, __field, weak) }
+            unsafe { ::bstack_raii::BStackWeakable::set_weak_field(allocator, __field, weak) }
         }
     }
 }
@@ -2387,9 +2389,13 @@ pub(crate) fn foreign_field(
     // are tagged (via `wal_file_id`) with the target's file so the home WAL
     // reclaims them there. `#[bstack_ref]` owns nothing → no teardown.
     let foreign_drop_helper = match kind {
-        Kind::Owned => Some(quote!(::bstack_raii::__private::foreign_drop_owned)),
-        Kind::Strong => Some(quote!(::bstack_raii::__private::foreign_drop_strong)),
-        Kind::Weak => Some(quote!(::bstack_raii::__private::foreign_drop_weak)),
+        Kind::Owned => Some(quote!(<#ftarget as ::bstack_raii::BStackBlock>::foreign_drop)),
+        Kind::Strong => {
+            Some(quote!(<#ftarget as ::bstack_raii::BStackShared>::foreign_drop_strong))
+        }
+        Kind::Weak => {
+            Some(quote!(<#ftarget as ::bstack_raii::BStackWeakable>::foreign_drop_weak))
+        }
         // Ref: non-owning. Pod / Embed: already rejected above.
         Kind::Ref | Kind::Pod | Kind::Embed => None,
     };
@@ -2404,7 +2410,7 @@ pub(crate) fn foreign_field(
                     let __fid = __fp.file_id();
                     if __fid == 0 {
                         // `SELF`: the target is in this same file.
-                        unsafe { #helper::<#ftarget, _>(allocator, __off)?; }
+                        unsafe { #helper::<_>(allocator, __off)?; }
                     } else if let ::core::option::Option::Some(__id) =
                         ::bstack_raii::registry::FileId::from_u64(__fid)
                     {
@@ -2417,7 +2423,7 @@ pub(crate) fn foreign_field(
                         {
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { #helper::<#ftarget, _>(&__adapter, __off)?; }
+                            unsafe { #helper::<_>(&__adapter, __off)?; }
                         }
                     }
                     // A malformed id (does not fit the `FileId` space) is
@@ -2467,7 +2473,7 @@ pub(crate) fn foreign_field(
                         let __adapter =
                             ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                         let __new_off = unsafe {
-                            ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(
+                            <#ftarget as ::bstack_raii::BStackBlock>::foreign_clone::<_>(
                                 &__adapter, __off,
                             )?
                         };
@@ -2510,7 +2516,7 @@ pub(crate) fn foreign_field(
                         let __adapter =
                             ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                         unsafe {
-                            ::bstack_raii::__private::foreign_clone_strong::<#ftarget, _>(
+                            <#ftarget as ::bstack_raii::BStackShared>::foreign_clone_strong::<_>(
                                 &__adapter, __off,
                             )?;
                         }
@@ -2549,7 +2555,7 @@ pub(crate) fn foreign_field(
                         let __adapter =
                             ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                         unsafe {
-                            ::bstack_raii::__private::foreign_clone_weak::<#ftarget, _>(
+                            <#ftarget as ::bstack_raii::BStackWeakable>::foreign_clone_weak::<_>(
                                 &__adapter, __off,
                             )?;
                         }
@@ -3992,7 +3998,7 @@ pub(crate) fn block_array_field(
                     + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
                     + (index as u64) * 8;
                 // SAFETY (emitted): `__field` indexes this block's own weak array.
-                unsafe { ::bstack_raii::__private::set_weak_field(allocator, __field, weak) }
+                unsafe { ::bstack_raii::BStackWeakable::set_weak_field(allocator, __field, weak) }
             }
         });
 
@@ -4000,7 +4006,7 @@ pub(crate) fn block_array_field(
         let acc_ret = nested_ty(&dims, &leaf_ty);
         let acc_read = |k: &Ident| {
             // SAFETY (emitted): `__base + k*8` indexes this block's own weak array.
-            quote!(unsafe { ::bstack_raii::__private::upgrade_weak_field(
+            quote!(unsafe { ::bstack_raii::BStackWeakable::upgrade_weak_field(
                         allocator, __base + (#k as u64) * 8)? })
         };
         let acc_body = nested_build(&dims, &leaf_ty, &acc_read);

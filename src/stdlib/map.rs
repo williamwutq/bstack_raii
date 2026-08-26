@@ -42,13 +42,12 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::fnv1a;
-use super::util::{
-    Meta, ProbeStep, Scratch, SmallBuf, alloc_image, grow_table, probe_commit, read_fields,
-    read_u64, w8,
-};
+use super::util::{Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8};
+use crate::util::small_buf::SmallBuf;
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE, get_u64};
+use crate::layout::{BlockHeader, HEADER_SIZE, get_u64};
+use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::replace::{ReplaceError, finish_handback};
 use crate::teardown::{BStackDrop, dealloc_range};

@@ -499,7 +499,7 @@ fn leaf_or_container_shape(
     leaf_shape(fname, orig, ty, kind)
 }
 
-/// The `ForeignKind` variant for a foreign field's ownership annotation, or `None`
+/// The `OwnershipKind` variant for a foreign field's ownership annotation, or `None`
 /// (a `Foreign` must be annotated — never POD / `#[embed]`).
 fn foreign_kind_variant(kind: Kind) -> Option<TokenStream> {
     Some(match kind {
@@ -535,7 +535,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
         })?;
         return Ok(quote!(::bstack_raii::rtti::Shape::Foreign {
             tag: <#target as ::bstack_raii::BStackCast>::eightcc(),
-            kind: ::bstack_raii::rtti::ForeignKind::#fk,
+            kind: ::bstack_raii::rtti::OwnershipKind::#fk,
         }));
     }
     if let Type::Tuple(tup) = ty {
@@ -569,7 +569,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
                 let fk = fk.clone().expect("foreign member ⇒ has_foreign");
                 let leaf = quote!(::bstack_raii::rtti::Shape::Foreign {
                     tag: <#target as ::bstack_raii::BStackCast>::eightcc(),
-                    kind: ::bstack_raii::rtti::ForeignKind::#fk,
+                    kind: ::bstack_raii::rtti::OwnershipKind::#fk,
                 });
                 if option_inner(e).is_some() {
                     quote!(::bstack_raii::rtti::Shape::Option(::std::boxed::Box::new(#leaf)))

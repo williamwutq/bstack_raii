@@ -45,6 +45,7 @@ use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStack
 use parking_lot::RwLock;
 
 use crate::handback::impl_source_error;
+use crate::primitives::WidePtr;
 use crate::{BStackRaiiAllocator, get_u64};
 
 /// The stable per-file identity underlying `Foreign<T>`. Defined among the wide
@@ -677,6 +678,56 @@ pub fn path_of(id: FileId) -> Option<PathBuf> {
 /// [`FileRegistry::id_of_host`] on the process-wide registry.
 pub fn id_of_host(stack: &BStack) -> Option<FileId> {
     REGISTRY.get()?.id_of_host(stack)
+}
+
+/// **Read-side `SELF` resolution**. A stored [`WidePtr`] whose file is
+/// [`SELF`](FileId::SELF) is only meaningful *relative to the file it was read from*;
+/// handed out unchanged, an in-memory `SELF` pointer stored into a *different* file
+/// would later free or copy the wrong file's block. This rebinds a `SELF` pointer to
+/// the reading file's **registered** [`FileId`], so the escaped pointer is *explicit*
+/// and routes correctly wherever it is later stored. An explicit pointer (and the null
+/// niche) pass through unchanged.
+///
+/// **When `home` is not registered the `SELF` pointer passes through as-is** (not an
+/// error): a `SELF` pointer that reached storage through *safe* code was minted by
+/// [`Foreign::from_local`](crate::Foreign::from_local) / `bstack_cast!`, both of which
+/// require the file to be registered — so the safe surface is always resolvable here.
+/// An unregistered file's `SELF` can only have been minted through `unsafe`
+/// [`Foreign::new`](crate::Foreign::new), whose contract already forbids moving it to
+/// another file. Returns `io::Result` for signature symmetry with the fallible read
+/// paths that call it; it currently never errors. The inverse is
+/// [`home_relative_repr`], applied on write.
+pub fn resolve_self_repr(repr: WidePtr, home: &BStack) -> io::Result<WidePtr> {
+    if !repr.is_self() || repr.is_null() {
+        return Ok(repr);
+    }
+    match id_of_host(home) {
+        // Rebind the `SELF` pointer to the reading file's explicit id, keeping its
+        // type tag and address.
+        Some(id) => Ok(WidePtr::with_parts(id, repr.type_id(), repr.offset())),
+        // Unregistered home: no id to resolve against. A safe SELF can't reach here
+        // (its minting required registration); leave an unsafe-minted one as-is.
+        None => Ok(repr),
+    }
+}
+
+/// **Write-side `SELF` re-encoding**, the inverse of [`resolve_self_repr`]. An explicit
+/// pointer whose target file **is** `home` is stored back as [`SELF`](FileId::SELF), so
+/// the on-disk encoding stays portable across re-attaches (file ids are assigned per
+/// attach). A pointer to any other file stays explicit; an already-`SELF` pointer (only
+/// mintable through `unsafe`) is left as-is — after resolve-on-read a legitimate
+/// in-memory `SELF` means "home", so writing it as `SELF` is correct.
+pub fn home_relative_repr(repr: WidePtr, home: &BStack) -> WidePtr {
+    if repr.is_self() {
+        return repr;
+    }
+    if let Some(id) = id_of_host(home) {
+        if repr.file() == id {
+            // Target is the home file ⇒ re-encode as `SELF`, keeping type + address.
+            return WidePtr::with_parts(FileId::SELF, repr.type_id(), repr.offset());
+        }
+    }
+    repr
 }
 
 /// [`FileRegistry::host_arc`] on the process-wide registry — the owned-`Arc` host

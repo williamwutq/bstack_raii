@@ -40,10 +40,12 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{SmallBuf, WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
+use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
+use crate::util::small_buf::SmallBuf;
 use crate::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
+use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::replace::{ReplaceError, finish_handback};
 use crate::teardown::{BStackDrop, dealloc_range};

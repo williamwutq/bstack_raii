@@ -26,7 +26,8 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::block::{BStackBlock, BStackCast, BStackMove};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, EightCC, HEADER_SIZE};
+use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::teardown::dealloc_range;

@@ -17,7 +17,7 @@ use crate::clone::TryClone;
 use crate::handle::{StrongRef, WeakRef, strong_release_ctrl};
 use crate::layout;
 use crate::owned::BStackOwned;
-use crate::refcount;
+use crate::io_core::refcount;
 use crate::reference::BStackRef;
 use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
 

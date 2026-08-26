@@ -13,6 +13,7 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 
 use super::hash::fnv1a;
 use crate::layout::{HEADER_SIZE, get_u64};
+use crate::util::small_buf::SmallBuf;
 use crate::teardown::dealloc_range;
 
 /// Read a little-endian `u64` at absolute offset `off`.
@@ -20,38 +21,6 @@ pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     let mut b = [0u8; 8];
     stack.get_into(off, &mut b)?;
     Ok(u64::from_le_bytes(b))
-}
-
-/// A write payload for the `Vec<(u64, SmallBuf)>` batches [`atomic_update`] /
-/// [`probe_commit`] / `BStack::set_batched` take. Two on-disk shapes recur
-/// often enough in the stdlib collections to inline without a heap allocation:
-/// a single `u64` field (every counter/offset/length bump — the overwhelming
-/// majority of writes) and a [`crate::stdlib::list`] node's whole image (the
-/// 16-byte [`crate::layout::BlockHeader`] plus `prev`/`next`/`val`, 3 `u64`s —
-/// 40 bytes). Deliberately **no length field** — each inline variant is
-/// exact-size-only (never "up to N bytes"), so there is nothing to track;
-/// anything that isn't exactly 8 or 40 bytes (a B-tree node, a bucket-table
-/// image, a generic-`K`-sized heap slot, …) goes through [`SmallBuf::Heap`].
-pub(super) enum SmallBuf {
-    Buf8([u8; 8]),
-    Buf40([u8; 40]),
-    Heap(Box<[u8]>),
-}
-
-impl SmallBuf {
-    pub(super) fn as_slice(&self) -> &[u8] {
-        match self {
-            SmallBuf::Buf8(b) => b.as_slice(),
-            SmallBuf::Buf40(b) => b.as_slice(),
-            SmallBuf::Heap(b) => b.as_ref(),
-        }
-    }
-}
-
-impl AsRef<[u8]> for SmallBuf {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
 }
 
 /// Build a `(offset, value)` write-tuple for a `u64` field: little-endian into
