@@ -44,7 +44,7 @@ use bytemuck::{Pod, Zeroable};
 use super::hash::double_hash;
 use super::util::{alloc_image, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::block::{BStackBlock, BStackCast};
+use crate::types::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
@@ -354,7 +354,7 @@ impl<K: Pod> BStackCast for BStackCountingBloomFilter<K> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod> crate::block::BStackEmbeddable for BStackCountingBloomFilter<K> {}
+impl<K: Pod> crate::types::embed::BStackEmbeddable for BStackCountingBloomFilter<K> {}
 
 impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
     type OnDisk = BloomOnDisk;

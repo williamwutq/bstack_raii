@@ -14,7 +14,7 @@ use std::io;
 use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
-use crate::block::BStackBlock;
+use crate::types::block::BStackBlock;
 use crate::io_core::teardown::drop_block;
 
 /// The safe teardown protocol for an affine (non-`Copy`) owning handle: consume

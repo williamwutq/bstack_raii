@@ -12,7 +12,8 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackGenOp, BStackRange};
 
 use super::hash::fnv1a;
-use crate::layout::{HEADER_SIZE, get_u64};
+use crate::layout::HEADER_SIZE;
+use crate::util::bytes::get_u64;
 use crate::util::small_buf::SmallBuf;
 use crate::io_core::teardown::dealloc_range;
 

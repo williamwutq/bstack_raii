@@ -42,7 +42,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::block::{BStackBlock, BStackCast};
+use crate::types::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
@@ -562,7 +562,7 @@ impl<T: BStackBlock> BStackCast for BStackDeque<T> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<T: BStackBlock> crate::block::BStackEmbeddable for BStackDeque<T> {}
+impl<T: BStackBlock> crate::types::embed::BStackEmbeddable for BStackDeque<T> {}
 
 impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     type OnDisk = DequeOnDisk;

@@ -24,7 +24,8 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use crate::block::{BStackBlock, BStackCast, BStackMove};
+use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::r#move::BStackMove;
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
@@ -124,7 +125,7 @@ impl<T: Pod> BStackCast for BStackBox<T> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<T: Pod> crate::block::BStackEmbeddable for BStackBox<T> {}
+impl<T: Pod> crate::types::embed::BStackEmbeddable for BStackBox<T> {}
 
 impl<T: Pod> BStackBlock for BStackBox<T> {
     type OnDisk = BoxOnDisk<T>;

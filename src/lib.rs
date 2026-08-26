@@ -57,13 +57,11 @@
 // `::bstack_raii::…` even from within the crate's own tests.
 extern crate self as bstack_raii;
 
-mod block;
 mod bulk;
 mod cast;
 mod clone;
 mod construct;
 mod foreign;
-mod handback;
 mod handle;
 mod layout;
 mod owned;
@@ -84,9 +82,9 @@ mod vec;
 #[cfg(test)]
 mod tests;
 
-pub use block::{
-    BStackBlock, BStackCast, BStackMove, BStackMoveExpr, BStackShared, BStackWeakable,
-};
+pub use types::block::{BStackBlock, BStackCast};
+pub use types::r#move::{BStackMove, BStackMoveExpr};
+pub use types::rc::{BStackShared, BStackWeakable};
 pub use bulk::FreeManyError;
 pub use cast::CastError;
 pub use cast::{BStackCastAs, BStackCastInto};
@@ -106,9 +104,10 @@ pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
 pub use io_core::registry;
 pub use primitives::WidePtr;
 pub use types::alloc::BStackRaiiAllocator;
-pub use handback::HandBack;
+pub use util::handback::HandBack;
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
-pub use layout::{BlockHeader, get_u64};
+pub use layout::BlockHeader;
+pub use util::bytes::get_u64;
 pub use primitives::EightCC;
 pub use owned::BStackOwned;
 pub use reference::BStackRef;
@@ -149,7 +148,7 @@ pub mod __private {
     // Only `#[bstack_block]`/`#[bstack_enum]`-generated code (and the stdlib) implement
     // it; no downstream code names it, so it lives here rather than in the prelude — the
     // `on_unimplemented` message fires regardless of visibility.
-    pub use crate::block::BStackEmbeddable;
+    pub use crate::types::embed::BStackEmbeddable;
     /// Control-block image builder for `(rc, weak)` lowerings — plumbing kept out of
     /// the prelude. (The `#[bstack_weak]` field operations and the cross-file
     /// teardown / clone helpers are now methods on the capability traits

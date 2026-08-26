@@ -67,13 +67,13 @@ use bstack::{BStack, BStackRange};
 use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
-use crate::block::{BStackBlock, BStackCast};
-use crate::layout::read_u64_at;
+use crate::types::block::{BStackBlock, BStackCast};
 use crate::primitives::{EightCC, WidePtr};
 use crate::layout::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET,
-    RC_REFCOUNT_OFFSET, get_u64,
+    RC_REFCOUNT_OFFSET,
 };
+use crate::util::bytes::{get_u64, read_u64_at};
 use crate::io_core::refcount;
 use crate::registry::{self, FileId, ForeignHostAllocator};
 use crate::util::small_map::SmallStringMap;

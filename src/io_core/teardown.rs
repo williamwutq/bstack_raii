@@ -261,7 +261,7 @@ pub(crate) unsafe fn commit_home_frees<A: BStackRaiiAllocator>(
 /// # Safety
 /// `range` must be a live `T` block owned by `allocator` that no other live owner
 /// will also free.
-pub(crate) unsafe fn drop_block<T: crate::block::BStackBlock, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn drop_block<T: crate::types::block::BStackBlock, A: BStackRaiiAllocator>(
     range: BStackRange,
     allocator: &A,
 ) -> io::Result<()> {

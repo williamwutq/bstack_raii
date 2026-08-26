@@ -1,5 +1,7 @@
 //! Small crate-internal utilities with no home of their own.
 
+pub(crate) mod bytes;
+pub(crate) mod handback;
 pub(crate) mod io;
 pub(crate) mod small_buf;
 pub(crate) mod small_map;

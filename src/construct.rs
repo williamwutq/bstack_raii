@@ -13,12 +13,13 @@ use std::fmt;
 use std::io;
 
 use crate::BStackRaiiAllocator;
-use crate::handback::impl_source_error;
+use crate::util::handback::impl_source_error;
 use bstack::BStackRange;
 
-use crate::block::BStackWeakable;
+use crate::types::rc::BStackWeakable;
 use crate::handle::WeakRef;
-use crate::layout::{self, BlockHeader, put_u64};
+use crate::layout::{self, BlockHeader};
+use crate::util::bytes::{put_u64, read_u64_at};
 use crate::primitives::EightCC;
 use crate::reference::BStackRef;
 use crate::replace::ReplaceError;
@@ -40,7 +41,7 @@ use crate::types::drop::BStackDrop;
 /// [`BStackRaiiAllocError`](crate::registry::BStackRaiiAllocError), and
 /// [`ReplaceError`](crate::ReplaceError).
 ///
-/// `F` is the block's [`Fields`](crate::block::BStackMove::Fields) tuple — exactly
+/// `F` is the block's [`Fields`](crate::BStackMove::Fields) tuple — exactly
 /// what `bstack_move!` hands back — so a recovered construction returns the
 /// children in the same shape a later move would.
 ///
@@ -59,7 +60,7 @@ pub struct ConstructError<F> {
     /// The children the constructor consumed, handed back if they survived.
     ///
     /// * `Some` — recovered: the children are intact and yours again, in the
-    ///   block's `bstack_move!` [`Fields`](crate::block::BStackMove::Fields)
+    ///   block's `bstack_move!` [`Fields`](crate::BStackMove::Fields)
     ///   shape. Retry `new`, re-home them, or free each — dropping them as-is may
     ///   leak, since a bare handle is unrooted (the crate's
     ///   *moved-out-is-unrooted* rule). Every allocation/write failure path takes
@@ -287,7 +288,7 @@ pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllo
     // owned here, so nothing else keeps that block alive.
     let lock = crate::io_core::wal::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let off = layout::read_u64_at(allocator.stack(), field_off)?;
+    let off = read_u64_at(allocator.stack(), field_off)?;
     if off == 0 {
         return Ok(None);
     }

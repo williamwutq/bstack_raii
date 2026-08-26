@@ -36,9 +36,10 @@ use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::block::{BStackBlock, BStackCast};
+use crate::types::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE, get_u64};
+use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::util::bytes::get_u64;
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::replace::{ReplaceError, finish_handback};
@@ -384,7 +385,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackCast for BStackBinaryHeap<K, V> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod + Ord, V: BStackBlock> crate::block::BStackEmbeddable for BStackBinaryHeap<K, V> {}
+impl<K: Pod + Ord, V: BStackBlock> crate::types::embed::BStackEmbeddable for BStackBinaryHeap<K, V> {}
 
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     type OnDisk = HeapOnDisk;

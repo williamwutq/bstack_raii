@@ -48,7 +48,7 @@ macro_rules! impl_source_error {
                 ::core::option::Option::Some(&self.source)
             }
         }
-        impl $(< $($g),+ >)? $crate::handback::HandBack for $ty $(< $($g),+ >)? {
+        impl $(< $($g),+ >)? $crate::util::handback::HandBack for $ty $(< $($g),+ >)? {
             fn io(&self) -> &::std::io::Error {
                 &self.source
             }

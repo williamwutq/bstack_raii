@@ -28,7 +28,7 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64};
-use crate::block::{BStackBlock, BStackCast};
+use crate::types::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
@@ -256,7 +256,7 @@ impl BStackCast for BStackString {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl crate::block::BStackEmbeddable for BStackString {}
+impl crate::types::embed::BStackEmbeddable for BStackString {}
 
 impl BStackBlock for BStackString {
     type OnDisk = StringOnDisk;

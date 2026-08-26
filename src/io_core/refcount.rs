@@ -18,7 +18,7 @@ use std::io;
 
 use bstack::BStack;
 
-use crate::layout::get_u64;
+use crate::util::bytes::get_u64;
 use crate::util::io_errorfn;
 
 io_errorfn!(overflow_err, InvalidData, "refcount overflow");

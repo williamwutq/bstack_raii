@@ -15,7 +15,8 @@ use core::ops::Deref;
 use std::io;
 
 use crate::BStackRaiiAllocator;
-use crate::block::{BStackBlock, BStackMove, BStackMoveExpr};
+use crate::types::block::BStackBlock;
+use crate::types::r#move::{BStackMove, BStackMoveExpr};
 use crate::io_core::teardown::{wal_teardown};
 use crate::types::drop::{AutoDrop, BStackDrop, BlockShell};
 

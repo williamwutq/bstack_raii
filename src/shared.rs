@@ -12,7 +12,9 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use crate::block::{BStackBlock, BStackMove, BStackMoveExpr, BStackWeakable};
+use crate::types::block::BStackBlock;
+use crate::types::r#move::{BStackMove, BStackMoveExpr};
+use crate::types::rc::BStackWeakable;
 use crate::clone::TryClone;
 use crate::handle::{StrongRef, WeakRef, strong_release_ctrl};
 use crate::layout;

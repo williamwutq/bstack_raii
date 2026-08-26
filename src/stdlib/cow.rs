@@ -21,7 +21,7 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use crate::block::BStackBlock;
+use crate::types::block::BStackBlock;
 use crate::clone::TryCloneIn;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;

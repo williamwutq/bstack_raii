@@ -41,10 +41,11 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use crate::block::{BStackBlock, BStackShared, BStackWeakable};
+use crate::types::block::BStackBlock;
+use crate::types::rc::{BStackShared, BStackWeakable};
 use crate::clone::ClonePlan;
 use crate::handle::WeakRef;
-use crate::layout::{get_u64, put_u64};
+use crate::util::bytes::{get_u64, put_u64};
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::replace::ReplaceError;

@@ -35,7 +35,8 @@ use std::io;
 use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
 
 use crate::BStackRaiiAllocator;
-use crate::block::{BStackBlock, BStackShared, BStackWeakable};
+use crate::types::block::BStackBlock;
+use crate::types::rc::{BStackShared, BStackWeakable};
 use crate::clone::TryCloneIn;
 use crate::handle::{OwnedRef, WeakRef};
 use crate::layout;

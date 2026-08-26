@@ -6,7 +6,7 @@ use std::io;
 use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
-use crate::handback::impl_source_error;
+use crate::util::handback::impl_source_error;
 use crate::types::drop::{AutoDrop, BStackDrop};
 
 /// Resolve a consuming operation that guarded its input in an [`AutoDrop`]:

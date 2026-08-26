@@ -19,7 +19,8 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use crate::block::{BStackBlock, BStackWeakable};
+use crate::types::block::BStackBlock;
+use crate::types::rc::BStackWeakable;
 use crate::layout;
 use crate::io_core::refcount;
 use crate::reference::BStackRef;
