@@ -47,86 +47,10 @@ use parking_lot::RwLock;
 use crate::handback::impl_source_error;
 use crate::{BStackRaiiAllocator, get_u64};
 
-/// A small, stable identity for a registered bstack file.
-///
-/// Backed by a `u32` (a sane program opens far fewer than `u16::MAX` files, so
-/// this is generous headroom), but a `Foreign` pointer stores it **widened to a
-/// `u64`** — for alignment next to a [`BStackRange`], and to leave room for future
-/// RTTI. [`as_u64`](Self::as_u64) / [`from_u64`](Self::from_u64) bridge the two.
-///
-/// # Id-space layout
-///
-/// * **`0` = [`SELF`](Self::SELF)** — the *current* file. A `Foreign` with this id
-///   points into whatever file it itself lives in, resolved directly against the
-///   local allocator the caller already holds. Registry lookup (and its lock) is
-///   never consulted for `SELF`. Never assigned to a registered path.
-/// * **`1, 2, 3, …` (ascending) = ordinary registered files** — assigned in order
-///   of registration; the id is `1 + ` the file's index in the append-only path
-///   table.
-/// * **`u32::MAX, u32::MAX - 1, …` (descending) = reserved "special" meanings** —
-///   sentinels beyond a single concrete file, allocated from the top down so they
-///   never collide with the ascending ordinary ids (`SELF` is the sole exception
-///   at the bottom). Only `SELF` is defined so far; the descending region is
-///   reserved for future use (see [`is_special`](Self::is_special)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FileId(u32);
-
-impl FileId {
-    /// The self-referential id (`0`): a `Foreign` bearing it points into the
-    /// *current* file and is resolved against the local allocator **without**
-    /// touching the registry or its lock. Never assigned to a registered path.
-    pub const SELF: FileId = FileId(0);
-
-    // NOTE: "Foreign" seems to have very much similar implementation for this
-    /// Whether this is [`SELF`](Self::SELF) (the current file).
-    pub const fn is_self(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Whether this id is in the reserved descending "special" region (top of the
-    /// `u32` space). Ordinary registered files and `SELF` are **not** special.
-    /// The boundary is generous — far above any realistic file count.
-    pub const fn is_special(self) -> bool {
-        self.0 >= Self::SPECIAL_FLOOR
-    }
-
-    /// Lowest id treated as a reserved special sentinel (special ids grow *down*
-    /// from `u32::MAX`). Chosen far above any plausible number of open files.
-    pub const SPECIAL_FLOOR: u32 = u32::MAX - 0xFFFF;
-
-    /// The raw `u32` value.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-
-    /// The id widened to the `u64` a `Foreign` pointer stores on disk.
-    pub const fn as_u64(self) -> u64 {
-        self.0 as u64
-    }
-
-    // NOTE: FileId handles values properly and has checks, while the parallel implementation
-    // in foreign might not. Please check
-    /// Reconstruct a `FileId` from its on-disk `u64` form, rejecting values that
-    /// do not fit the `u32` id space (corruption / a foreign id from a wider build).
-    pub const fn from_u64(v: u64) -> Option<Self> {
-        if v <= u32::MAX as u64 {
-            Some(FileId(v as u32))
-        } else {
-            None
-        }
-    }
-
-    /// This id's index into the registry's append-only path table, or `None` for
-    /// [`SELF`](Self::SELF) and reserved special ids (neither of which is a concrete
-    /// registered file). Ordinary ids are 1-based, so the index is `id - 1`.
-    pub(crate) const fn table_index(self) -> Option<usize> {
-        if self.0 >= 1 && !self.is_special() {
-            Some((self.0 - 1) as usize)
-        } else {
-            None
-        }
-    }
-}
+/// The stable per-file identity underlying `Foreign<T>`. Defined among the wide
+/// pointer's [components](crate::primitives); re-exported here as its resolution
+/// (path table, live hosts) is the registry's job.
+pub use crate::primitives::FileId;
 
 /// A thread-shareable [`BStackRaiiAllocator`] — the bound a file's live host must
 /// satisfy to be stored in (and resolved from) the registry across threads.
@@ -522,7 +446,7 @@ impl<'h> FileRegistry<'h> {
         let by_path = paths
             .iter()
             .enumerate()
-            .map(|(i, p)| (p.clone(), FileId(i as u32 + 1))) // ids are 1-based (0 = SELF)
+            .map(|(i, p)| (p.clone(), FileId::from_raw(i as u32 + 1))) // ids are 1-based (0 = SELF)
             .collect();
         let live = (0..paths.len()).map(|_| None).collect();
         Ok(FileRegistry {
@@ -551,7 +475,7 @@ impl<'h> FileRegistry<'h> {
                 "file registry exhausted the ordinary id space",
             ));
         }
-        let id = FileId(next);
+        let id = FileId::from_raw(next);
         // Persist first (append the record); only mutate memory once the disk write
         // succeeds, so a failed append leaves us consistent.
         g.store.append(path)?;

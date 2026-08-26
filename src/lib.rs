@@ -67,6 +67,7 @@ mod handback;
 mod handle;
 mod layout;
 mod owned;
+mod primitives;
 mod refcount;
 mod reference;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
@@ -79,6 +80,7 @@ mod shared;
 mod small_map;
 mod stdlib;
 mod teardown;
+mod util;
 mod vec;
 mod wal;
 
