@@ -10,7 +10,7 @@ use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::registry;
 use bstack_raii::rtti::{self, AnyRef, ForeignKind, ForeignPtr, Moved, RttiBody, Shape, Value};
 use bstack_raii::{
-    BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, ForeignRepr,
+    BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, WidePtr,
     TryClone, bstack_class, rtti_path,
 };
 
@@ -888,7 +888,7 @@ fn any_ref_downcast_and_generic_fallback() {
     assert_eq!(AnyRef::from_block(alloc.stack(), off).unwrap(), any);
 
     // An untyped pointer resolves to no AnyRef (never masquerades as a type).
-    assert!(reg.any_ref(ForeignRepr::new(0, off)).is_none());
+    assert!(reg.any_ref(WidePtr::from_raw(0, 0, off)).is_none());
 
     p.bstack_drop(&alloc).unwrap();
     drop(reg);
@@ -1708,7 +1708,7 @@ fn bstack_class_pod_tuple_field() {
 #[test]
 fn interpret_foreign_vec_teardown_across_files() {
     // `#[bstack_owned] Vec<Foreign<Point>>`: interpreted teardown frees every element
-    // target in the foreign file (each a 16-byte `ForeignRepr` in the vec data block).
+    // target in the foreign file (each a 16-byte `WidePtr` in the vec data block).
     let schema = temp_path("fvect_schema");
     let reg = rtti::sync(&schema).unwrap();
     let ord = reg.ordinal_of(<FVec as BStackCast>::eightcc()).unwrap();
@@ -1763,7 +1763,7 @@ fn interpret_foreign_vec_teardown_across_files() {
 #[test]
 fn interpret_foreign_vec_clone_across_files() {
     // Cloning `Vec<Foreign<Point>>` deep-copies EVERY element's target into a fresh
-    // block in the foreign file and repoints the clone's `ForeignRepr` there.
+    // block in the foreign file and repoints the clone's `WidePtr` there.
     let schema = temp_path("fvecc_schema");
     let reg = rtti::sync(&schema).unwrap();
     let ord = reg.ordinal_of(<FVec as BStackCast>::eightcc()).unwrap();

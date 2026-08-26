@@ -427,7 +427,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             ));
         }
 
-        // `Foreign<T>` scalar / `Option<Foreign<T>>`: a 16-byte `ForeignRepr` slot
+        // `Foreign<T>` scalar / `Option<Foreign<T>>`: a 16-byte `WidePtr` slot
         // resolved through the registry. Lowered by `emit::foreign_field` (the inline
         // slot, lifetime-bound accessor, ctor wiring, per-kind cross-file teardown /
         // deep-clone, `bstack_move!` RAII duals, and `#[bstack_mut]` mutators).

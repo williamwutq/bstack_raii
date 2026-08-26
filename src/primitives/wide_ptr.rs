@@ -2,7 +2,9 @@
 //! *where in that file* — and [`BrandedWidePtr`], its borrow-branded in-memory form.
 
 use core::marker::PhantomData;
+use std::io;
 
+use bstack::BStack;
 use bytemuck::{Pod, Zeroable};
 
 use super::{FileId, Offset, ResolvedFileId, ResolvedTypeId, TypeId};
@@ -41,6 +43,14 @@ const _: () = {
 };
 
 impl WidePtr {
+    /// The null pointer: [`SELF`](FileId::SELF), untyped, offset `0` (an absent
+    /// target). The all-zero value.
+    pub const NULL: WidePtr = WidePtr {
+        file: FileId::SELF,
+        ty: TypeId::UNTYPED,
+        offset: Offset::NULL,
+    };
+
     /// An **untyped** pointer to `(file, offset)` — its [`TypeId`] is
     /// [`UNTYPED`](TypeId::UNTYPED). Tag it with [`with_type`](Self::with_type) when
     /// an RTTI type is known.
@@ -52,7 +62,7 @@ impl WidePtr {
         }
     }
 
-    /// Assemble from all three components explicitly.
+    /// Assemble from all three typed components explicitly.
     pub const fn with_parts(file: FileId, ty: TypeId, offset: Offset) -> Self {
         WidePtr { file, ty, offset }
     }
@@ -64,7 +74,42 @@ impl WidePtr {
         self
     }
 
-    /// The target file.
+    /// **Decode from raw on-disk words** — the untrusted-boundary constructor. The
+    /// generated `#[bstack_block]` code and the RTTI interpreter read a pointer's
+    /// three fields as plain integers off disk and rebuild it here, rather than
+    /// forging the typed primitives themselves. A `file_id` beyond the `u32` id space
+    /// folds to [`SELF`](FileId::SELF); `type_index == 0` is untyped; `offset == 0`
+    /// is null. Prefer [`new`](Self::new) / [`with_parts`](Self::with_parts) wherever
+    /// the components are already typed.
+    pub const fn from_raw(file_id: u64, type_index: u32, offset: u64) -> Self {
+        WidePtr {
+            file: FileId::from_raw(file_id as u32),
+            ty: TypeId::from_raw(type_index),
+            offset: Offset::from_raw(offset),
+        }
+    }
+
+    /// Decode a 16-byte on-disk record — `{ file_id:u32 @0, type_index:u32 @4,
+    /// offset:u64 @8 }`, little-endian — into a `WidePtr`. `b` must be at least
+    /// [`size_of::<WidePtr>()`](core::mem::size_of) bytes; the counterpart of
+    /// [`from_raw`](Self::from_raw) over a byte buffer (e.g. the bytes an atomic
+    /// `swap` hands back).
+    pub fn decode(b: &[u8]) -> WidePtr {
+        let file_id = u32::from_le_bytes(b[0..4].try_into().unwrap()) as u64;
+        let type_index = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        WidePtr::from_raw(file_id, type_index, offset)
+    }
+
+    /// Read and [`decode`](Self::decode) a `WidePtr` slot at byte offset `off` in
+    /// `data`.
+    pub fn read_from_stack(data: &BStack, off: u64) -> io::Result<WidePtr> {
+        let mut b = [0u8; core::mem::size_of::<WidePtr>()];
+        data.get_into(off, &mut b)?;
+        Ok(WidePtr::decode(&b))
+    }
+
+    /// The target file ([`SELF`](FileId::SELF) for a `SELF` pointer).
     pub const fn file(self) -> FileId {
         self.file
     }
@@ -77,6 +122,20 @@ impl WidePtr {
     /// The target address within the file.
     pub const fn offset(self) -> Offset {
         self.offset
+    }
+
+    // -- Raw wire *views* (not construction): the encode-side counterparts of
+    //    [`from_raw`](Self::from_raw), for code that writes these fields back to disk. --
+
+    /// The file-id word, widened to `u64` — `self.file().as_u64()`.
+    pub const fn file_id(self) -> u64 {
+        self.file.as_u64()
+    }
+
+    /// The raw RTTI type-index word (`0` = untyped, else `ordinal + 1`) —
+    /// `self.type_id().get()`.
+    pub const fn type_index(self) -> u32 {
+        self.ty.get()
     }
 
     /// Whether the target file is [`SELF`](FileId::SELF) (the current file).
@@ -142,7 +201,7 @@ impl<'a> BrandedWidePtr<'a> {
         Self::from_wide(WidePtr::new(file, offset))
     }
 
-    /// A branded pointer from all three components — [`WidePtr::with_parts`] branded.
+    /// A branded pointer from all three typed components — [`WidePtr::with_parts`] branded.
     #[inline(always)]
     pub const fn with_parts(file: FileId, ty: TypeId, offset: Offset) -> Self {
         Self::from_wide(WidePtr::with_parts(file, ty, offset))
@@ -154,19 +213,31 @@ impl<'a> BrandedWidePtr<'a> {
         Self::from_wide(self.ptr.with_type(ty))
     }
 
-    /// The target file — [`WidePtr::file`].
+    /// Decode a 16-byte on-disk record into a branded pointer — [`WidePtr::decode`] branded.
+    #[inline(always)]
+    pub fn decode(b: &[u8]) -> Self {
+        Self::from_wide(WidePtr::decode(b))
+    }
+
+    /// Read and decode a branded `WidePtr` slot at `off` — [`WidePtr::read_from_stack`] branded.
+    #[inline(always)]
+    pub fn read_from_stack(data: &BStack, off: u64) -> io::Result<Self> {
+        WidePtr::read_from_stack(data, off).map(Self::from_wide)
+    }
+
+    /// The target [`FileId`] — [`WidePtr::file`].
     #[inline(always)]
     pub const fn file(self) -> FileId {
         self.ptr.file()
     }
 
-    /// The RTTI type tag — [`WidePtr::type_id`].
+    /// The RTTI [`TypeId`] — [`WidePtr::type_id`].
     #[inline(always)]
     pub const fn type_id(self) -> TypeId {
         self.ptr.type_id()
     }
 
-    /// The target address — [`WidePtr::offset`].
+    /// The target address as a typed [`Offset`] — [`WidePtr::offset`].
     #[inline(always)]
     pub const fn offset(self) -> Offset {
         self.ptr.offset()

@@ -99,12 +99,13 @@ pub use cast::{BStackCastAs, BStackCastInto};
 pub use clone::ClonePlan;
 pub use clone::{TryClone, TryCloneIn};
 pub use construct::ConstructError;
-/// The inert on-disk wire form of a [`Foreign`] pointer. Not part of the public API —
-/// generated `#[bstack_block]` code names it through `::bstack_raii::ForeignRepr`; user
-/// code should never use it directly.
-#[doc(hidden)]
-pub use foreign::ForeignRepr;
 pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
+/// The inert on-disk **wire** form of a [`Foreign`] pointer — the composed
+/// [wide pointer](crate::primitives). Not part of the public API — generated
+/// `#[bstack_block]` code names it through `::bstack_raii::WidePtr`; user code should
+/// never use it directly.
+#[doc(hidden)]
+pub use primitives::WidePtr;
 pub use handback::HandBack;
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, EightCC, get_u64};

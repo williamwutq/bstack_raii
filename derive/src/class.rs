@@ -402,7 +402,7 @@ fn registration(name: &Ident, rtti_type: TokenStream) -> TokenStream {
 /// down to a leaf (`Pod` or a block reference); the ownership `kind` applies to the
 /// leaf.
 fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
-    // `Foreign` composes inside a `Vec` / array / tuple (its 16-byte `ForeignRepr`
+    // `Foreign` composes inside a `Vec` / array / tuple (its 16-byte `WidePtr`
     // is the container's element / member); the recursion below reaches the
     // `Foreign` leaf in each case.
 

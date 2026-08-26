@@ -33,7 +33,6 @@ use core::marker::PhantomData;
 use std::io;
 
 use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
-use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackShared, BStackWeakable};
@@ -41,6 +40,7 @@ use crate::clone::TryCloneIn;
 use crate::handle::{OwnedRef, WeakRef};
 use crate::layout;
 use crate::owned::BStackOwned;
+use crate::primitives::{BrandedWidePtr, Offset, WidePtr};
 use crate::refcount;
 use crate::reference::BStackRef;
 #[cfg(test)]
@@ -49,74 +49,7 @@ use crate::registry::{self, FileId};
 use crate::shared::{BStackRc, BStackWeak};
 use crate::teardown::BStackDrop;
 
-/// The on-disk **wire** form of a [`Foreign`] pointer: a file identity, an optional
-/// RTTI type index, and an address in that file. 16 bytes, `Pod`. `file_id == 0` is
-/// [`SELF`](FileId::SELF) (a pointer into the current file); the target's length is
-/// **not** stored — it is recovered from `size_of::<T::OnDisk>()`, exactly like an
-/// in-file `#[bstack_ref]`.
-///
-/// The `file_id` is a [`FileId`], which is a `u32`, so the pointer stores it in 4
-/// bytes and spends the other 4 on `type_index` — the pointee's RTTI ordinal `+ 1`
-/// (`0` = untyped; see [`crate::rtti`]). The static `#[bstack_block]` path leaves
-/// `type_index == 0` (the schema already knows the target type); only RTTI-aware
-/// writers fill it. This layout is byte-compatible with the previous
-/// `{file_id: u64, offset: u64}` form: an old pointer's zero high file-id word
-/// simply reads back as `type_index == 0`.
-///
-/// This is the inert wire form only: the resolution API and target type live on the
-/// in-memory [`Foreign<T>`] (which the macro converts to/from at the load/store
-/// boundary). Not part of the public prelude (`#[doc(hidden)]`); user code should
-/// never name it.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
-#[repr(C)]
-pub struct ForeignRepr {
-    /// The target file's [`FileId`] (`0` = [`FileId::SELF`]).
-    file_id: u32,
-    /// The pointee's RTTI ordinal `+ 1`, or `0` for an untyped pointer.
-    type_index: u32,
-    /// The target's address within that file.
-    offset: u64,
-}
-
-impl ForeignRepr {
-    /// A wire pointer from a raw `(file_id, offset)`, untyped (`type_index == 0`).
-    /// `file_id` is a [`FileId`] (`u32` range); its high bits are unused.
-    pub const fn new(file_id: u64, offset: u64) -> Self {
-        Self {
-            file_id: file_id as u32,
-            type_index: 0,
-            offset,
-        }
-    }
-    // NOTE: we should change file_id to u32
-    /// The file-id word, widened to `u64` for the callers that compare it as one.
-    pub const fn file_id(self) -> u64 {
-        self.file_id as u64
-    }
-    /// The target address.
-    pub const fn offset(self) -> u64 {
-        self.offset
-    }
-    /// The raw RTTI type index (`0` = untyped; otherwise ordinal `+ 1`).
-    pub const fn type_index(self) -> u32 {
-        self.type_index
-    }
-    /// This pointer with its RTTI type index set (ordinal `+ 1`; `0` = untyped).
-    pub const fn with_type_index(mut self, type_index: u32) -> Self {
-        self.type_index = type_index;
-        self
-    }
-    /// The pointee's RTTI ordinal, or `None` if the pointer is untyped.
-    pub const fn rtti_ordinal(self) -> Option<u32> {
-        match self.type_index {
-            0 => None,
-            n => Some(n - 1),
-        }
-    }
-}
-
-/// **Read-side `SELF` resolution**. A stored [`ForeignRepr`] whose
+/// **Read-side `SELF` resolution**. A stored [`WidePtr`] whose
 /// `file_id == 0` (`SELF`) is only meaningful *relative to the file it was read
 /// from*; handed out unchanged, an in-memory `SELF` pointer can be stored into a
 /// different file, whose later owning teardown / clone would then free or copy the
@@ -134,14 +67,14 @@ impl ForeignRepr {
 /// another file. Returns `io::Result` for signature symmetry with the fallible read
 /// paths that call it; it currently never errors. The inverse is
 /// [`home_relative_repr`], applied on write.
-pub fn resolve_self_repr(repr: ForeignRepr, home: &BStack) -> io::Result<ForeignRepr> {
-    if repr.file_id() != 0 || repr.offset() == 0 {
+pub fn resolve_self_repr(repr: WidePtr, home: &BStack) -> io::Result<WidePtr> {
+    if !repr.is_self() || repr.is_null() {
         return Ok(repr);
     }
     match registry::id_of_host(home) {
-        Some(id) => {
-            Ok(ForeignRepr::new(id.as_u64(), repr.offset()).with_type_index(repr.type_index()))
-        }
+        // Rebind the `SELF` pointer to the reading file's explicit id, keeping its
+        // type tag and address.
+        Some(id) => Ok(WidePtr::with_parts(id, repr.type_id(), repr.offset())),
         // NOTE: This does not resolve completely, will this be an issue downstream the call stack?
         // Unregistered home: no id to resolve against. A safe SELF can't reach here
         // (its minting required registration); leave an unsafe-minted one as-is.
@@ -156,79 +89,17 @@ pub fn resolve_self_repr(repr: ForeignRepr, home: &BStack) -> io::Result<Foreign
 /// any other file stays explicit; an already-`SELF` pointer (only mintable through
 /// `unsafe`) is left as-is — after resolve-on-read a legitimate in-memory `SELF`
 /// means "home", so writing it as `SELF` is correct.
-pub fn home_relative_repr(repr: ForeignRepr, home: &BStack) -> ForeignRepr {
-    if repr.file_id() == 0 {
+pub fn home_relative_repr(repr: WidePtr, home: &BStack) -> WidePtr {
+    if repr.is_self() {
         return repr;
     }
     if let Some(id) = registry::id_of_host(home) {
-        if repr.file_id() == id.as_u64() {
-            return ForeignRepr::new(0, repr.offset()).with_type_index(repr.type_index());
+        if repr.file() == id {
+            // Target is the home file ⇒ re-encode as `SELF`, keeping type + address.
+            return WidePtr::with_parts(FileId::SELF, repr.type_id(), repr.offset());
         }
     }
     repr
-}
-
-/// Read a [`ForeignRepr`] at `off` — `{ file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }`
-/// — returning `(file_id, offset)`. (`type_index` = the target's RTTI ordinal + 1; the
-/// RTTI interpreter resolves the target type from the field's shape tag instead.)
-pub(crate) fn read_foreign_repr(data: &BStack, off: u64) -> io::Result<(u64, u64)> {
-    let mut b = [0u8; core::mem::size_of::<ForeignRepr>()];
-    data.get_into(off, &mut b)?;
-    Ok(decode_foreign_repr(&b))
-}
-
-/// Decode a raw 16-byte [`ForeignRepr`] into `(file_id, offset)` — the in-memory
-/// counterpart of [`read_foreign_repr`], used on the bytes an atomic `swap` hands
-/// back. `b` must be at least `size_of::<ForeignRepr>()` bytes.
-pub(crate) fn decode_foreign_repr(b: &[u8]) -> (u64, u64) {
-    let file_id = u32::from_le_bytes(b[0..4].try_into().unwrap()) as u64;
-    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
-    (file_id, offset)
-}
-
-/// The in-memory form of a cross-file pointer: a single 16-byte record keyed on
-/// `file_id`, mirroring the on-disk [`ForeignRepr`] one-to-one.
-///
-/// * `file_id == 0` ⇒ **`SELF`** — an address in the file it was read from. `SELF` is
-///   an on-disk *encoding* only: the generated read paths resolve it to the reading
-///   file's explicit [`FileId`] before handing a `Foreign` out
-///   ([`resolve_self_repr`]), so a `SELF` pointer does not normally exist in memory
-///   from safe code. The `'a` brand does **not** confine it to its file — a lifetime
-///   bounds duration, not identity — so an unresolved `SELF` (mintable only through
-///   the `unsafe` [`Foreign::new`] / [`Foreign::at`]) is the caller's obligation to
-///   keep in its home file. Length is recovered from the target type.
-/// * `file_id != 0` ⇒ **explicit** — a non-`SELF` [`FileId`], **registry-resolved** and
-///   borrow-free (valid independent of any file handle; deref fallible). Being `'static`
-///   it narrows `'a` freely (the brand is covariant).
-///
-/// A single struct rather than a niche-packed 2-variant enum on purpose: the enum form
-/// left the compiler unable to co-locate a `NonZeroU32` file-id niche with the borrow-
-/// bound variant's fields once an in-memory `type_index` was added, padding
-/// [`Foreign`] out to 24 bytes. Branching on `file_id == 0` keeps it flat and exactly
-/// [`ForeignRepr`]-sized (16 bytes), `type_index` and all.
-#[derive(Clone, Copy)]
-pub(crate) struct FilePtr<'a> {
-    // NOTE: we might just want to use ForeignRepr here instead of recreating
-    // The structure of a foreign pointer
-    /// The target file: `0` = [`FileId::SELF`], else an explicit [`FileId`] (`u32`).
-    file_id: u32,
-    /// The target's RTTI type ordinal + 1 (`0` = untyped, recovered from the block
-    /// header). Carried in memory so a read → re-store round-trip preserves it — the
-    /// on-disk [`ForeignRepr`] holds it, but rebuilding one via `ForeignRepr::new`
-    /// would zero it.
-    type_index: u32,
-    /// The target's address within `file_id`'s file.
-    address: u64,
-    /// Borrow brand for the `SELF` case (see the type docs); zero-sized.
-    _brand: PhantomData<fn() -> &'a ()>,
-}
-
-impl<'a> FilePtr<'a> {
-    /// Whether this is a `SELF` pointer (`file_id == 0`).
-    #[inline]
-    fn is_self(&self) -> bool {
-        self.file_id == 0
-    }
 }
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
@@ -241,7 +112,7 @@ impl<'a> FilePtr<'a> {
 /// the file it was read from). `T: 'static` because a persisted block target holds no
 /// in-memory borrow. See the [module docs](self) for teardown / deep-clone semantics.
 pub struct Foreign<'a, T: 'static> {
-    inner: FilePtr<'a>,
+    inner: BrandedWidePtr<'a>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -253,9 +124,9 @@ impl<'a, T: 'static> Clone for Foreign<'a, T> {
 impl<'a, T: 'static> Copy for Foreign<'a, T> {}
 
 impl<'a, T: 'static> Foreign<'a, T> {
-    /// Reconstruct from the stored on-disk [`ForeignRepr`]. A `SELF` pointer becomes a
-    /// borrow-bound [`SelfPtr`]; an explicit one an [`ExternalPtr`] (which ignores the
-    /// borrow — [`detach`](Self::detach) it to escape).
+    /// Reconstruct from the stored on-disk [`WidePtr`]. A `SELF` pointer stays
+    /// borrow-bound to `'a`; an explicit one ignores the borrow
+    /// ([`detach`](Self::detach) it to escape).
     ///
     /// # Safety
     /// Two obligations:
@@ -264,30 +135,22 @@ impl<'a, T: 'static> Foreign<'a, T> {
     /// * the caller must bind the returned `Foreign<'a, T>`'s lifetime `'a` to that
     ///   file's borrow (a generated field accessor does this by tying `'a` to the
     ///   `&'a BStack` / `&'a A` it read through), so a `SELF` pointer cannot escape it.
-    pub unsafe fn from_repr(repr: ForeignRepr) -> Self {
+    pub unsafe fn from_repr(repr: WidePtr) -> Self {
         Self {
-            inner: FilePtr {
-                file_id: repr.file_id() as u32,
-                type_index: repr.type_index(),
-                address: repr.offset(),
-                _brand: PhantomData,
-            },
+            inner: BrandedWidePtr::from_wide(repr),
             _marker: PhantomData,
         }
     }
 
     /// The on-disk wire pointer, for storing into a field. Preserves the RTTI
     /// `type_index` the pointer was read with (so a round-trip keeps it typed).
-    pub fn repr(self) -> ForeignRepr {
-        // `file_id == 0` (SELF) yields a `ForeignRepr` with a zero file id, exactly as
-        // the wire form encodes SELF.
-        ForeignRepr::new(self.inner.file_id as u64, self.inner.address)
-            .with_type_index(self.inner.type_index)
+    pub fn repr(self) -> WidePtr {
+        self.inner.wide()
     }
 
     /// The target's address within its file.
     pub fn offset(self) -> u64 {
-        self.inner.address
+        self.inner.offset().get()
     }
 
     /// Whether this points into the *current* file ([`FileId::SELF`]).
@@ -298,11 +161,7 @@ impl<'a, T: 'static> Foreign<'a, T> {
     /// The file this points into: [`SELF`](FileId::SELF) for a `SELF` pointer, else the
     /// explicit target file.
     pub fn file_id(self) -> FileId {
-        if self.inner.is_self() {
-            FileId::SELF
-        } else {
-            FileId::from_u64(self.inner.file_id as u64).unwrap_or(FileId::SELF)
-        }
+        self.inner.file()
     }
 
     /// Promote an **explicit** pointer to a `'static`, borrow-free [`Foreign`] — the
@@ -315,12 +174,7 @@ impl<'a, T: 'static> Foreign<'a, T> {
         } else {
             // Explicit ⇒ borrow-free: rebrand the identical bytes to `'static`.
             Some(Foreign {
-                inner: FilePtr {
-                    file_id: self.inner.file_id,
-                    type_index: self.inner.type_index,
-                    address: self.inner.address,
-                    _brand: PhantomData,
-                },
+                inner: BrandedWidePtr::from_wide(self.inner.wide()),
                 _marker: PhantomData,
             })
         }
@@ -340,15 +194,10 @@ impl<T: 'static> Foreign<'static, T> {
     /// `SELF` pointer is borrow-bound; read it from its field instead.)
     pub const unsafe fn new(file: FileId, offset: u64) -> Self {
         Self {
-            inner: FilePtr {
-                // `file == SELF` is `0`, matching the `SELF` key. A raw pointer carries
-                // no RTTI ordinal (the interpreter recovers the type from the target's
-                // block header); `type_index` is `0` = untyped.
-                file_id: file.as_u64() as u32,
-                type_index: 0,
-                address: offset,
-                _brand: PhantomData,
-            },
+            // A raw pointer carries no RTTI ordinal (the interpreter recovers the type
+            // from the target's block header), so [`BrandedWidePtr::new`] leaves it
+            // untyped. `file == SELF` (0) is the `SELF` key.
+            inner: BrandedWidePtr::new(file, Offset::from_raw(offset)),
             _marker: PhantomData,
         }
     }
@@ -385,9 +234,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         if self.inner.is_self() {
             Ok(Some(f(t, local.stack())))
         } else {
-            let id = FileId::from_u64(self.inner.file_id as u64).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
-            })?;
+            let id = self.inner.file();
             registry::with_host(id, |host| f(t, host.stack()))
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
@@ -402,14 +249,10 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     /// resolvable); `None` otherwise. Does no I/O — pair the ref with the target
     /// file's stack (e.g. via [`with`](Self::with)) to read it.
     pub fn into_local(self) -> Option<BStackRef<T>> {
-        // NOTE: This is essentially the same logic ForeignRepr, maybe we can merge them
-        // But if this is not possible, just leave it
         let resolvable = if self.inner.is_self() {
             true
         } else {
-            FileId::from_u64(self.inner.file_id as u64)
-                .and_then(|id| registry::get().map(|r| r.is_live(id)))
-                .unwrap_or(false)
+            registry::get().is_some_and(|r| r.is_live(self.inner.file()))
         };
         // SAFETY: `range()` is this pointer's target region; the returned ref is a
         // plain offset handle (no aliasing/liveness claim beyond the caller's).
@@ -437,9 +280,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         if self.inner.is_self() {
             Ok(Some(f(t, local.stack())))
         } else {
-            let id = FileId::from_u64(self.inner.file_id as u64).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "Foreign: file id out of range")
-            })?;
+            let id = self.inner.file();
             registry
                 .with_host(id, |host| f(t, host.stack()))
                 .ok_or_else(|| {
@@ -547,7 +388,7 @@ impl<'a, T: 'static> ForeignOwned<'a, T> {
 macro_rules! foreign_dispatch_drop {
     ($repr:expr, $home:expr, $drop:path) => {{
         let repr = $repr;
-        let off = repr.offset();
+        let off = repr.offset().get();
         if off == 0 {
             Ok(())
         } else if repr.file_id() == 0 {

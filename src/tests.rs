@@ -7361,7 +7361,7 @@ fn foreign_self_pointer_resolves_on_read_and_reencodes_on_write() {
     // write (so the on-disk form stays portable across re-attaches). Two registered
     // files make the cross-file distinction observable.
     use crate::foreign::{home_relative_repr, resolve_self_repr};
-    use crate::{Foreign, ForeignRepr, registry};
+    use crate::{Foreign, WidePtr, registry};
     use std::sync::Arc;
 
     let file_a = TempStack::new();
@@ -7379,13 +7379,13 @@ fn foreign_self_pointer_resolves_on_read_and_reencodes_on_write() {
     // A live block in A, and the SELF pointer as it sits on disk (`file_id == 0`).
     let leaf = MacroLeaf::new(&*arc_a, 42).unwrap().into_inner();
     let off = leaf.range().start();
-    let self_repr = ForeignRepr::new(0, off);
+    let self_repr = WidePtr::from_raw(0, 0, off);
 
     // READ: SELF resolves to A's explicit id — the escaped pointer names A, not
     // "whatever file I end up in".
     let resolved = resolve_self_repr(self_repr, arc_a.stack()).unwrap();
     assert_eq!(resolved.file_id(), id_a.as_u64());
-    assert_eq!(resolved.offset(), off);
+    assert_eq!(resolved.offset().get(), off);
 
     // WRITE back into A: a home pointer re-encodes to SELF (portable on disk).
     assert_eq!(home_relative_repr(resolved, arc_a.stack()).file_id(), 0);
@@ -8236,7 +8236,7 @@ fn macro_foreign_vec_owned_across_files() {
 fn macro_foreign_vec_owned_move_yields_dual_vec() {
     // `bstack_move!` of a `#[bstack_owned] Vec<Foreign<T>>` field hands back a
     // `Vec<ForeignOwned<T>>` — the per-element RAII duals, each resolved to an
-    // explicit id — not the raw `BStackVec<ForeignRepr>` store. Dropping each frees
+    // explicit id — not the raw `BStackVec<WidePtr>` store. Dropping each frees
     // its target on the far side; the storage block is freed by the move itself.
     use crate::registry;
     use crate::{Foreign, ForeignOwned};
@@ -8297,13 +8297,13 @@ fn macro_foreign_vec_owned_move_yields_dual_vec() {
         d.bstack_drop(&home_alloc).unwrap();
     }
 
-    // The move freed the parent shell + the `ForeignRepr` storage block; dropping the
+    // The move freed the parent shell + the `WidePtr` storage block; dropping the
     // duals freed the targets. Both files return to baseline — nothing leaked.
     assert_eq!(arc_b.stack().len().unwrap(), base_b, "targets leaked on B");
     assert_eq!(
         home_alloc.stack().len().unwrap(),
         base_home,
-        "parent shell or the ForeignRepr storage block leaked on home"
+        "parent shell or the WidePtr storage block leaked on home"
     );
 
     reg.detach(fid);
@@ -9495,23 +9495,23 @@ fn weak_array_setter_bounds_checked() {
 #[test]
 fn foreign_repr_round_trip_preserves_type_index() {
     // A typed pointer read into a `Foreign` and written back out must keep its RTTI
-    // `type_index` — the bug rebuilt the repr via `ForeignRepr::new`, zeroing it.
-    use crate::{Foreign, ForeignRepr};
+    // `type_index` — the bug rebuilt the repr via `WidePtr::new`, zeroing it.
+    use crate::{Foreign, WidePtr};
 
     // Explicit (non-SELF) typed pointer.
-    let repr = ForeignRepr::new(3, 4096).with_type_index(1);
+    let repr = WidePtr::from_raw(3, 1, 4096);
     assert_eq!(repr.type_index(), 1);
     let f = unsafe { Foreign::<MacroLeaf>::from_repr(repr) };
     let back = f.repr();
     assert_eq!(back.type_index(), 1, "type_index wiped on round-trip");
-    assert_eq!(back.offset(), 4096);
+    assert_eq!(back.offset().get(), 4096);
     assert_eq!(back.file_id(), 3);
 
     // SELF typed pointer.
-    let self_repr = ForeignRepr::new(0, 512).with_type_index(7);
+    let self_repr = WidePtr::from_raw(0, 7, 512);
     let fs = unsafe { Foreign::<MacroLeaf>::from_repr(self_repr) };
     assert_eq!(fs.repr().type_index(), 7);
-    assert_eq!(fs.repr().offset(), 512);
+    assert_eq!(fs.repr().offset().get(), 512);
     assert_eq!(fs.repr().file_id(), 0);
 
     // A freshly-constructed raw pointer is untyped (0) — unchanged behavior.
@@ -9523,7 +9523,7 @@ fn foreign_repr_round_trip_preserves_type_index() {
 fn try_clone_in_preserves_foreign_type_index() {
     // Clone path: deep-cloning an `#[bstack_owned] Foreign<T>` must keep the
     // field's RTTI `type_index`, even though the target is copied to a fresh offset.
-    use crate::{Foreign, ForeignRepr, TryCloneIn};
+    use crate::{Foreign, WidePtr, TryCloneIn};
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
     let stack = alloc.stack();
@@ -9532,7 +9532,7 @@ fn try_clone_in_preserves_foreign_type_index() {
     let target = MacroLeaf::new(&alloc, 42).unwrap();
     let toff = target.handle().range().start();
     let typed =
-        unsafe { Foreign::<MacroLeaf>::from_repr(ForeignRepr::new(0, toff).with_type_index(1)) };
+        unsafe { Foreign::<MacroLeaf>::from_repr(WidePtr::from_raw(0, 1, toff)) };
     let h = GenForeign::<MacroLeaf>::new(&alloc, 9, typed).unwrap();
 
     // Construction round-tripped the pointer (from_repr -> stored via repr) with its tag.
@@ -9547,7 +9547,7 @@ fn try_clone_in_preserves_foreign_type_index() {
         "clone wiped the foreign type_index"
     );
     assert_ne!(
-        cl.repr().offset(),
+        cl.repr().offset().get(),
         toff,
         "owned foreign should deep-copy the target"
     );

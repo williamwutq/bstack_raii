@@ -32,7 +32,7 @@
 //! ## Status
 //!
 //! Read + write of struct and enum records is in place; the on-disk RTTI-typed
-//! pointer is the existing [`ForeignRepr`] (its `type_index` is the ordinal `+ 1`).
+//! pointer is the existing [`WidePtr`] (its `type_index` is the ordinal `+ 1`).
 //! The `#[bstack_class]` macro fills [`RTTI_TYPES`] at link time, and [`sync`]
 //! appends every missing schema to a file. [`RttiRegistry::read_value`] /
 //! [`RttiRegistry::read_ptr`] are the non-recursive **read interpreter** (schema over
@@ -68,8 +68,8 @@ use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackCast};
-use crate::foreign::{ForeignRepr, decode_foreign_repr, read_foreign_repr};
 use crate::layout::read_u64_at;
+use crate::primitives::WidePtr;
 use crate::layout::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, EightCC,
     RC_REFCOUNT_OFFSET, get_u64,
@@ -176,11 +176,12 @@ fn too_large(what: &str, limit: &str) -> io::Error {
     ))
 }
 
-/// Build an RTTI-typed pointer: a [`ForeignRepr`] to `(file_id, offset)` tagged
+/// Build an RTTI-typed pointer: a [`WidePtr`] to `(file_id, offset)` tagged
 /// with `ordinal`. `file_id == 0` ⇒ `SELF`. For an untyped pointer (type recovered
-/// from the target block header on deref) use [`ForeignRepr::new`] directly.
-pub fn typed_ptr(file_id: u64, offset: u64, ordinal: RttiOrdinal) -> ForeignRepr {
-    ForeignRepr::new(file_id, offset).with_type_index(ordinal + 1)
+/// from the target block header on deref) use [`WidePtr::from_raw`] with a `0` type
+/// index. The raw `(file_id, offset)` inputs are decoded through the wire boundary.
+pub fn typed_ptr(file_id: u64, offset: u64, ordinal: RttiOrdinal) -> WidePtr {
+    WidePtr::from_raw(file_id, ordinal + 1, offset)
 }
 
 /// Build an RTTI field path from **dotted field names** for
@@ -1082,8 +1083,8 @@ impl RttiRegistry {
 
     /// Resolve a pointer's `type_index` to a live ordinal. `None` for an untyped
     /// pointer or an out-of-range index.
-    pub fn resolve_ptr(&self, ptr: ForeignRepr) -> Option<RttiOrdinal> {
-        let ord = ptr.rtti_ordinal()?;
+    pub fn resolve_ptr(&self, ptr: WidePtr) -> Option<RttiOrdinal> {
+        let ord = ptr.type_id().ordinal()?;
         ((ord as usize) < self.records.len()).then_some(ord)
     }
 
@@ -1256,7 +1257,7 @@ pub enum Moved {
     },
     /// A fixed array of cross-file [`Foreign`](crate::Foreign) pointers (`[Foreign; N]`),
     /// moved element-by-element — the foreign analog of [`List`](Self::List). Its inline
-    /// `ForeignRepr` storage dies with the freed shell, so each pointer is handed back
+    /// `WidePtr` storage dies with the freed shell, so each pointer is handed back
     /// (a `ForeignPtr` whose `offset == 0` is null). The caller now owns each reference.
     ForeignList(Box<[ForeignPtr]>),
     /// A tuple with at least one `Foreign` member, moved member-by-member: each element
@@ -1401,7 +1402,7 @@ struct CloneWal {
 const VECDESC_LEN: u64 = 16;
 /// A byte-vec data block's header (`len:u64` @0, `cap:u64` @8, elements from 16).
 const BYTEVEC_HEADER: u64 = 16;
-/// Bytes of a `ForeignRepr` on the wire.
+/// Bytes of a `WidePtr` on the wire.
 const FOREIGN_REPR_LEN: u64 = 16;
 /// Offset of the `tag: EightCC` within a block's `BlockHeader` (`size: u64` @0).
 const HEADER_TAG_OFFSET: u64 = 8;
@@ -1557,9 +1558,10 @@ impl RttiRegistry {
                         });
                     }
                     Shape::Foreign { tag, kind } => {
-                        // ForeignRepr { file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }.
+                        // WidePtr { file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }.
                         // The target is in another file — recorded, not followed.
-                        let (file_id, off) = read_foreign_repr(data, offset)?;
+                        let __wp = WidePtr::read_from_stack(data, offset)?;
+                        let (file_id, off) = (__wp.file_id(), __wp.offset().get());
                         results.push(Value::Foreign {
                             tag,
                             kind,
@@ -1690,16 +1692,16 @@ impl RttiRegistry {
         }
     }
 
-    /// Read the structure a typed [`ForeignRepr`] points at, within `data`. The
+    /// Read the structure a typed [`WidePtr`] points at, within `data`. The
     /// pointer must be **typed** (carry an RTTI ordinal), and `data` must be the file
     /// it targets. This resolves within a single file by design — for a cross-file
     /// pointer, resolve its `file_id` through the [`registry`](crate::registry) first
     /// and call this against that file's stack.
-    pub fn read_ptr(&self, data: &BStack, ptr: ForeignRepr) -> io::Result<Value> {
+    pub fn read_ptr(&self, data: &BStack, ptr: WidePtr) -> io::Result<Value> {
         let ord = self.resolve_ptr(ptr).ok_or_else(|| {
             corrupt("[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer")
         })?;
-        self.read_value(data, ord, ptr.offset())
+        self.read_value(data, ord, ptr.offset().get())
     }
 
     /// The runtime-typed [`AnyRef`] a **typed** pointer denotes — its registry tag
@@ -1707,12 +1709,12 @@ impl RttiRegistry {
     /// (`type_index == 0`) or out-of-range pointer, so a stray pointer can never
     /// masquerade as a registered type. Downcast the result with
     /// [`AnyRef::downcast`], or read it generically with [`read_any`](Self::read_any).
-    pub fn any_ref(&self, ptr: ForeignRepr) -> Option<AnyRef> {
+    pub fn any_ref(&self, ptr: WidePtr) -> Option<AnyRef> {
         let ord = self.resolve_ptr(ptr)?;
         let tag = self.tag_of(ord)?;
         // SAFETY: the tag is registry-authoritative for the pointer's type_index,
         // and the offset is the typed pointer's own target.
-        Some(unsafe { AnyRef::new(tag, ptr.offset()) })
+        Some(unsafe { AnyRef::new(tag, ptr.offset().get()) })
     }
 
     /// Interpret the structure an [`AnyRef`] points at into a [`Value`] tree — the
@@ -1870,7 +1872,8 @@ impl RttiRegistry {
                     Shape::Foreign { tag, kind } => {
                         // Cross-file: the target's file + offset, torn down in the commit
                         // phase (a self-contained transaction on that file).
-                        let (file_id, off) = read_foreign_repr(data, offset)?;
+                        let __wp = WidePtr::read_from_stack(data, offset)?;
+                        let (file_id, off) = (__wp.file_id(), __wp.offset().get());
                         foreign_releases.push((tag, kind, file_id, off));
                     }
                     Shape::Option(inner) => {
@@ -1914,7 +1917,7 @@ impl RttiRegistry {
                             // A vector of owning/shared elements releases each element
                             // from the data block's element area too. The `@0` word is
                             // the byte length, so the count is `byte_len / stride`
-                            // (stride = 8 for a `u64` offset, 16 for a `ForeignRepr`).
+                            // (stride = 8 for a `u64` offset, 16 for a `WidePtr`).
                             let base = add_off(data_off, BYTEVEC_HEADER)?;
                             let stride = self.shape_stride(&inner, &mut cache)?;
                             let byte_len = read_u64_at(data, data_off)?;
@@ -1953,15 +1956,16 @@ impl RttiRegistry {
                                     }
                                 }
                                 // A vector of `Foreign` pointers: each element is a
-                                // 16-byte `ForeignRepr`; its target is torn down in its
+                                // 16-byte `WidePtr`; its target is torn down in its
                                 // own file in the commit phase (a null offset is a no-op).
                                 other if foreign_leaf(other).is_some() => {
                                     let (tag, kind) = foreign_leaf(other).unwrap();
                                     for i in 0..len {
-                                        let (file_id, foff) = read_foreign_repr(
+                                        let __wp = WidePtr::read_from_stack(
                                             data,
                                             add_off(base, mul_off(i, stride)?)?,
                                         )?;
+                                        let (file_id, foff) = (__wp.file_id(), __wp.offset().get());
                                         foreign_releases.push((tag, kind, file_id, foff));
                                     }
                                 }
@@ -2129,7 +2133,7 @@ impl RttiRegistry {
     /// resolves against `home`; a detached target file **errors** (fail-safe — never
     /// alias an owner, which would double-free later — matching the generated path).
     ///
-    /// `src_off` / `new_off` are the source / clone `ForeignRepr` slot locations in the
+    /// `src_off` / `new_off` are the source / clone `WidePtr` slot locations in the
     /// home file.
     fn clone_foreign<A: BStackRaiiAllocator>(
         &self,
@@ -2143,7 +2147,8 @@ impl RttiRegistry {
         if matches!(kind, ForeignKind::Ref) {
             return Ok(()); // aliased — the copied slot is correct
         }
-        let (file_id, src_target) = read_foreign_repr(home_data, src_off)?;
+        let __wp = WidePtr::read_from_stack(home_data, src_off)?;
+        let (file_id, src_target) = (__wp.file_id(), __wp.offset().get());
         if src_target == 0 {
             return Ok(()); // null — copied as 0
         }
@@ -2163,7 +2168,7 @@ impl RttiRegistry {
     }
 
     /// The per-kind foreign clone against an already-resolved `target` allocator. For
-    /// `owned` it patches the clone's `ForeignRepr.offset` (@ `new_off + 8`, in the
+    /// `owned` it patches the clone's `WidePtr.offset` (@ `new_off + 8`, in the
     /// home file) to the freshly-cloned target offset.
     fn clone_foreign_in<A: BStackRaiiAllocator>(
         &self,
@@ -2181,7 +2186,7 @@ impl RttiRegistry {
             ForeignKind::Owned => {
                 // SAFETY: `src_target` came from the source's validated foreign slot.
                 let new_target = unsafe { self.clone_value(target, ord, src_target)? };
-                // Repoint only the address word of the copied ForeignRepr.
+                // Repoint only the address word of the copied WidePtr.
                 home_data.set(
                     add_off(new_off, FOREIGN_REPR_LEN - 8)?,
                     new_target.to_le_bytes(),
@@ -2563,7 +2568,7 @@ impl RttiRegistry {
                 })??;
             }
         }
-        // Build the new 16-byte `ForeignRepr { file_id:u32, type_index:u32, offset:u64 }`
+        // Build the new 16-byte `WidePtr { file_id:u32, type_index:u32, offset:u64 }`
         // (type_index = the target's ordinal + 1, per `typed_ptr`).
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let mut b = [0u8; FOREIGN_REPR_LEN as usize];
@@ -2573,7 +2578,8 @@ impl RttiRegistry {
         // Atomic exchange of the whole 16-byte pointer, taking the old one this
         // caller displaced.
         let old_repr = data.swap(offset, b)?;
-        let (old_file, old_off) = decode_foreign_repr(&old_repr);
+        let __wp = WidePtr::decode(&old_repr);
+        let (old_file, old_off) = (__wp.file_id(), __wp.offset().get());
         Ok((old_off != 0).then_some(ForeignPtr {
             tag,
             kind,
@@ -2831,7 +2837,8 @@ impl RttiRegistry {
             }
             Shape::Foreign { tag, kind } => {
                 // The target lives in another file; hand its pointer to the caller.
-                let (file_id, offset) = read_foreign_repr(data, off)?;
+                let __wp = WidePtr::read_from_stack(data, off)?;
+                let (file_id, offset) = (__wp.file_id(), __wp.offset().get());
                 Moved::Foreign {
                     tag: *tag,
                     kind: *kind,
@@ -2857,12 +2864,13 @@ impl RttiRegistry {
             }
             Shape::Array { n, inner } => {
                 if let Some((tag, kind)) = foreign_leaf(inner) {
-                    // A foreign array: each element is a 16-byte `ForeignRepr` inline
+                    // A foreign array: each element is a 16-byte `WidePtr` inline
                     // in the shell; hand every cross-file pointer back to the caller.
                     let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
-                        let (file_id, offset) =
-                            read_foreign_repr(data, add_off(off, mul_off(i, FOREIGN_REPR_LEN)?)?)?;
+                        let __wp =
+                            WidePtr::read_from_stack(data, add_off(off, mul_off(i, FOREIGN_REPR_LEN)?)?)?;
+                        let (file_id, offset) = (__wp.file_id(), __wp.offset().get());
                         list.push(ForeignPtr {
                             tag,
                             kind,
@@ -3234,7 +3242,7 @@ impl RttiRegistry {
                             // its size word was copied verbatim.
                             data.set(new_off, new_data.to_le_bytes())?;
                             // `@0` is the byte length; count is `byte_len / stride`
-                            // (8 per `u64` offset, 16 per `ForeignRepr`).
+                            // (8 per `u64` offset, 16 per `WidePtr`).
                             let stride = self.shape_stride(&inner, &mut st.cache)?;
                             let byte_len = read_u64_at(data, src_data)?;
                             let len = checked_vec_len(byte_len, data_size, stride)?;
@@ -3419,7 +3427,7 @@ impl RttiRegistry {
 
     /// The on-disk byte width of one element of `shape` — the stride for array / vec /
     /// tuple element addressing. References are a `u64` offset; a foreign is a
-    /// `ForeignRepr`; an embedded child is its whole block; a vector is its inline
+    /// `WidePtr`; an embedded child is its whole block; a vector is its inline
     /// `VecDesc`.
     fn shape_stride(
         &self,
@@ -3554,7 +3562,7 @@ fn weak_element_tag(shape: &Shape) -> Option<EightCC> {
 }
 
 /// The `(tag, kind)` of a cross-file `Foreign` leaf (optionally `Option`-wrapped) —
-/// its slot is a 16-byte [`ForeignRepr`]. `None` for any non-foreign shape. Used to
+/// its slot is a 16-byte [`WidePtr`]. `None` for any non-foreign shape. Used to
 /// drive the per-element foreign path in a `Vec` / array / tuple.
 fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
     match shape {
@@ -3565,7 +3573,7 @@ fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
 }
 
 /// Whether an `Option<inner>` slot at `base` is `Some`. The null niche's **location
-/// depends on the inner shape**: a `Foreign` slot is a 16-byte `ForeignRepr`
+/// depends on the inner shape**: a `Foreign` slot is a 16-byte `WidePtr`
 /// `{ file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }` whose niche is the target
 /// `offset` word at byte 8 — *not* the leading `file_id|type_index` word (which is
 /// `0` for a present untyped SELF-file pointer, so testing it would misread a live
@@ -3574,7 +3582,7 @@ fn foreign_leaf(shape: &Shape) -> Option<(EightCC, ForeignKind)> {
 /// `u64`.
 fn option_present(data: &BStack, inner: &Shape, base: u64) -> io::Result<bool> {
     Ok(match inner {
-        Shape::Foreign { .. } => read_foreign_repr(data, base)?.1 != 0,
+        Shape::Foreign { .. } => !WidePtr::read_from_stack(data, base)?.is_null(),
         _ => read_u64_at(data, base)? != 0,
     })
 }
@@ -4044,7 +4052,7 @@ mod tests {
             // typed pointer resolves through the ordinal
             let ord = reg.ordinal_of(b.tag).unwrap();
             assert_eq!(reg.resolve_ptr(typed_ptr(0, 4096, ord)), Some(1));
-            assert_eq!(reg.resolve_ptr(ForeignRepr::new(0, 4096)), None); // untyped
+            assert_eq!(reg.resolve_ptr(WidePtr::from_raw(0, 0, 4096)), None); // untyped
         }
 
         // reopen: the scan rebuilds the same maps from disk

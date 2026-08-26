@@ -358,7 +358,7 @@ pub(crate) fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
         _ => return quote!(),
     };
     quote! {
-        let __off = __fp.offset();
+        let __off = __fp.offset().get();
         if __off != 0 {
             let __fid = __fp.file_id();
             if __fid == 0 {
@@ -401,8 +401,8 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
         Kind::Owned => {
             let err = not_attached("#[bstack_owned]");
             quote! {
-                let __newfp: ::bstack_raii::ForeignRepr = {
-                    let __off = __fp.offset();
+                let __newfp: ::bstack_raii::WidePtr = {
+                    let __off = __fp.offset().get();
                     if __off == 0 {
                         __fp
                     } else {
@@ -411,8 +411,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __child = unsafe { <#ftarget as ::bstack_raii::BStackBlock>::from_range(
                                 ::bstack_raii::BStackRange::new(__off, #od_size)) };
                             let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                            ::bstack_raii::ForeignRepr::new(0, __new.start())
-                                .with_type_index(__fp.type_index())
+                            ::bstack_raii::WidePtr::from_raw(0, __fp.type_index(), __new.start())
                         } else if __plan.is_measuring() {
                             // Foreign deep-clone is build-only; this value is discarded
                             // in the measure pass (home-file sizes only).
@@ -426,8 +425,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                             let __new_off = unsafe {
                                 ::bstack_raii::__private::foreign_clone_owned::<#ftarget, _>(&__adapter, __off)? };
-                            ::bstack_raii::ForeignRepr::new(__fid, __new_off)
-                                .with_type_index(__fp.type_index())
+                            ::bstack_raii::WidePtr::from_raw(__fid, __fp.type_index(), __new_off)
                         } else {
                             #malformed
                         }
@@ -438,8 +436,8 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
         Kind::Strong => {
             let err = not_attached("#[bstack_strong]");
             quote! {
-                let __newfp: ::bstack_raii::ForeignRepr = {
-                    let __off = __fp.offset();
+                let __newfp: ::bstack_raii::WidePtr = {
+                    let __off = __fp.offset().get();
                     if __off != 0 {
                         let __fid = __fp.file_id();
                         if __fid == 0 {
@@ -467,8 +465,8 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
         Kind::Weak => {
             let err = not_attached("#[bstack_weak]");
             quote! {
-                let __newfp: ::bstack_raii::ForeignRepr = {
-                    let __off = __fp.offset();
+                let __newfp: ::bstack_raii::WidePtr = {
+                    let __off = __fp.offset().get();
                     if __off != 0 {
                         let __fid = __fp.file_id();
                         if __fid == 0 {
@@ -492,7 +490,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
             }
         }
         // Ref aliases the pointer verbatim.
-        _ => quote! { let __newfp: ::bstack_raii::ForeignRepr = __fp; },
+        _ => quote! { let __newfp: ::bstack_raii::WidePtr = __fp; },
     }
 }
 
@@ -1375,7 +1373,7 @@ pub(crate) fn array_mut_methods(
 
 /// Generated `#[bstack_mut]` mutators for a scalar `Foreign<T>` /
 /// `Option<Foreign<T>>` field. Unlike teardown / clone, the swap is **purely local**
-/// — one crash-atomic 16-byte `ForeignRepr` write — because the cross-file
+/// — one crash-atomic 16-byte `WidePtr` write — because the cross-file
 /// responsibility (free / decrement in the target's own file) travels with the
 /// returned RAII dual, discharged later by the caller's `bstack_drop(&home)`:
 ///
@@ -1416,13 +1414,13 @@ pub(crate) fn foreign_mut_methods(
     } else {
         dual.clone()
     };
-    // Consume a dual `v` (by value) into its stored `ForeignRepr`.
+    // Consume a dual `v` (by value) into its stored `WidePtr`.
     let consume = |v: TokenStream| match kind {
         Kind::Owned | Kind::Strong | Kind::Weak => quote!((#v).into_foreign().repr()),
         Kind::Ref => quote!((#v).repr()),
         _ => unreachable!(),
     };
-    // Rebuild the dual from a `ForeignRepr` (infallible). `unsafe`: the repr was
+    // Rebuild the dual from a `WidePtr` (infallible). `unsafe`: the repr was
     // stored into this file, and the returned handle is bound to `'__m`.
     let rebuild = |r: TokenStream| match kind {
         Kind::Owned => quote!(unsafe {
@@ -1457,11 +1455,11 @@ pub(crate) fn foreign_mut_methods(
         if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
             return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
         }
-        let __old_raw: ::bstack_raii::ForeignRepr =
+        let __old_raw: ::bstack_raii::WidePtr =
             ::bstack_raii::bytemuck::pod_read_unaligned(&__b);
         // Resolve a SELF old-pointer to this file's registered id before it is handed
         // back as a dual. Nothing is written yet, so on failure hand `value` back.
-        let __old: ::bstack_raii::ForeignRepr =
+        let __old: ::bstack_raii::WidePtr =
             match ::bstack_raii::__private::resolve_self_repr(__old_raw, __stack) {
                 ::std::result::Result::Ok(__r) => __r,
                 ::std::result::Result::Err(__e) =>
@@ -1476,8 +1474,8 @@ pub(crate) fn foreign_mut_methods(
         quote! {
             #read_old
             let (__new, __back): (
-                ::bstack_raii::ForeignRepr,
-                ::core::option::Option<::bstack_raii::ForeignRepr>,
+                ::bstack_raii::WidePtr,
+                ::core::option::Option<::bstack_raii::WidePtr>,
             ) = match value {
                 ::core::option::Option::Some(__v) => {
                     let __r = #consume_some;
@@ -1487,7 +1485,7 @@ pub(crate) fn foreign_mut_methods(
                      ::core::option::Option::Some(__r))
                 }
                 ::core::option::Option::None =>
-                    (::bstack_raii::ForeignRepr::new(0, 0), ::core::option::Option::None),
+                    (::bstack_raii::WidePtr::NULL, ::core::option::Option::None),
             };
             if let ::std::result::Result::Err(__e) =
                 __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
@@ -1498,7 +1496,7 @@ pub(crate) fn foreign_mut_methods(
                 };
                 return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
             }
-            if __old.offset() == 0 {
+            if __old.offset().get() == 0 {
                 ::core::result::Result::Ok(::core::option::Option::None)
             } else {
                 ::core::result::Result::Ok(::core::option::Option::Some(#rb_old))
@@ -1510,10 +1508,10 @@ pub(crate) fn foreign_mut_methods(
         let rb_old = rebuild(quote!(__old));
         quote! {
             #read_old
-            let __new_explicit: ::bstack_raii::ForeignRepr = #consume_v;
+            let __new_explicit: ::bstack_raii::WidePtr = #consume_v;
             // Store the home-relative (SELF-re-encoded) form; hand the explicit value
             // back untouched on a write failure.
-            let __new: ::bstack_raii::ForeignRepr =
+            let __new: ::bstack_raii::WidePtr =
                 ::bstack_raii::__private::home_relative_repr(__new_explicit, __stack);
             if let ::std::result::Result::Err(__e) =
                 __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
@@ -1543,7 +1541,7 @@ pub(crate) fn foreign_mut_methods(
         let new_repr = if nullable {
             quote!(match value {
                 ::core::option::Option::Some(__v) => __v.repr(),
-                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             })
         } else {
             quote!(value.repr())
@@ -1557,7 +1555,7 @@ pub(crate) fn foreign_mut_methods(
                 value: #val_ty,
             ) -> ::std::io::Result<()> {
                 // Re-encode a pointer to the home file as SELF before storing.
-                let __new: ::bstack_raii::ForeignRepr =
+                let __new: ::bstack_raii::WidePtr =
                     ::bstack_raii::__private::home_relative_repr(#new_repr, allocator.stack());
                 allocator
                     .stack()
@@ -2229,7 +2227,7 @@ pub(crate) fn weakable_items(
 }
 
 /// Lower a scalar `Foreign<T>` / `Option<Foreign<T>>` field to its [`FieldParts`]:
-/// the inline `ForeignRepr` slot, the lifetime-bound accessor, ctor wiring,
+/// the inline `WidePtr` slot, the lifetime-bound accessor, ctor wiring,
 /// per-kind cross-file teardown / deep-clone, `bstack_move!` RAII-dual pieces, and
 /// (for `#[bstack_mut]`) the `replace_` / `set_` mutators.
 pub(crate) fn foreign_field(
@@ -2259,7 +2257,7 @@ pub(crate) fn foreign_field(
     )?;
     parts
         .on_disk_fields
-        .push(quote!(#fname: ::bstack_raii::ForeignRepr,));
+        .push(quote!(#fname: ::bstack_raii::WidePtr,));
     let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
     let cap = format_ident!("__cap_{}", fname);
     parts.mv_caps.push(quote!(let #cap = __od.#fname;));
@@ -2313,7 +2311,7 @@ pub(crate) fn foreign_field(
                 let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                 let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                 let __p = __od.#fname;
-                let __out = if __p.offset() == 0 {
+                let __out = if __p.offset().get() == 0 {
                     ::core::option::Option::None
                 } else {
                     // Resolve SELF to this file's registered id before it escapes.
@@ -2330,11 +2328,11 @@ pub(crate) fn foreign_field(
             .ctor_params
             .push(quote!(#fname: ::core::option::Option<#field_ty>,));
         parts.ctor_preps.push(quote! {
-            let #fname: ::bstack_raii::ForeignRepr = match #fname {
+            let #fname: ::bstack_raii::WidePtr = match #fname {
                 // Re-encode a pointer to the home file as SELF.
                 ::core::option::Option::Some(__f) =>
                     ::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack()),
-                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             };
         });
         parts.ctor_inits.push(quote!(#fname: #fname,));
@@ -2342,7 +2340,7 @@ pub(crate) fn foreign_field(
             .mv_types
             .push(quote!(::core::option::Option<#mv_leaf_ty>));
         parts.mv_recon.push(quote! {
-            if #cap.offset() == 0 {
+            if #cap.offset().get() == 0 {
                 ::core::option::Option::None
             } else {
                 // SAFETY: `#cap` was stored into this file; the handle is bound
@@ -2373,7 +2371,7 @@ pub(crate) fn foreign_field(
         parts.ctor_preps.push(quote!(
             // Re-encode a pointer to the home file as SELF, keeping the
             // on-disk form portable across re-attaches.
-            let #fname: ::bstack_raii::ForeignRepr =
+            let #fname: ::bstack_raii::WidePtr =
                 ::bstack_raii::__private::home_relative_repr(#fname.repr(), allocator.stack());
         ));
         parts.ctor_inits.push(quote!(#fname: #fname,));
@@ -2398,10 +2396,10 @@ pub(crate) fn foreign_field(
     if let Some(helper) = foreign_drop_helper {
         parts.drop_stmts.push(quote! {
             {
-                let __fp: ::bstack_raii::ForeignRepr = __on_disk.#fname;
+                let __fp: ::bstack_raii::WidePtr = __on_disk.#fname;
                 // A `0` offset is the null / unset niche (nullable field, or a
                 // never-set pointer) — nothing to free.
-                let __off = __fp.offset();
+                let __off = __fp.offset().get();
                 if __off != 0 {
                     let __fid = __fp.file_id();
                     if __fid == 0 {
@@ -2442,8 +2440,8 @@ pub(crate) fn foreign_field(
     let foreign_clone_stmt = match kind {
         Kind::Owned => Some(quote! {
             {
-                let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
-                let __off = __fp.offset();
+                let __fp: ::bstack_raii::WidePtr = __od.#fname;
+                let __off = __fp.offset().get();
                 if __off != 0 {
                     let __fid = __fp.file_id();
                     if __fid == 0 {
@@ -2452,8 +2450,7 @@ pub(crate) fn foreign_field(
                             ::bstack_raii::BStackRange::new(__off, #target_od_size),
                         ) };
                         let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                        __od.#fname = ::bstack_raii::ForeignRepr::new(0, __new.start())
-                            .with_type_index(__fp.type_index());
+                        __od.#fname = ::bstack_raii::WidePtr::from_raw(0, __fp.type_index(), __new.start());
                     } else if __plan.is_measuring() {
                         // Foreign deep-clone is eager cross-file work; the
                         // measure pass (home-file sizes only) skips it, so it
@@ -2474,8 +2471,7 @@ pub(crate) fn foreign_field(
                                 &__adapter, __off,
                             )?
                         };
-                        __od.#fname = ::bstack_raii::ForeignRepr::new(__fid, __new_off)
-                            .with_type_index(__fp.type_index());
+                        __od.#fname = ::bstack_raii::WidePtr::from_raw(__fid, __fp.type_index(), __new_off);
                     } else {
                         return ::std::result::Result::Err(::std::io::Error::new(
                             ::std::io::ErrorKind::InvalidData,
@@ -2487,8 +2483,8 @@ pub(crate) fn foreign_field(
         }),
         Kind::Strong => Some(quote! {
             {
-                let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
-                let __off = __fp.offset();
+                let __fp: ::bstack_raii::WidePtr = __od.#fname;
+                let __off = __fp.offset().get();
                 if __off != 0 {
                     let __fid = __fp.file_id();
                     if __fid == 0 {
@@ -2530,9 +2526,9 @@ pub(crate) fn foreign_field(
         }),
         Kind::Weak => Some(quote! {
             {
-                let __fp: ::bstack_raii::ForeignRepr = __od.#fname;
+                let __fp: ::bstack_raii::WidePtr = __od.#fname;
                 // For a weak pointer, the offset is the target's control block.
-                let __off = __fp.offset();
+                let __off = __fp.offset().get();
                 if __off != 0 {
                     let __fid = __fp.file_id();
                     if __fid == 0 {
@@ -2575,7 +2571,7 @@ pub(crate) fn foreign_field(
 
     // `#[bstack_mut]`: `replace_<f>` (owned/strong/weak — moves the old
     // cross-file target out as its RAII dual) and, for a foreign `ref`, also
-    // `set_<f>`. One crash-atomic 16-byte `ForeignRepr` write; the swap is
+    // `set_<f>`. One crash-atomic 16-byte `WidePtr` write; the swap is
     // purely local (no registry / host access), the cross-file free/decrement
     // travelling with the returned handle.
     if is_bstack_mut(&field.attrs) {
@@ -2646,7 +2642,7 @@ pub(crate) fn vec_field(
             &mut parts.wrapper_defs,
         )?;
 
-        let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
+        let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::WidePtr, __A>);
         let field_loc = quote!(::bstack_raii::__private::checked_field_offset(
             self.0.start(),
             ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
@@ -2663,14 +2659,14 @@ pub(crate) fn vec_field(
         } else {
             quote!(::bstack_raii::Foreign<'__v, #ftarget>)
         };
-        // Map a stored `ForeignRepr` ↔ the element type (offset 0 ⇒ `None` when the
+        // Map a stored `WidePtr` ↔ the element type (offset 0 ⇒ `None` when the
         // element is `Option`-wrapped). Read: resolve a SELF pointer to this file's
         // registered id before it escapes (fallible — collected into a
         // `Result`). Write: re-encode a home pointer back to SELF.
         let from_ptr = if elem_nullable {
-            quote!(|__p: ::bstack_raii::ForeignRepr|
+            quote!(|__p: ::bstack_raii::WidePtr|
                         -> ::std::io::Result<#acc_elem_ty> {
-                if __p.offset() == 0 {
+                if __p.offset().get() == 0 {
                     ::std::result::Result::Ok(::core::option::Option::None)
                 } else {
                     let __repr =
@@ -2680,7 +2676,7 @@ pub(crate) fn vec_field(
                 }
             })
         } else {
-            quote!(|__p: ::bstack_raii::ForeignRepr|
+            quote!(|__p: ::bstack_raii::WidePtr|
                         -> ::std::io::Result<#acc_elem_ty> {
                 let __repr =
                     ::bstack_raii::__private::resolve_self_repr(__p, allocator.stack())?;
@@ -2692,7 +2688,7 @@ pub(crate) fn vec_field(
             quote!(|__f: #field_ty| match __f {
                 ::core::option::Option::Some(__ff) =>
                     ::bstack_raii::__private::home_relative_repr(__ff.repr(), allocator.stack()),
-                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             })
         } else {
             quote!(|__f: #field_ty|
@@ -2733,7 +2729,7 @@ pub(crate) fn vec_field(
 
         // ---- Constructor: `Vec<Foreign<T>>` → a `ForeignPtr` data block ----
         let build = quote! {
-            let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
+            let __ptrs: ::std::vec::Vec<::bstack_raii::WidePtr> =
                 __list.into_iter().map(#to_ptr).collect();
             #store::from_slice(allocator, &__ptrs)?.descriptor()
         };
@@ -2786,7 +2782,7 @@ pub(crate) fn vec_field(
                 let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
                 if __srcdesc.data_off != 0 {
                     let __src = unsafe { #store::from_desc(__srcdesc, allocator) }.to_vec()?;
-                    let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
+                    let mut __new: ::std::vec::Vec<::bstack_raii::WidePtr> =
                         ::std::vec::Vec::with_capacity(__src.len());
                     for __fp in __src {
                         #elem_clone
@@ -2799,10 +2795,10 @@ pub(crate) fn vec_field(
         });
 
         // ---- Move: hand back a `Vec` of the per-element RAII dual, not the raw
-        // `ForeignRepr` store. An owning kind yields the freeable
+        // `WidePtr` store. An owning kind yields the freeable
         // `ForeignOwned` / `ForeignRc` / `ForeignWeak` (each `bstack_drop`-able or
         // re-storable); a `ref` yields a plain `Foreign`. Every element is resolved
-        // to an explicit id. The `ForeignRepr` storage block is freed here —
+        // to an explicit id. The `WidePtr` storage block is freed here —
         // its pointers now live in the returned duals.
         let (dual_ty, wrap) = match kind {
             Kind::Owned => (
@@ -2835,7 +2831,7 @@ pub(crate) fn vec_field(
         };
         let push_expr = if elem_nullable {
             quote! {
-                if __p.offset() == 0 {
+                if __p.offset().get() == 0 {
                     ::core::option::Option::None
                 } else {
                     let __repr =
@@ -2853,7 +2849,7 @@ pub(crate) fn vec_field(
         // before the parent shell is freed; the data block it names is freed here.
         let build = quote! {{
             let __vec = unsafe {
-                ::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>::from_desc(#cap, __alloc)
+                ::bstack_raii::BStackVec::<::bstack_raii::WidePtr, __A>::from_desc(#cap, __alloc)
             };
             let __reprs = __vec.to_vec()?;
             __vec.bstack_drop()?;
@@ -3550,7 +3546,7 @@ pub(crate) fn vec_array_field(
 }
 
 /// Lower an inline **array of `Foreign`** `[Foreign<T>; N]` (nested / per-element
-/// `Option`) to its [`FieldParts`] — a flat `[ForeignRepr; TOTAL]` inline, each
+/// `Option`) to its [`FieldParts`] — a flat `[WidePtr; TOTAL]` inline, each
 /// slot's teardown / deep-clone dispatching cross-file like a scalar `Foreign`.
 /// Returns `Ok(None)` if the field isn't an array whose leaf is a `Foreign`.
 pub(crate) fn foreign_array_field(
@@ -3596,7 +3592,7 @@ pub(crate) fn foreign_array_field(
         let field_ty = quote!(::bstack_raii::Foreign<#ftarget>);
         parts
             .on_disk_fields
-            .push(quote!(#fname: [::bstack_raii::ForeignRepr; #total],));
+            .push(quote!(#fname: [::bstack_raii::WidePtr; #total],));
 
         // ---- Accessor: nested `[[Foreign<T>; ..]; ..]` (Option per slot) ----
         // Each SELF slot is resolved to this file's registered id before it escapes,
@@ -3613,7 +3609,7 @@ pub(crate) fn foreign_array_field(
             if aleaf_nullable {
                 quote!({
                     let __p = __arr[#k];
-                    if __p.offset() == 0 {
+                    if __p.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
                         let __repr = ::bstack_raii::__private::resolve_self_repr(__p, stack)?;
@@ -3638,7 +3634,7 @@ pub(crate) fn foreign_array_field(
                 let mut __buf = ::std::vec![0u8; ::core::mem::size_of::<#on_disk_ty>()];
                 let __r = unsafe { ::bstack_raii::BStackRef::<Self>::from_range(self.0) };
                 let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
-                let __arr: [::bstack_raii::ForeignRepr; #total] = __od.#fname;
+                let __arr: [::bstack_raii::WidePtr; #total] = __od.#fname;
                 ::std::result::Result::Ok(#acc_body)
             }
         });
@@ -3658,7 +3654,7 @@ pub(crate) fn foreign_array_field(
                             ::core::option::Option::Some(__f) =>
                                 ::bstack_raii::__private::home_relative_repr(
                                     __f.repr(), allocator.stack()),
-                            ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                            ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
                         };)
             } else {
                 quote!(__slots[#k] = ::bstack_raii::__private::home_relative_repr(
@@ -3667,8 +3663,8 @@ pub(crate) fn foreign_array_field(
         };
         let flatten = nested_consume(&adims, &quote!(#fname), &ctor_write);
         parts.ctor_preps.push(quote! {
-            let #fname: [::bstack_raii::ForeignRepr; #total] = {
-                let mut __slots = [::bstack_raii::ForeignRepr::new(0, 0); #total];
+            let #fname: [::bstack_raii::WidePtr; #total] = {
+                let mut __slots = [::bstack_raii::WidePtr::NULL; #total];
                 #flatten
                 __slots
             };
@@ -3681,7 +3677,7 @@ pub(crate) fn foreign_array_field(
             quote!()
         } else {
             quote! {
-                let __arr: [::bstack_raii::ForeignRepr; #total] = __on_disk.#fname;
+                let __arr: [::bstack_raii::WidePtr; #total] = __on_disk.#fname;
                 for __k in 0usize..(#total) {
                     let __fp = __arr[__k];
                     #elem_drop
@@ -3694,8 +3690,8 @@ pub(crate) fn foreign_array_field(
         let elem_clone = foreign_elem_clone(kind, ftarget);
         parts.clone_stmts.push(quote! {
             {
-                let __arr: [::bstack_raii::ForeignRepr; #total] = __od.#fname;
-                let mut __narr: [::bstack_raii::ForeignRepr; #total] = __arr;
+                let __arr: [::bstack_raii::WidePtr; #total] = __od.#fname;
+                let mut __narr: [::bstack_raii::WidePtr; #total] = __arr;
                 for __k in 0usize..(#total) {
                     let __fp = __arr[__k];
                     #elem_clone
@@ -3721,7 +3717,7 @@ pub(crate) fn foreign_array_field(
             if aleaf_nullable {
                 quote!({
                     let __p = #cap[#k];
-                    if __p.offset() == 0 {
+                    if __p.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
                         let __repr =
@@ -4319,7 +4315,7 @@ pub(crate) fn block_array_field(
 }
 
 /// Lower a **tuple with ≥1 `Foreign` element** `(A, Foreign<T>, ..)` to its
-/// [`FieldParts`]: POD elements packed inline, each foreign element a `ForeignRepr`,
+/// [`FieldParts`]: POD elements packed inline, each foreign element a `WidePtr`,
 /// all at cumulative payload offsets. Returns `Ok(None)` if the field isn't a tuple
 /// containing a `Foreign` (fall through to the POD-tuple / scalar path).
 pub(crate) fn foreign_tuple_field(
@@ -4437,7 +4433,7 @@ pub(crate) fn foreign_tuple_field(
         .enumerate()
         .map(|(i, e)| {
             if is_foreign[i] {
-                quote!(::bstack_raii::ForeignRepr)
+                quote!(::bstack_raii::WidePtr)
             } else {
                 quote!(#e)
             }
@@ -4455,7 +4451,7 @@ pub(crate) fn foreign_tuple_field(
     });
     parts.on_disk_fields.push(quote!(#fname: #wrapper,));
 
-    // Accessor: rebuild the tuple, mapping each `ForeignRepr` back to a `Foreign`.
+    // Accessor: rebuild the tuple, mapping each `WidePtr` back to a `Foreign`.
     // Each SELF element is resolved to this file's registered id before it escapes;
     // the `?` propagates to the accessor's `io::Result`.
     let acc_elems: Vec<TokenStream> = (0..n)
@@ -4464,7 +4460,7 @@ pub(crate) fn foreign_tuple_field(
             if is_foreign[i] {
                 let ft = ftargets[i].unwrap();
                 if nulls[i] {
-                    quote!(if __w.#ix.offset() == 0 {
+                    quote!(if __w.#ix.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
                         let __repr =
@@ -4508,7 +4504,7 @@ pub(crate) fn foreign_tuple_field(
                         ::core::option::Option::Some(__f) =>
                             ::bstack_raii::__private::home_relative_repr(
                                 __f.repr(), allocator.stack()),
-                        ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                        ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
                     })
                 } else {
                     quote!(::bstack_raii::__private::home_relative_repr(
@@ -4537,14 +4533,14 @@ pub(crate) fn foreign_tuple_field(
         let elem_drop = foreign_elem_drop(kind, ft);
         tup_drops.push(quote! {
             {
-                let __fp: ::bstack_raii::ForeignRepr = __w.#ix;
+                let __fp: ::bstack_raii::WidePtr = __w.#ix;
                 #elem_drop
             }
         });
         let elem_clone = foreign_elem_clone(kind, ft);
         tup_clones.push(quote! {
             {
-                let __fp: ::bstack_raii::ForeignRepr = __w.#ix;
+                let __fp: ::bstack_raii::WidePtr = __w.#ix;
                 #elem_clone
                 __w.#ix = __newfp;
             }
@@ -4578,7 +4574,7 @@ pub(crate) fn foreign_tuple_field(
             if is_foreign[i] {
                 let ft = ftargets[i].unwrap();
                 if nulls[i] {
-                    quote!(if #cap.#ix.offset() == 0 {
+                    quote!(if #cap.#ix.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
                         let __repr =
@@ -5471,7 +5467,7 @@ pub(crate) fn foreign_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option
     parts.payload_sizes.push(quote!(16usize));
     let fty = quote!(::bstack_raii::Foreign<'__e, #ftarget>);
     let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-        ::bstack_raii::ForeignRepr,
+        ::bstack_raii::WidePtr,
     >(&__pl[..16]));
     // Resolve a stored SELF pointer to this file's registered id before it escapes,
     // so it can't be mis-stored into another file. `read` binds `allocator`,
@@ -5502,14 +5498,14 @@ pub(crate) fn foreign_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option
         let elem_drop = foreign_elem_drop(kind, ftarget);
         parts.drop_arms.push(quote! {
             #disc => {
-                let __fp: ::bstack_raii::ForeignRepr = #read_fp;
+                let __fp: ::bstack_raii::WidePtr = #read_fp;
                 #elem_drop
             }
         });
         let elem_clone = foreign_elem_clone(kind, ftarget);
         parts.clone_arms.push(quote! {
             #disc => {
-                let __fp: ::bstack_raii::ForeignRepr = #read_fp;
+                let __fp: ::bstack_raii::WidePtr = #read_fp;
                 #elem_clone
                 __pl[..16].copy_from_slice(
                     ::bstack_raii::bytemuck::bytes_of(&__newfp));
@@ -5626,7 +5622,7 @@ pub(crate) fn foreign_tuple_variant(
                             ::bstack_raii::__private::home_relative_repr(
                                 __x.repr(), allocator.stack()),
                         ::core::option::Option::None =>
-                            ::bstack_raii::ForeignRepr::new(0, 0),
+                            ::bstack_raii::WidePtr::NULL,
                     })
                 } else {
                     quote!(::bstack_raii::__private::home_relative_repr(
@@ -5660,12 +5656,12 @@ pub(crate) fn foreign_tuple_variant(
                 if is_foreign[i] {
                     let ft = ftargets[i].unwrap();
                     let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                        ::bstack_raii::ForeignRepr,
+                                        ::bstack_raii::WidePtr,
                                     >(&__pl[(#off)..(#off) + 16]));
                     if nulls[i] {
                         quote!({
                             let __p = #fp;
-                            if __p.offset() == 0 {
+                            if __p.offset().get() == 0 {
                                 ::core::option::Option::None
                             } else {
                                 let __repr =
@@ -5709,14 +5705,14 @@ pub(crate) fn foreign_tuple_variant(
             let off = &offsets[i];
             let ft = ftargets[i].unwrap();
             let read_fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                ::bstack_raii::ForeignRepr,
+                                ::bstack_raii::WidePtr,
                             >(&__pl[(#off)..(#off) + 16]));
             let ed = foreign_elem_drop(kind, ft);
-            drops.push(quote! { { let __fp: ::bstack_raii::ForeignRepr = #read_fp; #ed } });
+            drops.push(quote! { { let __fp: ::bstack_raii::WidePtr = #read_fp; #ed } });
             let ec = foreign_elem_clone(kind, ft);
             clones.push(quote! {
                 {
-                    let __fp: ::bstack_raii::ForeignRepr = #read_fp;
+                    let __fp: ::bstack_raii::WidePtr = #read_fp;
                     #ec
                     __pl[(#off)..(#off) + 16].copy_from_slice(
                         ::bstack_raii::bytemuck::bytes_of(&__newfp));
@@ -5796,7 +5792,7 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
                 quote!(match #leaf {
                     ::core::option::Option::Some(__f) => __f.repr(),
                     ::core::option::Option::None =>
-                        ::bstack_raii::ForeignRepr::new(0, 0),
+                        ::bstack_raii::WidePtr::NULL,
                 })
             } else {
                 quote!(#leaf.repr())
@@ -5813,18 +5809,18 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
             }
         });
 
-        // read / move: reshape `[ForeignRepr; TOTAL]` → nested handles.
+        // read / move: reshape `[WidePtr; TOTAL]` → nested handles.
         // SAFETY: each repr was stored into this file; the returned
         // `Foreign`s are lifetime-bound by the read (`'__e`) / move
         // (`'__mv`) signature via the variant type.
         let leaf_read = |k: &Ident| {
             let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
-                                ::bstack_raii::ForeignRepr,
+                                ::bstack_raii::WidePtr,
                             >(&__pl[(#k) * 16..(#k) * 16 + 16]));
             if elem_nullable {
                 quote!({
                     let __p = #fp;
-                    if __p.offset() == 0 {
+                    if __p.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
                         ::core::option::Option::Some(
@@ -5851,7 +5847,7 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
                 #disc => {
                     for __k in 0usize..(#total) {
                         let __fp = ::bstack_raii::bytemuck::pod_read_unaligned::<
-                            ::bstack_raii::ForeignRepr,
+                            ::bstack_raii::WidePtr,
                         >(&__pl[__k * 16..__k * 16 + 16]);
                         #elem_drop
                     }
@@ -5862,7 +5858,7 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
                 #disc => {
                     for __k in 0usize..(#total) {
                         let __fp = ::bstack_raii::bytemuck::pod_read_unaligned::<
-                            ::bstack_raii::ForeignRepr,
+                            ::bstack_raii::WidePtr,
                         >(&__pl[__k * 16..__k * 16 + 16]);
                         #elem_clone
                         __pl[__k * 16..__k * 16 + 16].copy_from_slice(
@@ -6350,7 +6346,7 @@ pub(crate) fn vec_variant(
         reject_bad_foreign_target(ftarget, ty, "a `Foreign` vec variant")?;
         parts.has_foreign = true;
         let elem_nullable = option_inner(velem).is_some();
-        let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::ForeignRepr, __A>);
+        let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::WidePtr, __A>);
         // Variant type uses the enum's `'__e`; the move local uses `'__mv`
         // (the move borrow), since `'__e` is not in scope in `bstack_move`.
         let fty = if elem_nullable {
@@ -6366,20 +6362,20 @@ pub(crate) fn vec_variant(
         // SAFETY: each repr was stored into this file; the returned
         // `Foreign`s are lifetime-bound by the read / move signature.
         let from_ptr = if elem_nullable {
-            quote!(|__p: ::bstack_raii::ForeignRepr| if __p.offset() == 0 {
+            quote!(|__p: ::bstack_raii::WidePtr| if __p.offset().get() == 0 {
                 ::core::option::Option::None
             } else {
                 ::core::option::Option::Some(
                     unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
             })
         } else {
-            quote!(|__p: ::bstack_raii::ForeignRepr|
+            quote!(|__p: ::bstack_raii::WidePtr|
                                 unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
         };
         let to_ptr = if elem_nullable {
             quote!(|__f: #fty| match __f {
                 ::core::option::Option::Some(__ff) => __ff.repr(),
-                ::core::option::Option::None => ::bstack_raii::ForeignRepr::new(0, 0),
+                ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             })
         } else {
             quote!(|__f: #fty| __f.repr())
@@ -6392,7 +6388,7 @@ pub(crate) fn vec_variant(
             .push(quote!(#vname(::std::vec::Vec<#fty>),));
         parts.new_arms.push(quote! {
             #data::#vname(__list) => {
-                let __ptrs: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
+                let __ptrs: ::std::vec::Vec<::bstack_raii::WidePtr> =
                     __list.into_iter().map(#to_ptr).collect();
                 let __desc = #store::from_slice(allocator, &__ptrs)?.descriptor();
                 let mut __pl = [0u8; #payload_const];
@@ -6435,7 +6431,7 @@ pub(crate) fn vec_variant(
         parts.clone_arms.push(quote! {
             #disc => {
                 let __src = unsafe { #store::from_desc(#read_desc, allocator) }.to_vec()?;
-                let mut __new: ::std::vec::Vec<::bstack_raii::ForeignRepr> =
+                let mut __new: ::std::vec::Vec<::bstack_raii::WidePtr> =
                     ::std::vec::Vec::with_capacity(__src.len());
                 for __fp in __src {
                     #elem_clone

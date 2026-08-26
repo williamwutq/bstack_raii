@@ -1,7 +1,7 @@
 //! The orthogonal **components of the crate's wide pointer**.
 //!
-//! A persisted cross-file reference is a fat pointer — on disk today the 16-byte
-//! [`ForeignRepr`](crate::ForeignRepr) `{ file_id: u32, type_index: u32, offset: u64 }`.
+//! A persisted cross-file reference is a fat pointer — on disk the 16-byte
+//! [`WidePtr`] `{ file_id: u32, type_index: u32, offset: u64 }`.
 //! Those three words are not one indivisible blob: each is an independent value with
 //! its own **niche** and its own rules, and only the file-id half was ever modelled
 //! as a real type ([`FileId`]). The rest travelled as bare `u32` / `u64`, so their
