@@ -57,8 +57,6 @@
 // `::bstack_raii::…` even from within the crate's own tests.
 extern crate self as bstack_raii;
 
-mod bulk;
-mod cast;
 mod clone;
 mod construct;
 mod foreign;
@@ -85,15 +83,16 @@ mod tests;
 pub use types::block::{BStackBlock, BStackCast};
 pub use types::r#move::{BStackMove, BStackMoveExpr};
 pub use types::rc::{BStackShared, BStackWeakable};
-pub use bulk::FreeManyError;
-pub use cast::CastError;
-pub use cast::{BStackCastAs, BStackCastInto};
+pub use io_core::bulk::FreeManyError;
+pub use types::cast::CastError;
+pub use types::cast::{BStackCastAs, BStackCastInto};
 /// Codegen plumbing, re-exported for `#[bstack_block]`-generated code only. It is
 /// named in [`BStackBlock`]'s (hidden) trait-method signatures, so the type must
 /// stay `pub`; the supported way to clone is [`TryClone`] / [`TryCloneIn`].
 #[doc(hidden)]
 pub use clone::ClonePlan;
-pub use clone::{TryClone, TryCloneIn};
+pub use clone::TryCloneIn;
+pub use primitives::TryClone;
 pub use construct::ConstructError;
 pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
 /// The inert on-disk **wire** form of a [`Foreign`] pointer — the composed

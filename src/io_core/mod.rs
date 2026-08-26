@@ -2,6 +2,9 @@
 //! mechanism over `bstack` files that sit *below* the object model — as opposed to
 //! [`crate::types`], which holds the semantic vocabulary these drive.
 //!
+//! * [`bulk`] — sequential / atomic-bulk fallbacks behind the allocator's
+//!   `alloc_many` / `free_many`, and the [`FreeManyError`](bulk::FreeManyError)
+//!   they hand back.
 //! * [`refcount`] — atomic on-disk `u64` counter ops.
 //! * [`wal`] — the write-ahead log for atomic multi-slice transactions.
 //! * [`teardown`] — the recursive block-teardown mechanism (`dealloc_range`, the
@@ -10,6 +13,7 @@
 //!   resolving cross-file (`Foreign<T>`) pointers. Re-exported publicly as
 //!   `crate::registry`.
 
+pub(crate) mod bulk;
 pub(crate) mod refcount;
 pub mod registry;
 pub(crate) mod teardown;

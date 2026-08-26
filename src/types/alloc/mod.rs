@@ -84,7 +84,7 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     /// allocator's own machinery. Ordinary trait dispatch picks the override at
     /// monomorphization, so compound ops generic over `A` get the fast path for free.
     fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
-        crate::bulk::seq_alloc_many(self, sizes)
+        crate::io_core::bulk::seq_alloc_many(self, sizes)
     }
 
     /// Free every range in `ranges`. The default is a **sequential** fallback
@@ -109,7 +109,7 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
         &self,
         ranges: impl IntoIterator<Item = BStackRange>,
     ) -> io::Result<()> {
-        crate::bulk::seq_free_many(self, ranges)
+        crate::io_core::bulk::seq_free_many(self, ranges)
     }
 
     /// Whether this allocator provides **atomic, self-recovering** bulk
@@ -150,7 +150,7 @@ impl<A: BStackRaiiAllocator + Send + Sync> SyncBStackRaiiAllocator for A {}
 // `bstack` ships is the glue between the two crates, so it lives here beside the
 // trait it implements. Each asserts the null niche and a stable WAL anchor; the
 // bulk-capable ones route the multi-block methods through the atomic bulk ops via
-// `bulk_raii_methods!` (which calls the helpers in [`crate::bulk`]).
+// `bulk_raii_methods!` (which calls the helpers in [`crate::io_core::bulk`]).
 
 /// Emit the three `BStackRaiiAllocator` bulk overrides — `alloc_many` / `free_many`
 /// routed through the atomic bulk ops, and `atomic_bulk` returning `true` — for a
@@ -164,13 +164,13 @@ macro_rules! bulk_raii_methods {
             &self,
             sizes: &[u64],
         ) -> ::std::io::Result<::std::vec::Vec<::bstack::BStackRange>> {
-            crate::bulk::bulk_alloc_many(self, sizes)
+            crate::io_core::bulk::bulk_alloc_many(self, sizes)
         }
         unsafe fn free_many(
             &self,
             ranges: impl ::core::iter::IntoIterator<Item = ::bstack::BStackRange>,
         ) -> ::std::io::Result<()> {
-            crate::bulk::bulk_free_many(self, ranges)
+            crate::io_core::bulk::bulk_free_many(self, ranges)
         }
         fn atomic_bulk(&self) -> bool {
             true

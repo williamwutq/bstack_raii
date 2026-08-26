@@ -2,9 +2,9 @@
 //!
 //! Two flavours, split by what the duplication needs:
 //!
-//! * [`TryClone`] — a same-type clone that needs **no allocator**. Implemented by
-//!   [`crate::BStackRc`] / [`crate::BStackWeak`], whose clone only bumps an
-//!   on-disk refcount (they carry their own allocator).
+//! * [`TryClone`](crate::TryClone) — a same-type clone that needs **no allocator**.
+//!   Implemented by [`crate::BStackRc`] / [`crate::BStackWeak`], whose clone only
+//!   bumps an on-disk refcount (they carry their own allocator).
 //! * [`TryCloneIn`] — a **deep** clone of a whole block, producing a fresh
 //!   independent [`BStackOwned`] copy. A without-allocator block handle
 //!   (`X(BStackRange)`) has no allocator to allocate the copy with, so the
@@ -63,28 +63,6 @@ use crate::io_core::wal::{
     wal_capacity_of, wal_set_idle,
 };
 
-/// Duplicate `self`, performing any fallible I/O the duplication requires,
-/// **without** needing an allocator.
-///
-/// This is how a **shared** block is cloned: [`crate::BStackRc`] and
-/// [`crate::BStackWeak`] implement it by bumping an on-disk refcount and handing
-/// back another handle to the *same* block — exactly like `Rc::clone` /
-/// `shared_ptr` copy in Rust / C++. A shared block is deliberately **not**
-/// deep-copied into an independent [`BStackOwned`] via [`TryCloneIn`]; sharing,
-/// not copying, is its defining semantics.
-///
-/// This matters most for the **weak** case: there is no coherent deep copy of a
-/// weak reference. A weak reference observes a live object's *control block*; a
-/// "deep copy" would have to either point at the same live object (in which case
-/// it is just another weak handle — a count bump, which is what this does) or at
-/// some fresh object (in which case it observes nothing the original observed, so
-/// it is not a copy at all). So `BStackWeak::try_clone` bumps the weak count and
-/// returns another weak handle to the same control block — the only sound
-/// meaning a weak clone can have.
-pub trait TryClone: Sized {
-    fn try_clone(&self) -> io::Result<Self>;
-}
-
 /// Deep-clone a whole block into a fresh, independent [`BStackOwned`] copy,
 /// allocating the copy with the supplied allocator.
 ///
@@ -94,11 +72,11 @@ pub trait TryClone: Sized {
 /// fields are byte-copied.
 ///
 /// A **shared** (`rc` / `rc, weak`) block does *not* implement this — its clone
-/// is a handle duplication (a refcount bump) via [`TryClone`], not a deep copy,
-/// so `try_clone_in` on such a block is a compile error that points you at
-/// `BStackRc::try_clone` / `BStackWeak::try_clone` instead. See [`TryClone`] for
-/// why (in particular, why a weak reference can only ever be cloned as another
-/// weak reference).
+/// is a handle duplication (a refcount bump) via [`TryClone`](crate::TryClone), not
+/// a deep copy, so `try_clone_in` on such a block is a compile error that points you
+/// at `BStackRc::try_clone` / `BStackWeak::try_clone` instead. See
+/// [`TryClone`](crate::TryClone) for why (in particular, why a weak reference can
+/// only ever be cloned as another weak reference).
 pub trait TryCloneIn: BStackBlock + Sized {
     fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>>;
 }

@@ -5,6 +5,9 @@
 //!   and its object-safe cross-file projection ([`alloc::host`]).
 //! * [`block`] — the core block contracts [`BStackCast`](block::BStackCast) /
 //!   [`BStackBlock`](block::BStackBlock).
+//! * [`cast`] — typed ↔ untyped handle conversion behind `bstack_cast!`
+//!   ([`BStackCastInto`](cast::BStackCastInto) / [`BStackCastAs`](cast::BStackCastAs),
+//!   [`CastError`](cast::CastError)).
 //! * [`r#move`] — the `bstack_move!` contracts ([`BStackMove`](r#move::BStackMove),
 //!   [`BStackMoveExpr`](r#move::BStackMoveExpr)).
 //! * [`rc`] — the refcount capabilities ([`BStackShared`](rc::BStackShared),
@@ -18,6 +21,7 @@
 
 pub mod alloc;
 pub mod block;
+pub mod cast;
 pub mod drop;
 pub mod embed;
 pub mod r#move;
