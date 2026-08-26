@@ -716,10 +716,8 @@ impl<'a, T: BStackBlock> Iterator for DequeIter<'a, T> {
         // and turn it into a clean `InvalidData` error.
         match BStackDeque::<T>::read_meta(self.stack, self.block_off) {
             Ok((head, len, cap, data))
-                if data == self.data
-                    && cap == self.cap
-                    && head == self.head
-                    && len == self.len => {}
+                if data == self.data && cap == self.cap && head == self.head && len == self.len => {
+            }
             Ok(_) => {
                 self.pos = self.len;
                 return Some(Err(io::Error::new(

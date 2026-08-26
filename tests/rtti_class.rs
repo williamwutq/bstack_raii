@@ -359,7 +359,7 @@ fn bstack_class_static_class_variables() {
         Shape::Class {
             mutable: false,
             inner: Box::new(Shape::Pod { width: 4 }),
-            value: vec![7, 0, 0, 0],
+            value: vec![7u8, 0, 0, 0].into(),
         }
     );
 
@@ -370,7 +370,7 @@ fn bstack_class_static_class_variables() {
         Shape::Class {
             mutable: true,
             inner: Box::new(Shape::Pod { width: 8 }),
-            value: vec![0; 8],
+            value: vec![0u8; 8].into(),
         }
     );
 
@@ -1656,7 +1656,7 @@ fn bstack_class_foreign_container_shapes() {
     };
     assert_eq!(
         g[0].shape,
-        Shape::Tuple(vec![f.clone(), Shape::Pod { width: 4 }])
+        Shape::Tuple(vec![f.clone(), Shape::Pod { width: 4 }].into())
     );
 
     drop(reg);
@@ -1677,7 +1677,7 @@ fn bstack_class_pod_tuple_field() {
     };
     assert_eq!(
         g[0].shape,
-        Shape::Tuple(vec![Shape::Pod { width: 2 }, Shape::Pod { width: 1 }])
+        Shape::Tuple(vec![Shape::Pod { width: 2 }, Shape::Pod { width: 1 }].into())
     );
 
     let (home, hpath) = data_alloc("ptup_home");
@@ -1881,20 +1881,23 @@ fn interpret_foreign_array_across_files() {
     let moved = unsafe { reg.move_out(&home, ord, off) }.unwrap();
     assert_eq!(
         moved["links"],
-        Moved::ForeignList(vec![
-            ForeignPtr {
-                tag: pt,
-                kind: ForeignKind::Owned,
-                file_id: fid.get() as u64,
-                offset: o0,
-            },
-            ForeignPtr {
-                tag: pt,
-                kind: ForeignKind::Owned,
-                file_id: fid.get() as u64,
-                offset: o1,
-            },
-        ])
+        Moved::ForeignList(
+            vec![
+                ForeignPtr {
+                    tag: pt,
+                    kind: ForeignKind::Owned,
+                    file_id: fid.get() as u64,
+                    offset: o0,
+                },
+                ForeignPtr {
+                    tag: pt,
+                    kind: ForeignKind::Owned,
+                    file_id: fid.get() as u64,
+                    offset: o1,
+                },
+            ]
+            .into()
+        )
     );
 
     registry::detach(fid);
@@ -2658,7 +2661,9 @@ fn sync_rejects_layout_change() {
     let mut reg = rtti::RttiRegistry::open(&schema).unwrap();
     let mut fake = real.clone();
     if let RttiBody::Struct(fields) = &mut fake.body {
-        fields.pop();
+        let mut v = fields.to_vec();
+        v.pop();
+        *fields = v.into();
     }
     fake.ondisk_size -= 4;
     assert_ne!(fake, real);

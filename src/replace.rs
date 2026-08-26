@@ -1,12 +1,12 @@
 //! [`ReplaceError<V>`]: the error a generated `replace_<field>` mutator returns.
 
-use std::error::Error;
 use std::fmt;
 use std::io;
 
 use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
+use crate::handback::impl_source_error;
 use crate::teardown::{AutoDrop, BStackDrop};
 
 /// Resolve a consuming operation that guarded its input in an [`AutoDrop`]:
@@ -154,14 +154,4 @@ impl<V> fmt::Debug for ReplaceError<V> {
     }
 }
 
-impl<V> fmt::Display for ReplaceError<V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.source, f)
-    }
-}
-
-impl<V> Error for ReplaceError<V> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
-    }
-}
+impl_source_error!(ReplaceError<V>);

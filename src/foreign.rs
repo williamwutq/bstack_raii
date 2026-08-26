@@ -89,6 +89,7 @@ impl ForeignRepr {
             offset,
         }
     }
+    // NOTE: we should change file_id to u32
     /// The file-id word, widened to `u64` for the callers that compare it as one.
     pub const fn file_id(self) -> u64 {
         self.file_id as u64
@@ -141,6 +142,7 @@ pub fn resolve_self_repr(repr: ForeignRepr, home: &BStack) -> io::Result<Foreign
         Some(id) => {
             Ok(ForeignRepr::new(id.as_u64(), repr.offset()).with_type_index(repr.type_index()))
         }
+        // NOTE: This does not resolve completely, will this be an issue downstream the call stack?
         // Unregistered home: no id to resolve against. A safe SELF can't reach here
         // (its minting required registration); leave an unsafe-minted one as-is.
         None => Ok(repr),
@@ -166,6 +168,24 @@ pub fn home_relative_repr(repr: ForeignRepr, home: &BStack) -> ForeignRepr {
     repr
 }
 
+/// Read a [`ForeignRepr`] at `off` — `{ file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }`
+/// — returning `(file_id, offset)`. (`type_index` = the target's RTTI ordinal + 1; the
+/// RTTI interpreter resolves the target type from the field's shape tag instead.)
+pub(crate) fn read_foreign_repr(data: &BStack, off: u64) -> io::Result<(u64, u64)> {
+    let mut b = [0u8; core::mem::size_of::<ForeignRepr>()];
+    data.get_into(off, &mut b)?;
+    Ok(decode_foreign_repr(&b))
+}
+
+/// Decode a raw 16-byte [`ForeignRepr`] into `(file_id, offset)` — the in-memory
+/// counterpart of [`read_foreign_repr`], used on the bytes an atomic `swap` hands
+/// back. `b` must be at least `size_of::<ForeignRepr>()` bytes.
+pub(crate) fn decode_foreign_repr(b: &[u8]) -> (u64, u64) {
+    let file_id = u32::from_le_bytes(b[0..4].try_into().unwrap()) as u64;
+    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    (file_id, offset)
+}
+
 /// The in-memory form of a cross-file pointer: a single 16-byte record keyed on
 /// `file_id`, mirroring the on-disk [`ForeignRepr`] one-to-one.
 ///
@@ -188,6 +208,8 @@ pub fn home_relative_repr(repr: ForeignRepr, home: &BStack) -> ForeignRepr {
 /// [`ForeignRepr`]-sized (16 bytes), `type_index` and all.
 #[derive(Clone, Copy)]
 pub(crate) struct FilePtr<'a> {
+    // NOTE: we might just want to use ForeignRepr here instead of recreating
+    // The structure of a foreign pointer
     /// The target file: `0` = [`FileId::SELF`], else an explicit [`FileId`] (`u32`).
     file_id: u32,
     /// The target's RTTI type ordinal + 1 (`0` = untyped, recovered from the block
@@ -380,6 +402,8 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     /// resolvable); `None` otherwise. Does no I/O — pair the ref with the target
     /// file's stack (e.g. via [`with`](Self::with)) to read it.
     pub fn into_local(self) -> Option<BStackRef<T>> {
+        // NOTE: This is essentially the same logic ForeignRepr, maybe we can merge them
+        // But if this is not possible, just leave it
         let resolvable = if self.inner.is_self() {
             true
         } else {
@@ -395,6 +419,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     /// Like [`with`](Self::with) but against an explicit `registry` — crate-internal,
     /// for tests (the global is a one-shot `OnceLock`, awkward to exercise in unit
     /// tests). Production code uses [`with`](Self::with) against the sole registry.
+    /// This may seems like it's code duplication but it's for testing purposes
     #[cfg(test)]
     pub(crate) fn with_in<A, R>(
         self,
@@ -439,12 +464,10 @@ impl<T: BStackBlock + 'static> Foreign<'static, T> {
     /// owning teardown / deep clone then frees or copies **that offset in the wrong
     /// file**, corrupting an unrelated block from otherwise-safe code.
     ///
-    /// (This is the same unverifiable promise that makes [`Foreign::new`](Self::new)
-    /// `unsafe`; an earlier revision made `at` safe, which was unsound — issue
-    /// NEW-20260818-F1.) For a **safe** pointer to a local block, use
-    /// [`from_local`](Self::from_local) / `bstack_cast!(slice as Foreign<T>)`, which
-    /// resolves the block's file to its registered [`FileId`] through the registry — an
-    /// *explicit* id that routes correctly no matter where the pointer is later stored.
+    /// For a **safe** pointer to a local block, use [`from_local`](Self::from_local) /
+    /// `bstack_cast!(slice as Foreign<T>)`, which resolves the block's file to its
+    /// registered [`FileId`] through the registry — an *explicit* id that routes correctly
+    /// no matter where the pointer is later stored.
     pub unsafe fn at(target: &T) -> Self {
         // SAFETY: the caller upholds that this `SELF` pointer stays in `target`'s home
         // file; `target` is a live `T` handle, so its start names a valid `T` there.
@@ -510,29 +533,44 @@ impl<'a, T: 'static> ForeignOwned<'a, T> {
     }
 }
 
-impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
-    /// Deep-free the owned target in its own file (`SELF` ⇒ `home`, else registry).
-    pub fn bstack_drop<A: BStackRaiiAllocator>(self, home: &A) -> io::Result<()> {
-        let repr = self.ptr.repr();
+/// Run a `Foreign` reference's per-kind teardown against **the file its target
+/// lives in**, selected by the pointer's `file_id`: `home` for a `SELF` pointer
+/// (`fid == 0`), else the [`ForeignHostAllocator`](registry::ForeignHostAllocator)
+/// of the registered file `fid` names. A null pointer (`offset == 0`), a detached
+/// target file, or a malformed id are each a permitted leak (`Ok(())`), never a
+/// panic. `$drop` is the kind's `foreign_drop_{owned,strong,weak}` helper.
+///
+/// # Safety
+/// `$repr` must be the reference held by `self` (transferred in by `from_foreign`),
+/// consumed exactly once — so `$drop` accounts for exactly the one reference the
+/// caller held, in the target's own file.
+macro_rules! foreign_dispatch_drop {
+    ($repr:expr, $home:expr, $drop:path) => {{
+        let repr = $repr;
         let off = repr.offset();
         if off == 0 {
-            return Ok(());
-        }
-        let fid = repr.file_id();
-        if fid == 0 {
-            // SAFETY: sole owner (`from_foreign` contract); `SELF` ⇒ the home file.
-            unsafe { foreign_drop_owned::<T, A>(home, off) }
-        } else if let Some(id) = FileId::from_u64(fid) {
+            Ok(())
+        } else if repr.file_id() == 0 {
+            // `SELF` ⇒ the home file.
+            unsafe { $drop($home, off) }
+        } else if let Some(id) = FileId::from_u64(repr.file_id()) {
             if let Some(host) = registry::host_arc(id) {
                 let adapter = registry::ForeignHostAllocator::new(host, id);
-                // SAFETY: sole owner; the adapter addresses the target's own file.
-                unsafe { foreign_drop_owned::<T, _>(&adapter, off) }
+                unsafe { $drop(&adapter, off) }
             } else {
                 Ok(()) // target file detached ⇒ leak (permitted)
             }
         } else {
             Ok(()) // malformed id ⇒ unreachable target ⇒ leak
         }
+    }};
+}
+
+impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
+    /// Deep-free the owned target in its own file (`SELF` ⇒ `home`, else registry).
+    pub fn bstack_drop<A: BStackRaiiAllocator>(self, home: &A) -> io::Result<()> {
+        // SAFETY: sole owner (`from_foreign` contract), consumed here exactly once.
+        foreign_dispatch_drop!(self.ptr.repr(), home, foreign_drop_owned::<T, _>)
     }
 
     /// Read the target — convenience for `self.as_foreign().with(local, f)`.
@@ -562,6 +600,7 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
         target: &'t A,
     ) -> io::Result<BStackOwned<T>> {
         let fid = self.ptr.repr().file_id();
+        // NOTE: see previous note
         if fid != 0 {
             // Resolve `target`'s identity: its adapter-declared id (a
             // `ForeignHostAllocator`), or the registry's reverse map for a plain
@@ -619,26 +658,8 @@ impl<'a, T: BStackShared + 'static> ForeignRc<'a, T> {
     /// Decrement the target's strong count in its own file (`SELF` ⇒ `home`, else
     /// registry); the target is freed when the count reaches zero.
     pub fn bstack_drop<A: BStackRaiiAllocator>(self, home: &A) -> io::Result<()> {
-        let repr = self.ptr.repr();
-        let off = repr.offset();
-        if off == 0 {
-            return Ok(());
-        }
-        let fid = repr.file_id();
-        if fid == 0 {
-            // SAFETY: one strong ref (`from_foreign` contract); `SELF` ⇒ the home file.
-            unsafe { foreign_drop_strong::<T, A>(home, off) }
-        } else if let Some(id) = FileId::from_u64(fid) {
-            if let Some(host) = registry::host_arc(id) {
-                let adapter = registry::ForeignHostAllocator::new(host, id);
-                // SAFETY: one strong ref; the adapter addresses the target's own file.
-                unsafe { foreign_drop_strong::<T, _>(&adapter, off) }
-            } else {
-                Ok(()) // target file detached ⇒ leak (permitted)
-            }
-        } else {
-            Ok(()) // malformed id ⇒ unreachable target ⇒ leak
-        }
+        // SAFETY: one strong ref (`from_foreign` contract), consumed here exactly once.
+        foreign_dispatch_drop!(self.ptr.repr(), home, foreign_drop_strong::<T, _>)
     }
 
     /// Read the target — convenience for `self.as_foreign().with(local, f)`.
@@ -702,26 +723,8 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
     /// Decrement the target's weak count in its own file (`SELF` ⇒ `home`, else
     /// registry).
     pub fn bstack_drop<A: BStackRaiiAllocator>(self, home: &A) -> io::Result<()> {
-        let repr = self.ptr.repr();
-        let off = repr.offset();
-        if off == 0 {
-            return Ok(());
-        }
-        let fid = repr.file_id();
-        if fid == 0 {
-            // SAFETY: one weak ref (`from_foreign` contract); `SELF` ⇒ the home file.
-            unsafe { foreign_drop_weak::<T, A>(home, off) }
-        } else if let Some(id) = FileId::from_u64(fid) {
-            if let Some(host) = registry::host_arc(id) {
-                let adapter = registry::ForeignHostAllocator::new(host, id);
-                // SAFETY: one weak ref; the adapter addresses the target's own file.
-                unsafe { foreign_drop_weak::<T, _>(&adapter, off) }
-            } else {
-                Ok(()) // target file detached ⇒ leak (permitted)
-            }
-        } else {
-            Ok(()) // malformed id ⇒ unreachable target ⇒ leak
-        }
+        // SAFETY: one weak ref (`from_foreign` contract), consumed here exactly once.
+        foreign_dispatch_drop!(self.ptr.repr(), home, foreign_drop_weak::<T, _>)
     }
 
     /// Resolve to a live [`BStackWeak<T>`](crate::BStackWeak) bound to `target` — the
@@ -744,6 +747,7 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
     }
 }
 
+// NOTE: the below probably should not be free functions
 // ---------------------------------------------------------------------------
 // Cross-file teardown helpers.
 //

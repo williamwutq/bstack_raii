@@ -9,12 +9,12 @@
 //! refcount / control machinery at the fixed offsets from [`crate::layout`].
 
 use core::mem::size_of;
-use std::error::Error;
 use std::fmt;
 use std::io;
 
 use crate::BStackRaiiAllocator;
-use bstack::{BStack, BStackRange};
+use crate::handback::impl_source_error;
+use bstack::BStackRange;
 
 use crate::block::BStackWeakable;
 use crate::handle::WeakRef;
@@ -131,24 +131,7 @@ impl<F> fmt::Debug for ConstructError<F> {
     }
 }
 
-impl<F> fmt::Display for ConstructError<F> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.source, f)
-    }
-}
-
-impl<F> Error for ConstructError<F> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-#[inline(always)]
-fn read_u64_at(stack: &BStack, off: u64) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    stack.get_into(off, &mut buf)?;
-    Ok(layout::get_u64(&buf))
-}
+impl_source_error!(ConstructError<F>);
 
 /// Allocate a `size`-byte block and stamp its `BlockHeader { size, tag }`.
 ///
@@ -167,7 +150,7 @@ pub(crate) fn alloc_block<A: BStackRaiiAllocator>(
 ) -> io::Result<BStackRange> {
     let mut slice = allocator.alloc(size)?;
     let header = BlockHeader { size, tag };
-    if let Err(e) = slice.write_range(0, bytemuck::bytes_of(&header)) {
+    if let Err(e) = slice.write(bytemuck::bytes_of(&header)) {
         let _ = allocator.dealloc(slice);
         return Err(e);
     }
@@ -184,6 +167,7 @@ pub(crate) fn alloc_block<A: BStackRaiiAllocator>(
 /// [`bstack::BStack::set_batched`] — so a `(rc, weak)` block is created atomically,
 /// with no separate back-pointer write and no transient half-wired state.
 pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u64) -> Vec<u8> {
+    // NOTE: control_size probably have an upper bound, so no need for vec here
     let mut payload = vec![0u8; control_size as usize];
     let header = BlockHeader {
         size: control_size,
@@ -300,7 +284,7 @@ pub unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllocator>(
     // owned here, so nothing else keeps that block alive.
     let lock = crate::wal::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let off = read_u64_at(allocator.stack(), field_off)?;
+    let off = layout::read_u64_at(allocator.stack(), field_off)?;
     if off == 0 {
         return Ok(None);
     }

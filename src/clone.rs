@@ -182,6 +182,7 @@ impl ClonePlan {
     pub fn new() -> Self {
         ClonePlan {
             mode: Mode::Direct,
+            // NOTE: We have a clone plan, maybe we want with capacity 4
             allocated: Vec::new(),
             sizes: Vec::new(),
             cursor: 0,
@@ -237,6 +238,8 @@ impl ClonePlan {
             Mode::Measure => {
                 self.sizes.push(size);
                 let off = self.fake_next;
+                // NOTE: in theory, saturating_add will make some fake)next return the same thing
+                // for very large numbers. This could be a concern but could not
                 self.fake_next = self.fake_next.saturating_add(size.max(1));
                 Ok(BStackRange::new(off, size))
             }
@@ -265,6 +268,7 @@ impl ClonePlan {
             }
             // Single pass: allocate eagerly and log it intention-first, keeping the
             // allocation and its WAL entry in lockstep with `allocated`.
+            // NOTE: Single path has way more leaks. Is it still used?
             Mode::Direct => {
                 let slice = allocator.alloc(size)?;
                 let range = slice.as_range();
@@ -309,6 +313,7 @@ impl ClonePlan {
                 Ok(())
             }
             Some(w) if w.logged < w.capacity => {
+                // The WAL has capacity to write, so we write
                 wal_append_alloc(allocator, w.block_off, w.logged, range)?;
                 w.logged += 1;
                 Ok(())
@@ -682,6 +687,7 @@ impl ClonePlan {
     /// `finish` does after a real crash; without one, free them directly. The WAL
     /// lock is held by the still-live `wal` in the caller, so the *locked* variant
     /// is used.
+    // NOTE: is this not just rollback?
     fn reclaim<A: BStackRaiiAllocator>(
         wal: &Option<CloneWal>,
         allocated: Vec<BStackRange>,
@@ -697,6 +703,8 @@ impl ClonePlan {
         }
     }
 
+    // NOTE: this looks like seq_free_many, which could be better, if it's not for
+    // its strange problems
     fn free_all<A: BStackRaiiAllocator>(allocated: Vec<BStackRange>, allocator: &A) {
         for r in allocated.into_iter().rev() {
             // SAFETY: each range was returned by our own `alloc_raw` and never

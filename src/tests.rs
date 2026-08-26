@@ -1140,16 +1140,13 @@ fn macro_cast() {
     // Owned upcast (macro) — a bare owned handle is wrapped (`auto`) to attach an
     // allocator first — then a wrong-type downcast hands the slice back.
     let slice = bstack_cast!(leaf.auto(&alloc) as BStackOwnedSlice);
-    let slice = match slice.cast_into::<MacroParent>().unwrap() {
+    let slice = match slice.cast_into::<MacroParent>() {
         Ok(_) => panic!("tag should not match"),
-        Err(s) => s,
+        Err(e) => e.into_slice(),
     };
 
     // Correct owned downcast (macro) round-trips to the typed (bare) handle.
-    let owned = bstack_cast!(slice as BStackOwned<MacroLeaf, _>)
-        .unwrap()
-        .ok()
-        .unwrap();
+    let owned = bstack_cast!(slice as BStackOwned<MacroLeaf, _>).unwrap();
     assert_eq!(owned.handle().get_val(stack).unwrap(), 9);
     owned.bstack_drop(&alloc).unwrap(); // frees the leaf
 }
@@ -2597,10 +2594,7 @@ fn macro_enum_cast() {
 
     // Owned upcast then downcast round-trips through BStackOwnedSlice.
     let owned_slice = bstack_cast!(node.auto(&alloc) as BStackOwnedSlice);
-    let back = bstack_cast!(owned_slice as BStackOwned<Node, _>)
-        .unwrap()
-        .ok()
-        .unwrap();
+    let back = bstack_cast!(owned_slice as BStackOwned<Node, _>).unwrap();
     assert!(matches!(
         back.handle().read(&alloc).unwrap(),
         NodeView::Num(7)
@@ -6557,7 +6551,11 @@ fn macro_enum_replace_hands_old_offset_back_when_recon_reads_fault() {
     // reconstructed as a typed handle …
     assert!(err.value.is_none());
     // … but the old strong child's block comes back raw, so it is recoverable.
-    assert_eq!(err.raw_old.len(), 1, "the old strong block must be handed back");
+    assert_eq!(
+        err.raw_old.len(),
+        1,
+        "the old strong block must be handed back"
+    );
     assert_eq!(err.raw_old[0].start(), a_data);
 
     // Recover the old child from the raw offset once I/O is healthy.

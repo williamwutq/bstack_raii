@@ -91,6 +91,12 @@ impl Error for FreeManyError {
     }
 }
 
+impl crate::handback::HandBack for FreeManyError {
+    fn io(&self) -> &io::Error {
+        &self.source
+    }
+}
+
 impl From<FreeManyError> for io::Error {
     fn from(e: FreeManyError) -> io::Error {
         io::Error::new(e.source.kind(), e)

@@ -44,7 +44,8 @@ use std::sync::{Arc, OnceLock};
 use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackRange};
 use parking_lot::RwLock;
 
-use crate::BStackRaiiAllocator;
+use crate::handback::impl_source_error;
+use crate::{BStackRaiiAllocator, get_u64};
 
 /// A small, stable identity for a registered bstack file.
 ///
@@ -76,6 +77,7 @@ impl FileId {
     /// touching the registry or its lock. Never assigned to a registered path.
     pub const SELF: FileId = FileId(0);
 
+    // NOTE: "Foreign" seems to have very much similar implementation for this
     /// Whether this is [`SELF`](Self::SELF) (the current file).
     pub const fn is_self(self) -> bool {
         self.0 == 0
@@ -102,6 +104,8 @@ impl FileId {
         self.0 as u64
     }
 
+    // NOTE: FileId handles values properly and has checks, while the parallel implementation
+    // in foreign might not. Please check
     /// Reconstruct a `FileId` from its on-disk `u64` form, rejecting values that
     /// do not fit the `u32` id space (corruption / a foreign id from a wider build).
     pub const fn from_u64(v: u64) -> Option<Self> {
@@ -111,16 +115,16 @@ impl FileId {
             None
         }
     }
-}
 
-/// Map a `FileId` to its index in the append-only path table, or `None` for
-/// [`SELF`](FileId::SELF) and reserved special ids (neither of which is a concrete
-/// registered file). Ordinary ids are 1-based, so the index is `id - 1`.
-fn table_index(id: FileId) -> Option<usize> {
-    if id.0 >= 1 && !id.is_special() {
-        Some((id.0 - 1) as usize)
-    } else {
-        None
+    /// This id's index into the registry's append-only path table, or `None` for
+    /// [`SELF`](Self::SELF) and reserved special ids (neither of which is a concrete
+    /// registered file). Ordinary ids are 1-based, so the index is `id - 1`.
+    pub(crate) const fn table_index(self) -> Option<usize> {
+        if self.0 >= 1 && !self.is_special() {
+            Some((self.0 - 1) as usize)
+        } else {
+            None
+        }
     }
 }
 
@@ -193,13 +197,7 @@ impl fmt::Debug for ForeignAllocError {
     }
 }
 
-impl fmt::Display for ForeignAllocError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.source, f)
-    }
-}
-
-impl std::error::Error for ForeignAllocError {}
+impl_source_error!(ForeignAllocError);
 
 /// An **object-safe, range-based** view of a live file's allocator — the
 /// type-erased handle a `Foreign<T>` uses to reach *into another file*.
@@ -441,16 +439,15 @@ impl RegistryStore {
 
     /// Load the append-only path table from the registry's bstack file into memory.
     fn load(stack: &BStack) -> io::Result<Vec<PathBuf>> {
-        let total = stack.len()? as usize;
+        let total = stack.len()?;
         if total == 0 {
             return Ok(Vec::new());
         }
-        let mut buf = vec![0u8; total];
-        stack.get_into(0, &mut buf)?;
+        let buf = stack.get(0, total)?;
         let mut paths = Vec::new();
         let mut cur = 0usize;
         while cur + 8 <= buf.len() {
-            let len = u64::from_le_bytes(buf[cur..cur + 8].try_into().unwrap()) as usize;
+            let len = get_u64(&buf[cur..]) as usize;
             cur += 8;
             // `checked_add`, not `cur + len > buf.len()`: a forged `len` near
             // `usize::MAX` would wrap that unchecked sum below `cur`, passing
@@ -573,7 +570,8 @@ impl<'h> FileRegistry<'h> {
         let id = self.register_path(path)?;
         let stack_key = core::ptr::from_ref(host.stack()) as usize;
         let mut g = self.inner.write();
-        let idx = (id.0 - 1) as usize; // register_path returns a 1-based id
+        // `register_path` returns a concrete, 1-based id, so it always has a table slot.
+        let idx = id.table_index().expect("register_path returns a concrete 1-based id");
         // One host may be live under only one id: attaching the same host under a
         // second path would alias it (`live[]` holding it twice while `by_stack`
         // can name only one id), leaving the reverse map inconsistent with the
@@ -581,7 +579,7 @@ impl<'h> FileRegistry<'h> {
         // case and falls through.
         if let Some(&prev) = g.by_stack.get(&stack_key)
             && prev != id
-            && table_index(prev).is_some_and(|p| g.live[p].is_some())
+            && prev.table_index().is_some_and(|p| g.live[p].is_some())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -605,7 +603,7 @@ impl<'h> FileRegistry<'h> {
     /// Takes the write lock, so it waits for any in-flight [`with_host`] op to
     /// finish and cannot run *during* one.
     pub fn detach(&self, id: FileId) {
-        let Some(idx) = table_index(id) else { return };
+        let Some(idx) = id.table_index() else { return };
         let mut g = self.inner.write();
         // Take the host out (this is the detach) and drop its reverse-map entry.
         let stack_key = g
@@ -636,7 +634,7 @@ impl<'h> FileRegistry<'h> {
     pub fn with_host<R>(&self, id: FileId, f: impl FnOnce(&dyn ForeignHost) -> R) -> Option<R> {
         // `SELF` / special ids name no registry entry, so return without ever taking
         // the lock — the caller resolves `SELF` against its own local allocator.
-        let idx = table_index(id)?;
+        let idx = id.table_index()?;
         let g = self.inner.read_recursive();
         let host = g.live.get(idx)?.as_ref()?;
         Some(f(&**host))
@@ -649,13 +647,13 @@ impl<'h> FileRegistry<'h> {
     /// the `'static` [`ForeignHostAllocator`], which needs to outlive the lock and
     /// survive a concurrent [`detach`](Self::detach) mid-teardown.
     pub fn host_arc(&self, id: FileId) -> Option<Arc<dyn ForeignHost + 'h>> {
-        let idx = table_index(id)?;
+        let idx = id.table_index()?;
         self.inner.read_recursive().live.get(idx)?.clone()
     }
 
     /// The path registered for `id`, if any (`None` for `SELF` / special ids).
     pub fn path_of(&self, id: FileId) -> Option<PathBuf> {
-        let idx = table_index(id)?;
+        let idx = id.table_index()?;
         self.inner.read().paths.get(idx).cloned()
     }
 
@@ -667,7 +665,7 @@ impl<'h> FileRegistry<'h> {
     /// Whether `id` currently has a live host attached (always `false` for `SELF` /
     /// special ids).
     pub fn is_live(&self, id: FileId) -> bool {
-        let Some(idx) = table_index(id) else {
+        let Some(idx) = id.table_index() else {
             return false;
         };
         self.inner.read().live.get(idx).is_some_and(Option::is_some)

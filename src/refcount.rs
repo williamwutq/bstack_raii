@@ -19,10 +19,12 @@ use std::io;
 use crate::layout::get_u64;
 use bstack::BStack;
 
+#[inline]
 fn overflow_err() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "refcount overflow")
 }
 
+#[inline]
 fn underflow_err() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "refcount underflow")
 }
@@ -30,6 +32,7 @@ fn underflow_err() -> io::Error {
 /// A counter offset near `u64::MAX` (so the fixed 8-byte counter range can't be
 /// formed) can only come from a corrupted/forged on-disk pointer — every caller
 /// derives `offset` from a stored back-pointer, `Foreign` target, or field value.
+#[inline]
 fn corrupt_offset_err() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "refcount offset overflow")
 }
@@ -37,12 +40,14 @@ fn corrupt_offset_err() -> io::Error {
 /// Compare-and-swap the counter at `offset`: set it to `new` iff it currently
 /// equals `expected`. Returns whether the swap happened. The atomic "try-unwrap"
 /// primitive behind [`crate::BStackRc::try_move`].
+#[inline(always)]
 pub fn cas(stack: &BStack, offset: u64, expected: u64, new: u64) -> io::Result<bool> {
     stack.cas(offset, expected.to_le_bytes(), new.to_le_bytes())
 }
 
 /// Load the current value of the counter at `offset` (little-endian). Read-only,
 /// so it takes only `get_into` (no lock upgrade, no write-back).
+#[inline(always)]
 pub fn load(stack: &BStack, offset: u64) -> io::Result<u64> {
     let mut bytes = [0u8; 8];
     stack.get_into(offset, &mut bytes)?;

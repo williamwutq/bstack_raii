@@ -920,9 +920,9 @@ use bstack_raii::{BStackCastAs, BStackCastInto};   // the cast methods
 let owned: BStackOwned<Node> = /* … */;
 let slice = bstack_cast!(owned.auto(&alloc) as BStackOwnedSlice);   // owned upcast
 
-match bstack_cast!(slice as BStackOwned<Node, _>)? {                // owned downcast
-    Ok(node)   => { /* tag matched */ }
-    Err(slice) => { /* tag mismatch — slice handed back */ }
+match bstack_cast!(slice as BStackOwned<Node, _>) {                 // owned downcast
+    Ok(node) => { /* tag matched */ }
+    Err(e)   => { let slice = e.into_slice(); /* not a Node — slice handed back */ }
 }
 
 let view = node.handle().as_slice(stack);                           // borrowed upcast

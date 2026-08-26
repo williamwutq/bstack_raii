@@ -170,7 +170,7 @@ pub fn expand_struct(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenS
             ondisk_size: ::core::mem::size_of::<#on_disk>() as u64,
             body: ::bstack_raii::rtti::RttiBody::Struct(::std::vec![
                 #(#rtti_fields),*
-            ]),
+            ].into()),
         }
     };
     let reg_ts = registration(name, rtti_type);
@@ -229,7 +229,7 @@ pub fn expand_enum(attr: TokenStream, input: ItemEnum) -> syn::Result<TokenStrea
                 payload_off: ::core::mem::offset_of!(#on_disk, __bstack_payload) as u16,
                 variants: ::std::vec![
                     #(#variant_toks),*
-                ],
+                ].into(),
             }),
         }
     };
@@ -312,7 +312,7 @@ fn enum_variant(variant: &syn::Variant, value: i128) -> syn::Result<TokenStream>
             disc_value: #disc,
             fields: ::std::vec![
                 #(#fields),*
-            ],
+            ].into(),
         }
     })
 }
@@ -354,7 +354,7 @@ fn class_field(name: &str, ty: &Type, mutable: bool, expr: &syn::Expr) -> TokenS
                 }),
                 value: {
                     let __v: #ty = #expr;
-                    ::bstack_raii::bytemuck::bytes_of(&__v).to_vec()
+                    ::bstack_raii::bytemuck::bytes_of(&__v).into()
                 },
             },
         }
@@ -586,7 +586,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
             elems.push(es);
         }
         return Ok(quote!(::bstack_raii::rtti::Shape::Tuple(
-            ::std::vec![#(#elems),*]
+            ::std::vec![#(#elems),*].into()
         )));
     }
     Ok(match kind {

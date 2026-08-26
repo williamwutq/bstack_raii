@@ -68,7 +68,8 @@ use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackCast};
-use crate::foreign::ForeignRepr;
+use crate::foreign::{ForeignRepr, decode_foreign_repr, read_foreign_repr};
+use crate::layout::read_u64_at;
 use crate::layout::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, EightCC,
     RC_REFCOUNT_OFFSET, get_u64,
@@ -119,15 +120,17 @@ mod shape_tag {
     pub const CLASS: u8 = 0x20;
 }
 
-#[inline]
-fn align8(n: u64) -> u64 {
-    (n + 7) & !7
-}
-
+// NOTE: The invalid data thing might be widely used even outside of RTTI. Check if my claim
+// is accurate, and if is, we may want to refactor this.
+#[inline(always)]
 fn corrupt(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+// NOTE: An interesting idea had came to my mind: what if we brand our u64 offsets?
+// Maybe a DiskOffset or something could make our code more maintainable
+// We can also make DiskOffset behave instead like NonZeroU64, due to the null niche
+// requirement that is generally applied in this crate
 /// Add two on-disk offsets/lengths, rejecting overflow. Every interpreter walk
 /// (`read_value` / `teardown` / `clone_value`) chains additions off a **root**
 /// offset that can be entirely attacker/caller-controlled (a forged pointer, or
@@ -198,6 +201,7 @@ macro_rules! rtti_path {
     };
 }
 
+// NOTE: for our types, check the consistency of the inclusion of "BStack"
 /// A **runtime-typed reference** — an `(EightCC, offset)` into a data file, the RTTI
 /// analog of `&dyn Any`. It bridges the interpreted world back to compiled-in types:
 /// [`downcast`](Self::downcast) hands back a real typed block handle when the
@@ -229,6 +233,7 @@ impl AnyRef {
     /// [`downcast`](Self::downcast) trusts the pair as given: a fabricated pair
     /// yields an owning handle over an arbitrary range, whose safe `bstack_drop`
     /// frees storage the caller does not own.
+    #[inline(always)]
     pub unsafe fn new(tag: EightCC, offset: u64) -> Self {
         Self { tag, offset }
     }
@@ -245,16 +250,19 @@ impl AnyRef {
     }
 
     /// The reference's RTTI type tag.
+    #[inline(always)]
     pub fn tag(&self) -> EightCC {
         self.tag
     }
 
     /// The reference's block offset.
+    #[inline(always)]
     pub fn offset(&self) -> u64 {
         self.offset
     }
 
     /// Whether this reference is of the compiled-in type `T` (eightcc match).
+    #[inline(always)]
     pub fn is<T: BStackBlock>(&self) -> bool {
         self.tag == <T as BStackCast>::eightcc()
     }
@@ -281,32 +289,42 @@ struct Writer {
 }
 
 impl Writer {
+    #[inline(always)]
     fn u8(&mut self, v: u8) {
         self.buf.push(v);
     }
+    #[inline(always)]
     fn u16(&mut self, v: u16) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    #[inline(always)]
     fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    #[inline(always)]
     fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    #[inline(always)]
     fn i64(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    #[inline(always)]
     fn eightcc(&mut self, v: EightCC) {
         self.buf.extend_from_slice(&v.0);
     }
+    #[inline(always)]
     fn bytes(&mut self, b: &[u8]) {
         self.buf.extend_from_slice(b);
     }
     /// Pad with zero bytes up to the next `a`-byte boundary (`a` a power of two).
+    ///
+    /// Requires `a` to be a power of 2
+    #[inline(always)]
     fn align(&mut self, a: usize) {
-        while !self.buf.len().is_multiple_of(a) {
-            self.buf.push(0);
-        }
+        let mask = a - 1;
+        let new_len = (self.buf.len() + mask) & !mask;
+        self.buf.resize(new_len, 0);
     }
 }
 
@@ -317,6 +335,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    #[inline(always)]
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
@@ -330,28 +349,36 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
+    #[inline(always)]
     fn u8(&mut self) -> io::Result<u8> {
         Ok(self.take(1)?[0])
     }
+    #[inline(always)]
     fn u16(&mut self) -> io::Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
+    #[inline(always)]
     fn u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
+    #[inline(always)]
     fn u64(&mut self) -> io::Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    #[inline(always)]
     fn i64(&mut self) -> io::Result<i64> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    #[inline(always)]
     fn eightcc(&mut self) -> io::Result<EightCC> {
         Ok(EightCC(self.take(8)?.try_into().unwrap()))
     }
+    #[inline]
     fn string(&mut self, n: usize) -> io::Result<String> {
         String::from_utf8(self.take(n)?.to_vec())
             .map_err(|_| corrupt("[BSTACK0802] RTTI name is not valid UTF-8"))
     }
+    #[inline(always)]
     /// Skip zero-padding up to the next `a`-byte boundary.
     fn align(&mut self, a: usize) -> io::Result<()> {
         let aligned = (self.pos + a - 1) & !(a - 1);
@@ -365,6 +392,9 @@ impl<'a> Reader<'a> {
 
 // -- Parsed, in-memory schema (structure only) -----------------------------
 
+// NOTE: important: The four kind, `owned` / `strong` / `weak` / `ref` is used almost
+// universally in this crate, so we may want to create ownership.rs that provide this
+// as a OwnershipKind enum instead of putting it here in RTTI
 /// The ownership relationship a [`Foreign`](crate::Foreign) pointer has with its
 /// target **in the target's own file** — the cross-file analog of the in-file
 /// `owned` / `strong` / `weak` / `ref` kinds, selecting teardown / clone behavior.
@@ -420,14 +450,14 @@ pub enum Shape {
         inner: Box<Shape>,
     },
     Vec(Box<Shape>),
-    Tuple(Vec<Shape>),
+    Tuple(Box<[Shape]>),
     /// A class variable stored inline in the record. For the const case the bytes
     /// are the snapshot here; for the mutable case they are the initial value (the
     /// live value is read from the stack at the field's slot).
     Class {
         mutable: bool,
         inner: Box<Shape>,
-        value: Vec<u8>,
+        value: Box<[u8]>,
     },
 }
 
@@ -550,17 +580,16 @@ impl Shape {
             t::VEC => Shape::Vec(Box::new(Shape::decode_at(r, depth + 1)?)),
             t::TUPLE => {
                 let k = r.u8()? as usize;
-                let mut items = Vec::with_capacity(k);
-                for _ in 0..k {
-                    items.push(Shape::decode_at(r, depth + 1)?);
-                }
+                let items = (0..k)
+                    .map(|_| Shape::decode_at(r, depth + 1))
+                    .collect::<Result<Box<[_]>, _>>()?;
                 Shape::Tuple(items)
             }
             t::CLASS => {
                 let mutable = r.u8()? != 0;
                 let inner = Box::new(Shape::decode_at(r, depth + 1)?);
                 let value_len = r.u32()? as usize;
-                let value = r.take(value_len)?.to_vec();
+                let value = r.take(value_len)?.into();
                 Shape::Class {
                     mutable,
                     inner,
@@ -630,7 +659,7 @@ impl RttiField {
 pub struct RttiVariant {
     pub name: String,
     pub disc_value: i64,
-    pub fields: Vec<RttiField>,
+    pub fields: Box<[RttiField]>,
 }
 
 impl RttiVariant {
@@ -661,10 +690,9 @@ impl RttiVariant {
         let _pad = r.u32()?;
         let name = r.string(name_len)?;
         r.align(8)?;
-        let mut fields = Vec::with_capacity(field_count);
-        for _ in 0..field_count {
-            fields.push(RttiField::decode(r)?);
-        }
+        let fields = (0..field_count)
+            .map(|_| RttiField::decode(r))
+            .collect::<Result<Box<[_]>, _>>()?;
         Ok(RttiVariant {
             name,
             disc_value,
@@ -676,7 +704,7 @@ impl RttiVariant {
 /// The struct fields or enum variants of a type.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RttiBody {
-    Struct(Vec<RttiField>),
+    Struct(Box<[RttiField]>),
     Enum(RttiEnum),
 }
 
@@ -686,7 +714,7 @@ pub struct RttiEnum {
     pub disc_width: u8,
     pub disc_off: u16,
     pub payload_off: u16,
-    pub variants: Vec<RttiVariant>,
+    pub variants: Box<[RttiVariant]>,
 }
 
 /// A parsed type descriptor. Structure only — mutable class-variable *values* are
@@ -793,10 +821,9 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
             // must error, not mis-parse.
             return Err(corrupt("[BSTACK0816] RTTI enum discriminant width is zero"));
         }
-        let mut variants = Vec::with_capacity(count);
-        for _ in 0..count {
-            variants.push(RttiVariant::decode(&mut r)?);
-        }
+        let variants = (0..count)
+            .map(|_| RttiVariant::decode(&mut r))
+            .collect::<Result<Box<[_]>, _>>()?;
         RttiBody::Enum(RttiEnum {
             disc_width,
             disc_off,
@@ -804,10 +831,9 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
             variants,
         })
     } else {
-        let mut fields = Vec::with_capacity(count);
-        for _ in 0..count {
-            fields.push(RttiField::decode(&mut r)?);
-        }
+        let fields = (0..count)
+            .map(|_| RttiField::decode(&mut r))
+            .collect::<Result<Box<[_]>, _>>()?;
         RttiBody::Struct(fields)
     };
 
@@ -917,7 +943,8 @@ impl RttiRegistry {
                 ));
             }
             self.index(tag, off, body_len)?;
-            off += align8(RECORD_HEADER_LEN + body_len as u64);
+            // Advance to the next record, 8-byte aligned.
+            off += (RECORD_HEADER_LEN + body_len as u64 + 7) & !7;
         }
         Ok(())
     }
@@ -1068,12 +1095,16 @@ impl RttiRegistry {
                 "[BSTACK0801] RTTI ordinal out of range",
             )
         })?;
+        // NOTE: is rec.body_len bounded and will not result in dangerous allocations?
+        // check similar patterns
         let mut body = vec![0u8; rec.body_len as usize];
         self.stack
             .get_into(rec.offset + RECORD_HEADER_LEN, &mut body)?;
         decode_type(rec.tag, &body)
     }
 
+    // NOTE: as I increasingly see these kind of functions, I realized the convenience
+    // of a reader / writer / buffer, which can be passed in
     /// Read a class variable's current value bytes **live** from the schema stack.
     /// A mutable one may have been rewritten (by [`set_class_value`](Self::set_class_value),
     /// possibly through another handle) since it was registered, so the snapshot in a
@@ -1207,13 +1238,13 @@ pub enum Moved {
     /// — its inline offset storage lives in the freed shell, so unlike a vector there is
     /// no block to hand back whole. Each element is a **data** offset. `None` per null
     /// element.
-    List(Vec<Option<AnyRef>>),
+    List(Box<[Option<AnyRef>]>),
     /// A fixed **weak** reference array (`[#[bstack_weak] T; N]`), moved element-by-
     /// element. Each element is its **control-block** offset — exactly like a scalar
     /// [`Weak`](Self::Weak), and *unlike* a data-offset [`List`](Self::List) — so the
     /// caller never mistakes control bytes for a `T` (e.g. `swap`ping one into a non-weak
     /// slot). `None` per unset element.
-    WeakList(Vec<Option<AnyRef>>),
+    WeakList(Box<[Option<AnyRef>]>),
     /// A cross-file [`Foreign`](crate::Foreign) pointer, transferred whole (the target
     /// lives in another file and outlives the freed shell): tag, ownership kind, file
     /// id, and offset (`offset == 0` == null). The caller now owns the reference.
@@ -1227,17 +1258,17 @@ pub enum Moved {
     /// moved element-by-element — the foreign analog of [`List`](Self::List). Its inline
     /// `ForeignRepr` storage dies with the freed shell, so each pointer is handed back
     /// (a `ForeignPtr` whose `offset == 0` is null). The caller now owns each reference.
-    ForeignList(Vec<ForeignPtr>),
+    ForeignList(Box<[ForeignPtr]>),
     /// A tuple with at least one `Foreign` member, moved member-by-member: each element
     /// as its own [`Moved`] (POD by value, foreign as [`Foreign`](Self::Foreign)). Pure
     /// POD tuples come out as [`Pod`](Self::Pod) instead.
-    Tuple(Vec<Moved>),
+    Tuple(Box<[Moved]>),
     /// A **nested** reference array (`[[T; M]; N]`, …), moved outer-element-by-element —
     /// each inner container as its own [`Moved`] (a [`List`](Self::List) /
     /// [`ForeignList`](Self::ForeignList) / nested `Array`). A flat reference array is a
     /// [`List`](Self::List) / [`ForeignList`](Self::ForeignList); a pure-POD array
     /// (nested or not) is a [`Pod`](Self::Pod) blob.
-    Array(Vec<Moved>),
+    Array(Box<[Moved]>),
 }
 
 /// One cross-file [`Foreign`](crate::Foreign) pointer handed out by
@@ -1278,13 +1309,13 @@ enum Op {
     /// Pop `n` field values (child-first order) and assemble a struct block.
     MakeBlock {
         tag: EightCC,
-        names: Vec<String>,
+        names: Box<[String]>,
     },
     /// Pop `n` field values and assemble an enum block.
     MakeEnum {
         tag: EightCC,
         variant: String,
-        names: Vec<String>,
+        names: Box<[String]>,
     },
     /// Pop `n` values into an array / vec / tuple.
     MakeArray(usize),
@@ -1307,6 +1338,8 @@ enum TdOp {
     Shape { shape: Shape, offset: u64 },
 }
 
+// NOTE: refactor: we may want to refacto these into a rtti module, as it is basically
+// the normal things, and this is its equivelant of clone.rs
 /// One step of the non-recursive clone walk (see [`RttiRegistry::clone_value`]).
 enum CloneOp {
     /// Allocate + byte-copy a fresh block of type `ord` from `src_off`, then walk its
@@ -1376,30 +1409,6 @@ const HEADER_TAG_OFFSET: u64 = 8;
 /// `strong`, `weak`, and data-back-pointer `u64`s. Fixed for every weakable type (the
 /// control layout does not depend on `T`).
 const CONTROL_SIZE: u64 = CTRL_DATA_OFFSET + 8;
-
-fn read_u64_at(data: &BStack, off: u64) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    data.get_into(off, &mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-/// Read a `ForeignRepr` at `off` — `{ file_id:u32 @0, type_index:u32 @4, offset:u64 @8 }`
-/// — returning `(file_id, offset)`. (`type_index` = the target's RTTI ordinal + 1; the
-/// interpreter resolves the target type from the field's shape tag instead.)
-fn read_foreign_repr(data: &BStack, off: u64) -> io::Result<(u64, u64)> {
-    let mut b = [0u8; FOREIGN_REPR_LEN as usize];
-    data.get_into(off, &mut b)?;
-    Ok(decode_foreign_repr(&b))
-}
-
-/// Decode a raw 16-byte `ForeignRepr` into `(file_id, offset)` — the in-memory
-/// counterpart of [`read_foreign_repr`], used on the bytes an atomic `swap` hands
-/// back. `b` must be at least [`FOREIGN_REPR_LEN`] bytes.
-fn decode_foreign_repr(b: &[u8]) -> (u64, u64) {
-    let file_id = u32::from_le_bytes(b[0..4].try_into().unwrap()) as u64;
-    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
-    (file_id, offset)
-}
 
 impl RttiRegistry {
     /// Read a structure of type `ordinal` at `block_off` in `data` into a [`Value`]
@@ -1519,7 +1528,7 @@ impl RttiRegistry {
                     }
                     Shape::Class { value, .. } => {
                         // A class variable's value is schema-side, not per-instance.
-                        results.push(Value::Class(value.into()));
+                        results.push(Value::Class(value));
                     }
                     Shape::Owned(tag) | Shape::Strong(tag) => {
                         let child = read_u64_at(data, offset)?;
@@ -2718,7 +2727,7 @@ impl RttiRegistry {
         }
         // Own the (fields, base) so the `cache` borrow is released before `move_field`
         // needs it mutably (for embed / stride lookups).
-        let (fields, base): (Vec<RttiField>, u64) = {
+        let (fields, base): (Box<[RttiField]>, u64) = {
             let ty = &cache[&ordinal];
             match &ty.body {
                 RttiBody::Struct(f) => (f.clone(), block_off),
@@ -2861,7 +2870,7 @@ impl RttiRegistry {
                             offset,
                         });
                     }
-                    Moved::ForeignList(list)
+                    Moved::ForeignList(list.into())
                 } else if let Some(tag) = weak_element_tag(inner) {
                     // A weak array (`[#[bstack_weak] T; N]`, opt): each element is a
                     // `u64` **control-block** offset at `off + i*8`. Kept distinct from a
@@ -2872,7 +2881,7 @@ impl RttiRegistry {
                         let e = read_u64_at(data, add_off(off, mul_off(i, 8)?)?)?;
                         list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
                     }
-                    Moved::WeakList(list)
+                    Moved::WeakList(list.into())
                 } else if let Some(tag) = element_ref_tag(inner) {
                     // A flat data-reference array (`owned` / `strong` / `ref`, opt): each
                     // element is a `u64` **data** offset at `off + i*8`.
@@ -2881,7 +2890,7 @@ impl RttiRegistry {
                         let e = read_u64_at(data, add_off(off, mul_off(i, 8)?)?)?;
                         list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
                     }
-                    Moved::List(list)
+                    Moved::List(list.into())
                 } else if let Shape::Embed(etag) = &**inner {
                     // An array of embedded children (`#[embed] [Child; N]`): each is
                     // stored inline; materialize each into a fresh standalone block (its
@@ -2899,7 +2908,7 @@ impl RttiRegistry {
                         data.copy(add_off(off, mul_off(i, size)?)?, range.start(), size)?;
                         list.push(Some(unsafe { AnyRef::new(*etag, range.start()) }));
                     }
-                    Moved::List(list)
+                    Moved::List(list.into())
                 } else if matches!(&**inner, Shape::Array { .. }) && shape_has_reference(inner) {
                     // A nested reference array (`[[T; M]; N]`, …): move each outer
                     // element (itself a container) as its own `Moved`.
@@ -2915,7 +2924,7 @@ impl RttiRegistry {
                             materialized,
                         )?);
                     }
-                    Moved::Array(parts)
+                    Moved::Array(parts.into())
                 } else if shape_has_reference(inner) {
                     // Any other reference-bearing element we can't flatten one-per-`u64`.
                     return Err(move_unsupported());
@@ -2938,7 +2947,7 @@ impl RttiRegistry {
                         parts.push(self.move_field(alloc, data, it, eo, cache, materialized)?);
                         eo = add_off(eo, self.shape_stride(it, cache)?)?;
                     }
-                    Moved::Tuple(parts)
+                    Moved::Tuple(parts.into())
                 } else {
                     // A POD aggregate: its inline bytes (sum of element strides).
                     let mut total = 0u64;
@@ -3586,7 +3595,7 @@ fn layouts_match(a: &RttiType, b: &RttiType) -> bool {
                 value,
             } => {
                 if *mutable {
-                    value.clear();
+                    *value = Box::default();
                 }
                 strip_shape(inner);
             }
@@ -3828,32 +3837,35 @@ mod tests {
             weak: false,
             ctrl_tag: None,
             ondisk_size: 64,
-            body: RttiBody::Struct(vec![
-                RttiField {
-                    name: "id".to_string(),
-                    offset: 16,
-                    shape: Shape::Pod { width: 8 },
-                },
-                RttiField {
-                    name: "child".to_string(),
-                    offset: 24,
-                    shape: Shape::Owned(cc("Child")),
-                },
-                RttiField {
-                    name: "names".to_string(),
-                    offset: 32,
-                    shape: Shape::Vec(Box::new(Shape::Pod { width: 1 })),
-                },
-                RttiField {
-                    name: "kind".to_string(),
-                    offset: 0,
-                    shape: Shape::Class {
-                        mutable: false,
-                        inner: Box::new(Shape::Pod { width: 4 }),
-                        value: vec![7, 0, 0, 0],
+            body: RttiBody::Struct(
+                vec![
+                    RttiField {
+                        name: "id".to_string(),
+                        offset: 16,
+                        shape: Shape::Pod { width: 8 },
                     },
-                },
-            ]),
+                    RttiField {
+                        name: "child".to_string(),
+                        offset: 24,
+                        shape: Shape::Owned(cc("Child")),
+                    },
+                    RttiField {
+                        name: "names".to_string(),
+                        offset: 32,
+                        shape: Shape::Vec(Box::new(Shape::Pod { width: 1 })),
+                    },
+                    RttiField {
+                        name: "kind".to_string(),
+                        offset: 0,
+                        shape: Shape::Class {
+                            mutable: false,
+                            inner: Box::new(Shape::Pod { width: 4 }),
+                            value: vec![7u8, 0, 0, 0].into(),
+                        },
+                    },
+                ]
+                .into(),
+            ),
         }
     }
 
@@ -3877,7 +3889,8 @@ mod tests {
                             name: "value".to_string(),
                             offset: 0,
                             shape: Shape::Pod { width: 8 },
-                        }],
+                        }]
+                        .into(),
                     },
                     RttiVariant {
                         name: "Node".to_string(),
@@ -3893,9 +3906,11 @@ mod tests {
                                 offset: 8,
                                 shape: Shape::Owned(cc("Expr")),
                             },
-                        ],
+                        ]
+                        .into(),
                     },
-                ],
+                ]
+                .into(),
             }),
         }
     }
@@ -3926,11 +3941,14 @@ mod tests {
             weak: false,
             ctrl_tag: None,
             ondisk_size: 16,
-            body: RttiBody::Struct(vec![RttiField {
-                name: "x".to_string(),
-                offset: 0,
-                shape: Shape::Pod { width: 8 },
-            }]),
+            body: RttiBody::Struct(
+                vec![RttiField {
+                    name: "x".to_string(),
+                    offset: 0,
+                    shape: Shape::Pod { width: 8 },
+                }]
+                .into(),
+            ),
         }
     }
 
@@ -3942,11 +3960,14 @@ mod tests {
             weak: false,
             ctrl_tag: None,
             ondisk_size: 24,
-            body: RttiBody::Struct(vec![RttiField {
-                name: "child".to_string(),
-                offset: 0,
-                shape: Shape::Owned(cc("SyncRegA")),
-            }]),
+            body: RttiBody::Struct(
+                vec![RttiField {
+                    name: "child".to_string(),
+                    offset: 0,
+                    shape: Shape::Owned(cc("SyncRegA")),
+                }]
+                .into(),
+            ),
         }
     }
 
@@ -4109,18 +4130,21 @@ mod tests {
                 weak: false,
                 ctrl_tag: None,
                 ondisk_size: 8,
-                body: RttiBody::Struct(vec![RttiField {
-                    name: "f".to_string(),
-                    offset: 0,
-                    shape,
-                }]),
+                body: RttiBody::Struct(
+                    vec![RttiField {
+                        name: "f".to_string(),
+                        offset: 0,
+                        shape,
+                    }]
+                    .into(),
+                ),
             }
         }
 
         // Tuple arity is a `u8`: 256 elements overflow → rejected.
         let over = ty_with(
             "t".to_string(),
-            Shape::Tuple(vec![Shape::Pod { width: 1 }; 256]),
+            Shape::Tuple(vec![Shape::Pod { width: 1 }; 256].into()),
         );
         assert!(
             encode_type(&over)
@@ -4131,7 +4155,7 @@ mod tests {
         // 255 elements fit the `u8` arity → fine.
         let ok = ty_with(
             "t".to_string(),
-            Shape::Tuple(vec![Shape::Pod { width: 1 }; 255]),
+            Shape::Tuple(vec![Shape::Pod { width: 1 }; 255].into()),
         );
         assert!(encode_type(&ok).is_ok());
 

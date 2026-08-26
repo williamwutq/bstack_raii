@@ -5,6 +5,7 @@
 
 use std::io;
 
+use bstack::BStack;
 use bytemuck::{Pod, Zeroable};
 
 /// Add a small field-offset constant (`RC_REFCOUNT_OFFSET`/`CTRL_*_OFFSET`, a
@@ -14,6 +15,7 @@ use bytemuck::{Pod, Zeroable};
 /// next/prev/child offset) that can be corrupted or forged, so plain `+` would
 /// either panic under `overflow-checks` or silently wrap to an unrelated
 /// in-bounds offset that a later read/write would then corrupt.
+#[inline(always)]
 pub fn checked_off(base: u64, delta: u64) -> io::Result<u64> {
     base.checked_add(delta)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block offset overflow"))
@@ -37,6 +39,17 @@ pub fn get_u64(buf: &[u8]) -> u64 {
     u64::from_le_bytes(buf[..8].try_into().unwrap())
 }
 
+/// Read a little-endian `u64` directly from the block at `off` — the crate's
+/// fixed-width on-disk `u64` load (an 8-byte `get_into` fed through [`get_u64`]).
+/// Every on-disk pointer/count field (`ctrl` back-pointers, `Foreign` targets,
+/// linked-structure offsets, refcounts) is decoded through this.
+#[inline(always)]
+pub(crate) fn read_u64_at(stack: &BStack, off: u64) -> io::Result<u64> {
+    let mut buf = [0u8; 8];
+    stack.get_into(off, &mut buf)?;
+    Ok(get_u64(&buf))
+}
+
 /// An 8-byte type tag stored in every [`BlockHeader`].
 ///
 /// Used instead of a 4-byte `FourCC` because `bstack` offsets are 64-bit, so
@@ -53,12 +66,14 @@ pub struct EightCC(pub [u8; 8]);
 
 impl EightCC {
     /// Wrap a raw 8-byte tag.
+    #[inline(always)]
     pub const fn new(tag: [u8; 8]) -> Self {
         Self(tag)
     }
 
     /// Derive a tag from a type name: the first 8 bytes, zero-padded (or
     /// truncated). `const` so the macro can emit it in a `const` context.
+    #[inline]
     pub const fn from_name(name: &str) -> Self {
         let bytes = name.as_bytes();
         let mut out = [0u8; 8];
@@ -155,11 +170,11 @@ impl EightCC {
     /// Derive a control-block tag from this (data) tag by toggling one reserved
     /// bit in the trailing hash byte. The result differs from the data tag in
     /// exactly that bit, so `data_tag != ctrl_tag` is guaranteed **structurally**,
-    /// regardless of what the readable prefix contains — unlike the old
-    /// prefix-lowercasing, which was the identity on caseless prefixes (digits,
-    /// punctuation) and could collapse the two.
+    /// regardless of what the readable prefix contains.
+    ///
     /// Bit 6 (`0x40`) is chosen because `mix` / `mix_str` force bit 7 (`0x80`) and
     /// never touch bit 6, so the toggle survives generic mixing.
+    #[inline(always)]
     pub const fn with_ctrl_bit(self) -> EightCC {
         let mut out = self.0;
         out[7] ^= 0x40;
