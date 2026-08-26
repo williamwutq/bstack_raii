@@ -67,9 +67,9 @@ use bstack::{BStack, BStackRange};
 use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::primitives::{EightCC, WidePtr};
-use crate::layout::{
+use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET,
     RC_REFCOUNT_OFFSET,
 };

@@ -30,14 +30,14 @@ use bytemuck::{Pod, Zeroable};
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::util::{Scratch, alloc_image, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::util::bytes::get_u64;
 use crate::primitives::EightCC;
-use crate::owned::BStackOwned;
+use crate::types::compiled::owned::BStackOwned;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackBTreeSet`]: header, root node pointer (`0` =
 /// empty), key count, and the embedded Bloom filter's handle offset.
@@ -893,7 +893,7 @@ impl<K: Pod + Ord> BStackCast for BStackBTreeSet<K> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod + Ord> crate::types::embed::BStackEmbeddable for BStackBTreeSet<K> {}
+impl<K: Pod + Ord> crate::types::traits::embed::BStackEmbeddable for BStackBTreeSet<K> {}
 
 impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     type OnDisk = TreeSetOnDisk;

@@ -12,7 +12,7 @@ use bstack::{BStackGenOp, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::registry::FileId;
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 use crate::io_core::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
 
 /// A collected teardown transaction: the installing allocator's **stack identity**
@@ -261,7 +261,7 @@ pub(crate) unsafe fn commit_home_frees<A: BStackRaiiAllocator>(
 /// # Safety
 /// `range` must be a live `T` block owned by `allocator` that no other live owner
 /// will also free.
-pub(crate) unsafe fn drop_block<T: crate::types::block::BStackBlock, A: BStackRaiiAllocator>(
+pub(crate) unsafe fn drop_block<T: crate::types::traits::block::BStackBlock, A: BStackRaiiAllocator>(
     range: BStackRange,
     allocator: &A,
 ) -> io::Result<()> {

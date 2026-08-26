@@ -42,14 +42,14 @@ use bytemuck::{Pod, Zeroable};
 
 use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
-use crate::owned::BStackOwned;
-use crate::replace::{ReplaceError, finish_handback};
+use crate::types::compiled::owned::BStackOwned;
+use crate::replace::ReplaceError;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackDeque`]: the block header, a pointer to the
 /// ring data block (`0` = none), its capacity in slots, and the circular
@@ -252,7 +252,7 @@ impl<T: BStackBlock> BStackDeque<T> {
                 self.grow(allocator)?;
             }
         })();
-        finish_handback(value, outcome)
+        value.finish_handback(outcome)
     }
 
     /// Prepend a value to the front, taking ownership of its block.
@@ -301,7 +301,7 @@ impl<T: BStackBlock> BStackDeque<T> {
                 self.grow(allocator)?;
             }
         })();
-        finish_handback(value, outcome)
+        value.finish_handback(outcome)
     }
 
     /// Remove and return the last element (as an owned value block), or `None` if
@@ -562,7 +562,7 @@ impl<T: BStackBlock> BStackCast for BStackDeque<T> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<T: BStackBlock> crate::types::embed::BStackEmbeddable for BStackDeque<T> {}
+impl<T: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackDeque<T> {}
 
 impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     type OnDisk = DequeOnDisk;

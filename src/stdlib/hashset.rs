@@ -41,14 +41,14 @@ use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::hash::fnv1a;
 use super::util::{Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::util::bytes::get_u64;
 use crate::primitives::EightCC;
-use crate::owned::BStackOwned;
+use crate::types::compiled::owned::BStackOwned;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackHashSet`]: header, bucket-block pointer,
 /// bucket count `cap`, key count `len`, `used` (occupied + tombstone), and the
@@ -423,7 +423,7 @@ impl<K: Pod> BStackCast for BStackHashSet<K> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod> crate::types::embed::BStackEmbeddable for BStackHashSet<K> {}
+impl<K: Pod> crate::types::traits::embed::BStackEmbeddable for BStackHashSet<K> {}
 
 impl<K: Pod> BStackBlock for BStackHashSet<K> {
     type OnDisk = HashSetOnDisk;

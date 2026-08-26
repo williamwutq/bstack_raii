@@ -6,8 +6,8 @@
 //! runtime code (handles, `bstack_move!`) name a block's on-disk shape, tag, and
 //! control block without knowing the concrete type. The refcount / weak / move /
 //! embed capabilities that build on `BStackBlock` live in the sibling
-//! [`rc`](crate::types::rc), [`r#move`](crate::types::r#move), and
-//! [`embed`](crate::types::embed) modules.
+//! [`rc`](super::rc), [`r#move`](super::r#move), and
+//! [`embed`](super::embed) modules.
 
 use std::io;
 
@@ -17,7 +17,7 @@ use bytemuck::Pod;
 use crate::BStackRaiiAllocator;
 use crate::clone::ClonePlan;
 use crate::primitives::EightCC;
-use crate::reference::BStackRef;
+use super::reference::BStackRef;
 
 /// The downcast discriminant. The returned [`EightCC`] must match the tag in a
 /// block's [`crate::BlockHeader`] for a safe downcast to succeed.

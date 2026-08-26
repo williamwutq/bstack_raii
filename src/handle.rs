@@ -19,13 +19,16 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use crate::types::block::BStackBlock;
-use crate::types::rc::BStackWeakable;
+use crate::types::traits::block::BStackBlock;
+use crate::types::traits::rc::BStackWeakable;
 use crate::layout;
+use crate::types::compiled::rc::{
+    CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
+};
 use crate::io_core::refcount;
-use crate::reference::BStackRef;
+use crate::types::traits::reference::BStackRef;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// `#[bstack_owned]`: an exclusively-owned child.
 ///
@@ -50,7 +53,7 @@ impl<T> OwnedRef<T> {
 /// decrements the inline refcount and frees at zero.
 ///
 /// The macro only emits this for children whose type is `#[bstack_block(rc)]`,
-/// so the inline `refcount` at [`layout::RC_REFCOUNT_OFFSET`] is guaranteed
+/// so the inline `refcount` at [`RC_REFCOUNT_OFFSET`] is guaranteed
 /// present; the type system does not otherwise enforce it. Not `Copy`: it
 /// embodies exactly one strong-count debt, paid once by `bstack_drop`.
 pub struct StrongRef<T>(BStackRef<T>);
@@ -91,13 +94,13 @@ impl<T: BStackWeakable> WeakRef<T> {
 }
 
 /// Read a data block's `ctrl` back-pointer (a `u64` offset at
-/// [`layout::CTRL_BACKPTR_OFFSET`]) and resolve it to a typed control ref,
+/// [`CTRL_BACKPTR_OFFSET`]) and resolve it to a typed control ref,
 /// recovering the control block's length from `size_of::<T::Control>()`.
 fn read_ctrl_ref<T: BStackWeakable, A: BStackRaiiAllocator>(
     data_ref: BStackRef<T>,
     allocator: &A,
 ) -> io::Result<BStackRef<T::Control>> {
-    let pos = layout::checked_off(data_ref.into_range().start(), layout::CTRL_BACKPTR_OFFSET)?;
+    let pos = layout::checked_off(data_ref.into_range().start(), CTRL_BACKPTR_OFFSET)?;
     let mut bytes = [0u8; 8];
     allocator.stack().get_into(pos, &mut bytes)?;
     let ctrl_offset = u64::from_le_bytes(bytes);
@@ -124,7 +127,7 @@ impl<T: BStackBlock> BStackDrop for StrongRef<T> {
         // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
         let _depth = crate::io_core::teardown::TeardownDepthGuard::enter()?;
         let data_range = self.0.into_range();
-        let off = layout::checked_off(data_range.start(), layout::RC_REFCOUNT_OFFSET)?;
+        let off = layout::checked_off(data_range.start(), RC_REFCOUNT_OFFSET)?;
         // Decrement the inline refcount; only the last owner frees the block.
         if refcount::fetch_sub(allocator.stack(), off, 1)? == 1 {
             // SAFETY: last strong owner (the fetch_sub hit 1) of a live block.
@@ -175,13 +178,13 @@ pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
     // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
     let _depth = crate::io_core::teardown::TeardownDepthGuard::enter()?;
     let stack = allocator.stack();
-    let strong_off = layout::checked_off(ctrl_range.start(), layout::CTRL_STRONG_OFFSET)?;
+    let strong_off = layout::checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?;
     // Phase 1: last strong owner frees the data block (children + shell), then
     // releases the phantom weak the strong owners collectively held.
     if refcount::fetch_sub(stack, strong_off, 1)? == 1 {
         // SAFETY: last strong owner of a live `(rc, weak)` data block.
         unsafe { crate::io_core::teardown::drop_block::<T, A>(data_range, allocator)? };
-        let weak_off = layout::checked_off(ctrl_range.start(), layout::CTRL_WEAK_OFFSET)?;
+        let weak_off = layout::checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?;
         // Phase 2 (early): if no real weak handles remain, the phantom release
         // drives weak to zero and the control block is freed here.
         if refcount::fetch_sub(stack, weak_off, 1)? == 1 {
@@ -215,7 +218,7 @@ impl<T: BStackWeakable> WeakRef<T> {
 impl<T: BStackWeakable> BStackDrop for WeakRef<T> {
     fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         let ctrl_range = self.0.into_range();
-        let weak_off = layout::checked_off(ctrl_range.start(), layout::CTRL_WEAK_OFFSET)?;
+        let weak_off = layout::checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?;
         // Decrement ctrl.weak; free the control block when the last weak handle
         // (or the phantom) drops it to zero. The data block is never touched.
         if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {

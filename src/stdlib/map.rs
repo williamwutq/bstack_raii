@@ -44,15 +44,15 @@ use bytemuck::{Pod, Zeroable};
 use super::hash::fnv1a;
 use super::util::{Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::util::bytes::get_u64;
 use crate::primitives::EightCC;
-use crate::owned::BStackOwned;
-use crate::replace::{ReplaceError, finish_handback};
+use crate::types::compiled::owned::BStackOwned;
+use crate::replace::ReplaceError;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackHashMap`]: header, bucket-block pointer (`0` =
 /// none), bucket count `cap`, live-entry count `len`, and `used` (occupied +
@@ -295,7 +295,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                 }))
             };
         })();
-        finish_handback(value, outcome)
+        value.finish_handback(outcome)
     }
 
     /// Remove `key`, returning its value (owned) if present, else `None`. The
@@ -500,7 +500,7 @@ impl<K: Pod, V: BStackBlock> BStackCast for BStackHashMap<K, V> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod, V: BStackBlock> crate::types::embed::BStackEmbeddable for BStackHashMap<K, V> {}
+impl<K: Pod, V: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackHashMap<K, V> {}
 
 impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     type OnDisk = MapOnDisk;

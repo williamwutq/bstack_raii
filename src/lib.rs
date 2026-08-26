@@ -62,30 +62,26 @@ mod construct;
 mod foreign;
 mod handle;
 mod layout;
-mod owned;
 mod primitives;
 mod io_core;
-mod reference;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
 mod replace;
 /// Runtime Type Information: a persisted, self-describing schema stack for
 /// interpreting `bstack_raii` structures on disk with no compiled-in types.
 pub mod rtti;
-mod shared;
 mod stdlib;
 mod types;
 mod util;
-mod vec;
 
 #[cfg(test)]
 mod tests;
 
-pub use types::block::{BStackBlock, BStackCast};
-pub use types::r#move::{BStackMove, BStackMoveExpr};
-pub use types::rc::{BStackShared, BStackWeakable};
+pub use types::traits::block::{BStackBlock, BStackCast};
+pub use types::traits::r#move::{BStackMove, BStackMoveExpr};
+pub use types::traits::rc::{BStackShared, BStackWeakable};
 pub use io_core::bulk::FreeManyError;
-pub use types::cast::CastError;
-pub use types::cast::{BStackCastAs, BStackCastInto};
+pub use types::traits::cast::CastError;
+pub use types::traits::cast::{BStackCastAs, BStackCastInto};
 /// Codegen plumbing, re-exported for `#[bstack_block]`-generated code only. It is
 /// named in [`BStackBlock`]'s (hidden) trait-method signatures, so the type must
 /// stay `pub`; the supported way to clone is [`TryClone`] / [`TryCloneIn`].
@@ -105,14 +101,14 @@ pub use primitives::WidePtr;
 pub use types::alloc::BStackRaiiAllocator;
 pub use util::handback::HandBack;
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
-pub use layout::BlockHeader;
+pub use types::compiled::block::BlockHeader;
 pub use util::bytes::get_u64;
 pub use primitives::EightCC;
-pub use owned::BStackOwned;
-pub use reference::BStackRef;
+pub use types::compiled::owned::BStackOwned;
+pub use types::traits::reference::BStackRef;
 pub use io_core::registry::ForeignHostAllocator;
 pub use replace::ReplaceError;
-pub use shared::{BStackRc, BStackWeak};
+pub use types::compiled::rc::{BStackRc, BStackWeak};
 pub use util::small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
@@ -122,8 +118,10 @@ pub use stdlib::{
     StringOnDisk, TreeOnDisk, TreeSetOnDisk,
 };
 pub use io_core::teardown::{dealloc_range, wal_teardown};
-pub use types::drop::{AutoDrop, BStackDrop};
-pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
+pub use types::traits::drop::{AutoDrop, BStackDrop};
+pub use types::compiled::vec::{
+    BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc,
+};
 pub use io_core::wal::{STD_WAL_ANCHOR, finish};
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
@@ -147,7 +145,7 @@ pub mod __private {
     // Only `#[bstack_block]`/`#[bstack_enum]`-generated code (and the stdlib) implement
     // it; no downstream code names it, so it lives here rather than in the prelude — the
     // `on_unimplemented` message fires regardless of visibility.
-    pub use crate::types::embed::BStackEmbeddable;
+    pub use crate::types::traits::embed::BStackEmbeddable;
     /// Control-block image builder for `(rc, weak)` lowerings — plumbing kept out of
     /// the prelude. (The `#[bstack_weak]` field operations and the cross-file
     /// teardown / clone helpers are now methods on the capability traits

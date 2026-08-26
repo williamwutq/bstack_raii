@@ -39,14 +39,15 @@ use bytemuck::{Pod, Zeroable};
 
 use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE, checked_off};
+use crate::layout::checked_off;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
-use crate::owned::BStackOwned;
-use crate::replace::{ReplaceError, finish_handback};
+use crate::types::compiled::owned::BStackOwned;
+use crate::replace::ReplaceError;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackLinkedList`]: the block header followed by the
 /// `head`/`tail` node offsets (`0` = empty) and the element count. `#[repr(C)]`
@@ -229,7 +230,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
             }
             res
         })();
-        finish_handback(value, outcome)
+        value.finish_handback(outcome)
     }
 
     /// Prepend a value to the front, taking ownership of its block. Atomic and
@@ -277,7 +278,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
             }
             res
         })();
-        finish_handback(value, outcome)
+        value.finish_handback(outcome)
     }
 
     /// Remove and return the last element (as an owned value block), or `None`
@@ -478,7 +479,7 @@ impl<T: BStackBlock> BStackCast for BStackLinkedList<T> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<T: BStackBlock> crate::types::embed::BStackEmbeddable for BStackLinkedList<T> {}
+impl<T: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackLinkedList<T> {}
 
 impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     type OnDisk = ListOnDisk;

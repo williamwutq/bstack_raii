@@ -16,15 +16,16 @@ use crate::BStackRaiiAllocator;
 use crate::util::handback::impl_source_error;
 use bstack::BStackRange;
 
-use crate::types::rc::BStackWeakable;
+use crate::types::traits::rc::BStackWeakable;
 use crate::handle::WeakRef;
-use crate::layout::{self, BlockHeader};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::rc::{CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET};
 use crate::util::bytes::{put_u64, read_u64_at};
 use crate::primitives::EightCC;
-use crate::reference::BStackRef;
+use crate::types::traits::reference::BStackRef;
 use crate::replace::ReplaceError;
-use crate::shared::{BStackRc, BStackWeak};
-use crate::types::drop::BStackDrop;
+use crate::types::compiled::rc::{BStackRc, BStackWeak};
+use crate::types::traits::drop::BStackDrop;
 
 /// The error a generated `new` constructor returns when a fallible construction
 /// step fails after it has already consumed the caller's owned/strong/embedded
@@ -177,10 +178,10 @@ pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u
         size: control_size,
         tag: ctrl_tag,
     };
-    payload[..layout::HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
-    put_u64(&mut payload, layout::CTRL_STRONG_OFFSET, 1);
-    put_u64(&mut payload, layout::CTRL_WEAK_OFFSET, 1);
-    put_u64(&mut payload, layout::CTRL_DATA_OFFSET, data_start);
+    payload[..HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
+    put_u64(&mut payload, CTRL_STRONG_OFFSET, 1);
+    put_u64(&mut payload, CTRL_WEAK_OFFSET, 1);
+    put_u64(&mut payload, CTRL_DATA_OFFSET, data_start);
     payload
 }
 

@@ -36,15 +36,15 @@ use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64, w8};
 use crate::util::small_buf::SmallBuf;
-use crate::types::block::{BStackBlock, BStackCast};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::layout::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::util::bytes::get_u64;
 use crate::primitives::EightCC;
-use crate::owned::BStackOwned;
-use crate::replace::{ReplaceError, finish_handback};
+use crate::types::compiled::owned::BStackOwned;
+use crate::replace::ReplaceError;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use crate::types::traits::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackBinaryHeap`]: header, array-block pointer
 /// (`0` = none), capacity in slots, and element count. Non-generic.
@@ -248,7 +248,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
             // Linked into the heap.
             return Ok(());
         })();
-        finish_handback(value, outcome)
+        value.finish_handback(outcome)
     }
 
     /// Remove and return the minimum entry (its value block owned), or `None` if
@@ -385,7 +385,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackCast for BStackBinaryHeap<K, V> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod + Ord, V: BStackBlock> crate::types::embed::BStackEmbeddable for BStackBinaryHeap<K, V> {}
+impl<K: Pod + Ord, V: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackBinaryHeap<K, V> {}
 
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     type OnDisk = HeapOnDisk;

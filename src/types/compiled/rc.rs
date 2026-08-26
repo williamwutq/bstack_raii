@@ -12,17 +12,59 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use crate::types::block::BStackBlock;
-use crate::types::r#move::{BStackMove, BStackMoveExpr};
-use crate::types::rc::BStackWeakable;
+use super::super::traits::block::BStackBlock;
+use super::super::traits::r#move::{BStackMove, BStackMoveExpr};
+use super::super::traits::rc::BStackWeakable;
 use crate::primitives::TryClone;
 use crate::handle::{StrongRef, WeakRef, strong_release_ctrl};
 use crate::layout;
-use crate::owned::BStackOwned;
+use super::owned::BStackOwned;
 use crate::io_core::refcount;
-use crate::reference::BStackRef;
+use super::super::traits::reference::BStackRef;
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::{AutoDrop, BStackDrop};
+use super::super::traits::drop::{AutoDrop, BStackDrop};
+
+use super::block::HEADER_SIZE;
+
+// The macros inject the refcount / control back-pointer / control counters
+// immediately after the header, ahead of any user fields and in a fixed order.
+// Their offsets are therefore the same for *every* block, so they live here as
+// constants rather than as per-type trait members — alongside the shared handles
+// ([`BStackRc`] / [`BStackWeak`]) that read and write them.
+
+/// `#[bstack_block(rc)]` data block: offset of the inline `refcount: AtomicU64`,
+/// injected right after the header.
+///
+/// ```text
+/// struct XOnDisk { header, refcount: AtomicU64, <user fields...> }
+/// ```
+pub(crate) const RC_REFCOUNT_OFFSET: u64 = HEADER_SIZE;
+
+/// `#[bstack_block(rc, weak)]` data block: offset of the `ctrl` back-pointer to
+/// the control block, injected right after the header.
+///
+/// ```text
+/// struct XOnDisk { header, ctrl: BStackRef<XOnDiskRef>, <user fields...> }
+/// ```
+pub(crate) const CTRL_BACKPTR_OFFSET: u64 = HEADER_SIZE;
+
+/// `#[bstack_block(rc, weak)]` control block (`XOnDiskRef`): offset of `strong`.
+///
+/// ```text
+/// struct XOnDiskRef { header, strong: AtomicU64, weak: AtomicU64, x: BStackRef<X> }
+/// ```
+pub(crate) const CTRL_STRONG_OFFSET: u64 = HEADER_SIZE;
+
+/// Control block: offset of `weak` (starts at 1 — the phantom weak held
+/// collectively by all live strong owners).
+pub(crate) const CTRL_WEAK_OFFSET: u64 = HEADER_SIZE + 8;
+
+/// Control block: offset of `x`, the forward pointer back to the data block.
+/// Read by [`BStackWeak::upgrade`] once it wins the strong CAS.
+pub(crate) const CTRL_DATA_OFFSET: u64 = HEADER_SIZE + 16;
+
+// Guard the hand-derived offsets against a header size change.
+const _: () = assert!(HEADER_SIZE == 16);
 
 /// The without-allocator drop core of a [`BStackRc`]: the data ref plus the
 /// optional control-block range.
@@ -32,6 +74,7 @@ use crate::types::drop::{AutoDrop, BStackDrop};
 /// (control block). Its [`BStackDrop`] is the strong release, so a `BStackRc`'s
 /// embedded [`AutoDrop`] runs it automatically and the handle needs no
 /// hand-written `Drop`.
+// Note: suspecious pub(crate)
 pub(crate) struct StrongCore<T: BStackBlock> {
     data: BStackRef<T>,
     ctrl: Option<BStackRange>,
@@ -51,7 +94,7 @@ impl<T: BStackBlock> BStackDrop for StrongCore<T> {
 ///
 /// Serves **both** block kinds via its [`StrongCore`]'s runtime `ctrl`:
 /// * `None` — a plain `#[bstack_block(rc)]` block, whose refcount lives inline
-///   in the data block at [`layout::RC_REFCOUNT_OFFSET`].
+///   in the data block at [`RC_REFCOUNT_OFFSET`].
 /// * `Some(range)` — an `#[bstack_block(rc, weak)]` block, whose `strong`/`weak`
 ///   counters live in a separate control block at `range`.
 ///
@@ -125,9 +168,9 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
     fn strong_offset(&self) -> io::Result<u64> {
         match self.ctrl() {
             None => {
-                layout::checked_off(self.data().into_range().start(), layout::RC_REFCOUNT_OFFSET)
+                layout::checked_off(self.data().into_range().start(), RC_REFCOUNT_OFFSET)
             }
-            Some(ctrl) => layout::checked_off(ctrl.start(), layout::CTRL_STRONG_OFFSET),
+            Some(ctrl) => layout::checked_off(ctrl.start(), CTRL_STRONG_OFFSET),
         }
     }
 }
@@ -167,7 +210,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
         let ctrl_range = self
             .ctrl()
             .expect("BStackRc<T: BStackWeakable> always has a control block");
-        let weak_off = layout::checked_off(ctrl_range.start(), layout::CTRL_WEAK_OFFSET)?;
+        let weak_off = layout::checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?;
         refcount::fetch_add(self.allocator().stack(), weak_off, 1)?;
         let ctrl = unsafe { BStackRef::<T::Control>::from_range(ctrl_range) };
         // SAFETY: the fetch_add above established the weak count this handle holds.
@@ -205,7 +248,7 @@ impl<'a, T: BStackMove, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
 
         // `(rc, weak)`: release the phantom weak; free the control block at zero.
         if let Some(ctrl) = ctrl {
-            let weak_off = layout::checked_off(ctrl.start(), layout::CTRL_WEAK_OFFSET)?;
+            let weak_off = layout::checked_off(ctrl.start(), CTRL_WEAK_OFFSET)?;
             if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {
                 unsafe { dealloc_range(allocator, ctrl)? };
             }
@@ -268,8 +311,8 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
         // Both offsets are computed (and can fail) up front, before any mutation —
         // so an overflowing `ctrl_range.start()` never leaves a claimed strong
         // count with nothing to release it.
-        let strong_off = layout::checked_off(ctrl_range.start(), layout::CTRL_STRONG_OFFSET)?;
-        let data_pos = layout::checked_off(ctrl_range.start(), layout::CTRL_DATA_OFFSET)?;
+        let strong_off = layout::checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?;
+        let data_pos = layout::checked_off(ctrl_range.start(), CTRL_DATA_OFFSET)?;
         if refcount::increment_if_nonzero(stack, strong_off)?.is_none() {
             return Ok(None);
         }
@@ -311,7 +354,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
 impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> TryClone for BStackWeak<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
         let weak_off =
-            layout::checked_off(self.ctrl().into_range().start(), layout::CTRL_WEAK_OFFSET)?;
+            layout::checked_off(self.ctrl().into_range().start(), CTRL_WEAK_OFFSET)?;
         refcount::fetch_add(self.allocator().stack(), weak_off, 1)?;
         // SAFETY: the fetch_add above established the weak count this clone holds.
         Ok(unsafe { Self::from_raw(self.ctrl(), self.allocator()) })

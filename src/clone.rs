@@ -51,13 +51,14 @@ use std::io;
 use bstack::{BStackGenOp, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::types::block::BStackBlock;
-use crate::types::rc::BStackShared;
+use crate::types::traits::block::BStackBlock;
+use crate::types::traits::rc::BStackShared;
 use crate::layout;
-use crate::owned::BStackOwned;
-use crate::reference::BStackRef;
+use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::reference::BStackRef;
 use crate::io_core::teardown::dealloc_range;
-use crate::vec::{BYTEVEC_HEADER, VecDesc};
+use crate::types::compiled::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::io_core::wal::{
     HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
     wal_capacity_of, wal_set_idle,
@@ -351,7 +352,7 @@ impl ClonePlan {
         // cap == len: a fresh clone carries no spare capacity. Skip building the
         // image in the measure phase (the write would be discarded anyway).
         if self.mode != Mode::Measure {
-            self.write(range.start(), crate::vec::bytevec_image(len, len, data));
+            self.write(range.start(), crate::types::compiled::vec::bytevec_image(len, len, data));
         }
         Ok(VecDesc {
             data_off: range.start(),
@@ -373,8 +374,8 @@ impl ClonePlan {
         }
         let (data_ref, ctrl) = T::strong_parts(data, allocator)?;
         let off = match ctrl {
-            None => layout::checked_off(data_ref.into_range().start(), layout::RC_REFCOUNT_OFFSET)?,
-            Some(c) => layout::checked_off(c.start(), layout::CTRL_STRONG_OFFSET)?,
+            None => layout::checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
+            Some(c) => layout::checked_off(c.start(), CTRL_STRONG_OFFSET)?,
         };
         self.bumps.push(off);
         Ok(())
@@ -386,7 +387,7 @@ impl ClonePlan {
     pub fn bump_weak(&mut self, ctrl_off: u64) -> io::Result<()> {
         if self.mode != Mode::Measure {
             self.bumps
-                .push(layout::checked_off(ctrl_off, layout::CTRL_WEAK_OFFSET)?);
+                .push(layout::checked_off(ctrl_off, CTRL_WEAK_OFFSET)?);
         }
         Ok(())
     }

@@ -35,20 +35,22 @@ use std::io;
 use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
 
 use crate::BStackRaiiAllocator;
-use crate::types::block::BStackBlock;
-use crate::types::rc::{BStackShared, BStackWeakable};
+use crate::types::traits::block::BStackBlock;
+use crate::types::traits::rc::{BStackShared, BStackWeakable};
 use crate::clone::TryCloneIn;
 use crate::handle::{OwnedRef, WeakRef};
 use crate::layout;
-use crate::owned::BStackOwned;
+use crate::types::compiled::owned::BStackOwned;
 use crate::primitives::{BrandedWidePtr, Offset, WidePtr};
 use crate::io_core::refcount;
-use crate::reference::BStackRef;
+use crate::types::traits::reference::BStackRef;
 #[cfg(test)]
 use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
-use crate::shared::{BStackRc, BStackWeak};
-use crate::types::drop::BStackDrop;
+use crate::types::compiled::rc::{
+    BStackRc, BStackWeak, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
+};
+use crate::types::traits::drop::BStackDrop;
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or
@@ -658,8 +660,8 @@ pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocato
     let data = unsafe { BStackRef::<T>::from_range(range) };
     let (data_ref, ctrl) = <T as BStackShared>::strong_parts(data, alloc)?;
     let off = match ctrl {
-        None => layout::checked_off(data_ref.into_range().start(), layout::RC_REFCOUNT_OFFSET)?,
-        Some(c) => layout::checked_off(c.start(), layout::CTRL_STRONG_OFFSET)?,
+        None => layout::checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
+        Some(c) => layout::checked_off(c.start(), CTRL_STRONG_OFFSET)?,
     };
     refcount::fetch_add(alloc.stack(), off, 1)?;
     Ok(())
@@ -681,7 +683,7 @@ pub(crate) unsafe fn foreign_clone_weak<T: BStackWeakable, A: BStackRaiiAllocato
 ) -> io::Result<()> {
     refcount::fetch_add(
         alloc.stack(),
-        layout::checked_off(ctrl_offset, layout::CTRL_WEAK_OFFSET)?,
+        layout::checked_off(ctrl_offset, CTRL_WEAK_OFFSET)?,
         1,
     )?;
     Ok(())

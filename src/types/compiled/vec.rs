@@ -41,17 +41,17 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use crate::types::block::BStackBlock;
-use crate::types::rc::{BStackShared, BStackWeakable};
+use super::super::traits::block::BStackBlock;
+use super::super::traits::rc::{BStackShared, BStackWeakable};
 use crate::clone::ClonePlan;
 use crate::handle::WeakRef;
 use crate::util::bytes::{get_u64, put_u64};
-use crate::owned::BStackOwned;
-use crate::reference::BStackRef;
+use super::owned::BStackOwned;
+use super::super::traits::reference::BStackRef;
 use crate::replace::ReplaceError;
-use crate::shared::{BStackRc, BStackWeak};
+use super::rc::{BStackRc, BStackWeak};
 use crate::io_core::teardown::{dealloc_range};
-use crate::types::drop::BStackDrop;
+use super::super::traits::drop::BStackDrop;
 
 /// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,
 /// `cap: u64` @ 8, elements from offset 16. Fixed by bstack's ABI (stable across
@@ -63,6 +63,7 @@ pub(crate) const BYTEVEC_HEADER: u64 = 16;
 /// single place that on-disk shape is assembled, shared by a cloned vec
 /// ([`crate::ClonePlan::stage_bytevec`]) and a field-resident growth
 /// [`push`](BStackVec::push).
+// Note: suspecious pub(crate)
 pub(crate) fn bytevec_image(len: u64, cap: u64, data: &[u8]) -> Vec<u8> {
     let mut img = vec![0u8; BYTEVEC_HEADER as usize + data.len()];
     put_u64(&mut img, 0, len);

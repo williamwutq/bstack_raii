@@ -9,10 +9,10 @@ use bytemuck::Pod;
 
 use crate::BStackRaiiAllocator;
 use crate::primitives::EightCC;
-use crate::reference::BStackRef;
+use super::reference::BStackRef;
 use crate::replace::ReplaceError;
-use crate::shared::{BStackRc, BStackWeak};
-use crate::types::block::BStackBlock;
+use super::super::compiled::rc::{BStackRc, BStackWeak};
+use super::block::BStackBlock;
 
 /// Implemented by refcounted blocks (`#[bstack_block(rc)]` and
 /// `#[bstack_block(rc, weak)]`), i.e. any block that can be the target of a

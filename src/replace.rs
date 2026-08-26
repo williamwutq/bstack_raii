@@ -7,35 +7,7 @@ use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
 use crate::util::handback::impl_source_error;
-use crate::types::drop::{AutoDrop, BStackDrop};
-
-/// Resolve a consuming operation that guarded its input in an [`AutoDrop`]:
-///
-/// * **success** — the resource is now linked in, so defuse the guard (it must
-///   not free what the operation just took ownership of) and pass the payload
-///   through.
-/// * **failure** — the operation did not consume the resource, so hand it back
-///   to the caller through [`ReplaceError::recovered`] instead of letting the
-///   guard free it. Freeing a transient-I/O failure's input is data loss the
-///   caller can neither prevent nor recover from; returning it lets them retry,
-///   re-home, or free at their discretion — the contract `bstack`'s allocator
-///   mandates.
-#[inline]
-pub(crate) fn finish_handback<T: BStackDrop, A: BStackRaiiAllocator, R>(
-    guard: AutoDrop<'_, T, A>,
-    outcome: io::Result<R>,
-) -> Result<R, ReplaceError<T>> {
-    match outcome {
-        Ok(r) => {
-            let _ = guard.into_raw_parts();
-            Ok(r)
-        }
-        Err(e) => {
-            let (value, _) = guard.into_raw_parts();
-            Err(ReplaceError::recovered(e, value))
-        }
-    }
-}
+use crate::types::traits::drop::BStackDrop;
 
 /// The error a [`#[bstack_mut]`](crate::bstack_block) `replace_<field>` mutator
 /// returns when the swap fails partway through.

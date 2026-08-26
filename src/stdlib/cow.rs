@@ -21,11 +21,11 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use crate::types::block::BStackBlock;
+use crate::types::traits::block::BStackBlock;
 use crate::clone::TryCloneIn;
-use crate::owned::BStackOwned;
-use crate::reference::BStackRef;
-use crate::types::drop::{AutoDrop, BStackDrop};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::reference::BStackRef;
+use crate::types::traits::drop::{AutoDrop, BStackDrop};
 
 /// Clone-on-write ownership of a block of type `T`.
 ///

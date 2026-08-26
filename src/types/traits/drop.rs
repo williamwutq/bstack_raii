@@ -14,8 +14,9 @@ use std::io;
 use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
-use crate::types::block::BStackBlock;
+use super::block::BStackBlock;
 use crate::io_core::teardown::drop_block;
+use crate::replace::ReplaceError;
 
 /// The safe teardown protocol for an affine (non-`Copy`) owning handle: consume
 /// `self` and free the on-disk block(s) it owns.
@@ -106,6 +107,34 @@ impl<'a, T: BStackDrop, A: BStackRaiiAllocator> AutoDrop<'a, T, A> {
     /// `owned.handle().get_field(stack)`.
     pub fn handle(&self) -> &T {
         &self.inner
+    }
+
+    /// Resolve a consuming operation that guarded its input in this [`AutoDrop`]:
+    ///
+    /// * **success** — the resource is now linked in, so defuse the guard (it must
+    ///   not free what the operation just took ownership of) and pass the payload
+    ///   through.
+    /// * **failure** — the operation did not consume the resource, so hand it back
+    ///   to the caller through [`ReplaceError::recovered`] instead of letting the
+    ///   guard free it. Freeing a transient-I/O failure's input is data loss the
+    ///   caller can neither prevent nor recover from; returning it lets them retry,
+    ///   re-home, or free at their discretion — the contract `bstack`'s allocator
+    ///   mandates.
+    #[inline]
+    pub(crate) fn finish_handback<R>(
+        self,
+        outcome: io::Result<R>,
+    ) -> Result<R, ReplaceError<T>> {
+        match outcome {
+            Ok(r) => {
+                let _ = self.into_raw_parts();
+                Ok(r)
+            }
+            Err(e) => {
+                let (value, _) = self.into_raw_parts();
+                Err(ReplaceError::recovered(e, value))
+            }
+        }
     }
 }
 
