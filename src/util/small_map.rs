@@ -21,6 +21,8 @@ pub struct SmallStringMap<T> {
 
 impl<T> SmallStringMap<T> {
     /// A new empty map.
+    #[must_use]
+    #[inline(always)]
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -28,6 +30,8 @@ impl<T> SmallStringMap<T> {
     }
 
     /// A new empty map with room for `capacity` entries.
+    #[must_use]
+    #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
@@ -36,56 +40,77 @@ impl<T> SmallStringMap<T> {
 
     /// Wrap an existing `Vec` of pairs (order preserved; earlier duplicates win on
     /// lookup, as insertion never dedups a pre-built vector).
+    #[must_use]
+    #[inline(always)]
     pub fn from_vec(entries: Vec<(String, T)>) -> Self {
         Self { entries }
     }
 
     /// Consume into the underlying `Vec` of pairs (insertion order).
+    #[must_use]
+    #[inline(always)]
     pub fn into_vec(self) -> Vec<(String, T)> {
         self.entries
     }
 
     /// The entries as a slice, in insertion order.
+    #[must_use]
+    #[inline(always)]
     pub fn as_slice(&self) -> &[(String, T)] {
         &self.entries
     }
 
     /// Number of entries.
+    #[must_use]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the map is empty.
+    #[must_use]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// The allocated capacity.
+    #[must_use]
+    #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.entries.capacity()
     }
 
     /// Remove all entries, keeping the allocation.
+    #[inline(always)]
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
     /// The index of `key`, if present.
+    #[must_use]
+    #[inline]
     fn position(&self, key: &str) -> Option<usize> {
         self.entries.iter().position(|(k, _)| k == key)
     }
 
     /// Whether `key` is present.
+    #[must_use]
+    #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
         self.position(key).is_some()
     }
 
     /// A shared reference to the value for `key`.
+    #[must_use]
+    #[inline]
     pub fn get(&self, key: &str) -> Option<&T> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
     /// A mutable reference to the value for `key`.
+    #[must_use]
+    #[inline]
     pub fn get_mut(&mut self, key: &str) -> Option<&mut T> {
         self.entries
             .iter_mut()
@@ -94,6 +119,8 @@ impl<T> SmallStringMap<T> {
     }
 
     /// The stored key + value for `key` (the key as actually stored).
+    #[must_use]
+    #[inline]
     pub fn get_key_value(&self, key: &str) -> Option<(&str, &T)> {
         self.entries
             .iter()
@@ -103,6 +130,7 @@ impl<T> SmallStringMap<T> {
 
     /// Insert `value` for `key`, returning the previous value if the key was present
     /// (its position is kept); a new key is appended at the end.
+    #[inline]
     pub fn insert(&mut self, key: impl Into<String>, value: T) -> Option<T> {
         let key = key.into();
         match self.position(&key) {
@@ -116,6 +144,7 @@ impl<T> SmallStringMap<T> {
 
     /// Remove and return the value for `key`, **preserving the order** of the rest
     /// (an `O(n)` shift).
+    #[inline]
     pub fn remove(&mut self, key: &str) -> Option<T> {
         let i = self.position(key)?;
         Some(self.entries.remove(i).1)
@@ -123,37 +152,45 @@ impl<T> SmallStringMap<T> {
 
     /// Remove and return the value for `key` **without preserving order** (an `O(1)`
     /// swap with the last entry).
+    #[inline]
     pub fn swap_remove(&mut self, key: &str) -> Option<T> {
         let i = self.position(key)?;
         Some(self.entries.swap_remove(i).1)
     }
 
     /// Iterate `(key, &value)` in insertion order.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &T)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     /// Iterate `(key, &mut value)` in insertion order.
+    #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut T)> {
         self.entries.iter_mut().map(|(k, v)| (k.as_str(), v))
     }
 
     /// Iterate the keys in insertion order.
+    #[inline]
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|(k, _)| k.as_str())
     }
 
     /// Iterate the values in insertion order.
+    #[inline]
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().map(|(_, v)| v)
     }
 
     /// Mutably iterate the values in insertion order.
+    #[inline]
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.entries.iter_mut().map(|(_, v)| v)
     }
 
     /// Get the [`Entry`] for `key` — the in-place-or-insert API.
+    #[must_use]
+    #[inline]
     pub fn entry(&mut self, key: impl Into<String>) -> Entry<'_, T> {
         let key = key.into();
         match self.position(&key) {
@@ -165,6 +202,7 @@ impl<T> SmallStringMap<T> {
 
 impl<T> std::ops::Index<&str> for SmallStringMap<T> {
     type Output = T;
+    #[inline(always)]
     fn index(&self, key: &str) -> &T {
         self.get(key).expect("no entry found for key")
     }
@@ -173,6 +211,7 @@ impl<T> std::ops::Index<&str> for SmallStringMap<T> {
 impl<T> FromIterator<(String, T)> for SmallStringMap<T> {
     /// Collect pairs into a map; a repeated key keeps its first position but takes the
     /// last value (`insert` semantics).
+    #[inline]
     fn from_iter<I: IntoIterator<Item = (String, T)>>(iter: I) -> Self {
         let mut map = Self::new();
         for (k, v) in iter {
@@ -183,6 +222,7 @@ impl<T> FromIterator<(String, T)> for SmallStringMap<T> {
 }
 
 impl<T> Extend<(String, T)> for SmallStringMap<T> {
+    #[inline]
     fn extend<I: IntoIterator<Item = (String, T)>>(&mut self, iter: I) {
         for (k, v) in iter {
             self.insert(k, v);
@@ -193,12 +233,14 @@ impl<T> Extend<(String, T)> for SmallStringMap<T> {
 impl<T> IntoIterator for SmallStringMap<T> {
     type Item = (String, T);
     type IntoIter = std::vec::IntoIter<(String, T)>;
+    #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
         self.entries.into_iter()
     }
 }
 
 impl<T> From<Vec<(String, T)>> for SmallStringMap<T> {
+    #[inline(always)]
     fn from(entries: Vec<(String, T)>) -> Self {
         Self::from_vec(entries)
     }
@@ -228,6 +270,7 @@ pub struct VacantEntry<'a, T> {
 impl<'a, T> Entry<'a, T> {
     /// Ensure a value is present (inserting `default` if vacant) and return a mutable
     /// reference to it.
+    #[inline]
     pub fn or_insert(self, default: T) -> &'a mut T {
         match self {
             Entry::Occupied(e) => e.into_mut(),
@@ -236,6 +279,7 @@ impl<'a, T> Entry<'a, T> {
     }
 
     /// Like [`or_insert`](Self::or_insert), computing the default lazily.
+    #[inline]
     pub fn or_insert_with<F: FnOnce() -> T>(self, default: F) -> &'a mut T {
         match self {
             Entry::Occupied(e) => e.into_mut(),
@@ -245,6 +289,7 @@ impl<'a, T> Entry<'a, T> {
 
     /// Like [`or_insert_with`](Self::or_insert_with), but the closure is handed the
     /// key.
+    #[inline]
     pub fn or_insert_with_key<F: FnOnce(&str) -> T>(self, default: F) -> &'a mut T {
         match self {
             Entry::Occupied(e) => e.into_mut(),
@@ -256,6 +301,7 @@ impl<'a, T> Entry<'a, T> {
     }
 
     /// Ensure a value is present (inserting `T::default()` if vacant).
+    #[inline]
     pub fn or_default(self) -> &'a mut T
     where
         T: Default,
@@ -265,6 +311,7 @@ impl<'a, T> Entry<'a, T> {
 
     /// Run `f` on the value if the entry is occupied, then return the entry (for
     /// chaining with `or_insert*`).
+    #[inline]
     pub fn and_modify<F: FnOnce(&mut T)>(mut self, f: F) -> Self {
         if let Entry::Occupied(e) = &mut self {
             f(e.get_mut());
@@ -273,6 +320,8 @@ impl<'a, T> Entry<'a, T> {
     }
 
     /// The key this entry is (or would be) stored under.
+    #[must_use]
+    #[inline(always)]
     pub fn key(&self) -> &str {
         match self {
             Entry::Occupied(e) => e.key(),
@@ -283,31 +332,41 @@ impl<'a, T> Entry<'a, T> {
 
 impl<'a, T> OccupiedEntry<'a, T> {
     /// The stored key.
+    #[must_use]
+    #[inline(always)]
     pub fn key(&self) -> &str {
         &self.map.entries[self.index].0
     }
 
     /// A shared reference to the value.
+    #[must_use]
+    #[inline(always)]
     pub fn get(&self) -> &T {
         &self.map.entries[self.index].1
     }
 
     /// A mutable reference to the value.
+    #[must_use]
+    #[inline(always)]
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.map.entries[self.index].1
     }
 
     /// Consume the entry into a mutable reference tied to the map's borrow.
+    #[must_use]
+    #[inline(always)]
     pub fn into_mut(self) -> &'a mut T {
         &mut self.map.entries[self.index].1
     }
 
     /// Replace the value, returning the old one.
+    #[inline]
     pub fn insert(&mut self, value: T) -> T {
         mem::replace(self.get_mut(), value)
     }
 
     /// Remove the entry, returning its value (order-preserving).
+    #[inline]
     pub fn remove(self) -> T {
         self.map.entries.remove(self.index).1
     }
@@ -315,16 +374,21 @@ impl<'a, T> OccupiedEntry<'a, T> {
 
 impl<'a, T> VacantEntry<'a, T> {
     /// The key that would be inserted.
+    #[must_use]
+    #[inline(always)]
     pub fn key(&self) -> &str {
         &self.key
     }
 
     /// Take back the owned key.
+    #[must_use]
+    #[inline(always)]
     pub fn into_key(self) -> String {
         self.key
     }
 
     /// Insert `value` under the entry's key, returning a mutable reference to it.
+    #[inline]
     pub fn insert(self, value: T) -> &'a mut T {
         self.map.entries.push((self.key, value));
         &mut self.map.entries.last_mut().unwrap().1

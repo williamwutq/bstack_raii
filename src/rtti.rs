@@ -76,7 +76,7 @@ use crate::layout::{
 };
 use crate::refcount;
 use crate::registry::{self, FileId, ForeignHostAllocator};
-use crate::small_map::SmallStringMap;
+use crate::util::small_map::SmallStringMap;
 use crate::wal::{
     HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
     wal_capacity_of, wal_set_idle,
