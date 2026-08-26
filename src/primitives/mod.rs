@@ -43,4 +43,4 @@ mod wide_ptr;
 pub use file_id::{FileId, ResolvedFileId, UnresolvedFileIdError};
 pub use offset::{NonNullOffset, NullOffsetError, Offset};
 pub use type_id::{ResolvedTypeId, TypeId, UntypedTypeIdError};
-pub use wide_ptr::WidePtr;
+pub use wide_ptr::{BrandedWidePtr, WidePtr};

@@ -1,5 +1,7 @@
 //! [`WidePtr`] — the composed wide (fat) pointer: *which file*, *which type*,
-//! *where in that file*.
+//! *where in that file* — and [`BrandedWidePtr`], its borrow-branded in-memory form.
+
+use core::marker::PhantomData;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -97,5 +99,114 @@ impl WidePtr {
     /// pointer is untyped.
     pub const fn resolved_type(self) -> Option<ResolvedTypeId> {
         self.ty.resolve()
+    }
+}
+
+/// A [`WidePtr`] carrying an **in-memory borrow brand** `'a` — the value form a live
+/// `Foreign<'a, T>` holds.
+///
+/// Byte-identical to [`WidePtr`]: the brand is a zero-sized
+/// `PhantomData<fn() -> &'a ()>` (covariant, so `'a` narrows freely), added purely to
+/// bound how long a borrow-tied target — a [`SELF`](FileId::SELF) pointer, valid only
+/// in the file it was read from — may be used. An explicit-file pointer ignores the
+/// brand (it is registry-resolved and valid independently); strip it to a plain
+/// [`WidePtr`] with [`wide`](Self::wide).
+///
+/// Every method just forwards to the inner [`WidePtr`] (all `#[inline(always)]`), so
+/// this is a pure lifetime wrapper with no runtime cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BrandedWidePtr<'a> {
+    ptr: WidePtr,
+    _brand: PhantomData<fn() -> &'a ()>,
+}
+
+impl<'a> BrandedWidePtr<'a> {
+    /// Brand a plain [`WidePtr`] with the borrow `'a`.
+    #[inline(always)]
+    pub const fn from_wide(ptr: WidePtr) -> Self {
+        BrandedWidePtr {
+            ptr,
+            _brand: PhantomData,
+        }
+    }
+
+    /// The inner [`WidePtr`], stripped of the brand.
+    #[inline(always)]
+    pub const fn wide(self) -> WidePtr {
+        self.ptr
+    }
+
+    /// A branded **untyped** pointer to `(file, offset)` — [`WidePtr::new`] branded.
+    #[inline(always)]
+    pub const fn new(file: FileId, offset: Offset) -> Self {
+        Self::from_wide(WidePtr::new(file, offset))
+    }
+
+    /// A branded pointer from all three components — [`WidePtr::with_parts`] branded.
+    #[inline(always)]
+    pub const fn with_parts(file: FileId, ty: TypeId, offset: Offset) -> Self {
+        Self::from_wide(WidePtr::with_parts(file, ty, offset))
+    }
+
+    /// This pointer tagged with RTTI type `ty`, keeping the brand — [`WidePtr::with_type`].
+    #[inline(always)]
+    pub const fn with_type(self, ty: TypeId) -> Self {
+        Self::from_wide(self.ptr.with_type(ty))
+    }
+
+    /// The target file — [`WidePtr::file`].
+    #[inline(always)]
+    pub const fn file(self) -> FileId {
+        self.ptr.file()
+    }
+
+    /// The RTTI type tag — [`WidePtr::type_id`].
+    #[inline(always)]
+    pub const fn type_id(self) -> TypeId {
+        self.ptr.type_id()
+    }
+
+    /// The target address — [`WidePtr::offset`].
+    #[inline(always)]
+    pub const fn offset(self) -> Offset {
+        self.ptr.offset()
+    }
+
+    /// Whether the target file is [`SELF`](FileId::SELF) — [`WidePtr::is_self`].
+    #[inline(always)]
+    pub const fn is_self(self) -> bool {
+        self.ptr.is_self()
+    }
+
+    /// Whether the pointer is null — [`WidePtr::is_null`].
+    #[inline(always)]
+    pub const fn is_null(self) -> bool {
+        self.ptr.is_null()
+    }
+
+    /// The target file refined to an ordinary registered file — [`WidePtr::resolved_file`].
+    #[inline(always)]
+    pub const fn resolved_file(self) -> Option<ResolvedFileId> {
+        self.ptr.resolved_file()
+    }
+
+    /// The type tag refined to a typed id — [`WidePtr::resolved_type`].
+    #[inline(always)]
+    pub const fn resolved_type(self) -> Option<ResolvedTypeId> {
+        self.ptr.resolved_type()
+    }
+}
+
+impl<'a> From<WidePtr> for BrandedWidePtr<'a> {
+    #[inline(always)]
+    fn from(ptr: WidePtr) -> Self {
+        Self::from_wide(ptr)
+    }
+}
+
+impl From<BrandedWidePtr<'_>> for WidePtr {
+    #[inline(always)]
+    fn from(b: BrandedWidePtr<'_>) -> WidePtr {
+        b.wide()
     }
 }
