@@ -47,7 +47,7 @@ use crate::reference::BStackRef;
 use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
 use crate::shared::{BStackRc, BStackWeak};
-use crate::teardown::BStackDrop;
+use crate::types::drop::BStackDrop;
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or

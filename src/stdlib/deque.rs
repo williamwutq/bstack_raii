@@ -48,7 +48,8 @@ use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::replace::{ReplaceError, finish_handback};
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackDeque`]: the block header, a pointer to the
 /// ring data block (`0` = none), its capacity in slots, and the circular

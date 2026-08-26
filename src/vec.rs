@@ -49,7 +49,8 @@ use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
 use crate::replace::ReplaceError;
 use crate::shared::{BStackRc, BStackWeak};
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::BStackDrop;
 
 /// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,
 /// `cap: u64` @ 8, elements from offset 16. Fixed by bstack's ABI (stable across
@@ -299,7 +300,7 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
         if self.writeback.is_some() {
             // Serialize field-resident pushes on this file, and re-read the
             // descriptor inside the lock — our in-memory snapshot may be stale.
-            let lock = crate::wal::wal_lock_for(self.allocator);
+            let lock = crate::io_core::wal::wal_lock_for(self.allocator);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let loc = self.writeback.expect("field-resident vec has a writeback");
             self.data = read_vecdesc(self.allocator.stack(), loc.start())
@@ -548,7 +549,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
         let allocator = self.offsets.allocator();
         for off in self.offsets.to_vec()? {
             // SAFETY: each stored offset names a live child this vec owns.
-            unsafe { crate::teardown::drop_block::<T, A>(Self::elem_range(off), allocator)? };
+            unsafe { crate::io_core::teardown::drop_block::<T, A>(Self::elem_range(off), allocator)? };
         }
         self.offsets.bstack_drop()
     }

@@ -35,7 +35,8 @@ use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE, get_u64};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackBTreeSet`]: header, root node pointer (`0` =
 /// empty), key count, and the embedded Bloom filter's handle offset.

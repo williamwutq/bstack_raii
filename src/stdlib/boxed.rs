@@ -30,7 +30,7 @@ use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackBox<T>`]: the standard [`BlockHeader`] followed
 /// by the boxed value. `#[repr(C, packed)]` (like every generated `XOnDisk`) so

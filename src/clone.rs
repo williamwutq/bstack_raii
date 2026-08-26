@@ -37,7 +37,7 @@
 //! returns `Some`), phase 1 is additionally **intention-first**: each allocation is
 //! logged `Pending` to the persistent WAL block the instant it is made
 //! ([`ClonePlan::alloc_raw`]), so a crash mid-descent is *reclaimed* by
-//! [`crate::wal::finish`] on the next open — down to a one-block window (the block
+//! [`crate::io_core::wal::finish`] on the next open — down to a one-block window (the block
 //! allocated but not yet logged). The phase-2 commit flips that transaction
 //! `Complete` inside the same atomic batch, so "clone committed" and "WAL Complete"
 //! are one event. Because the WAL block is a single-writer-per-file singleton, the
@@ -55,9 +55,9 @@ use crate::block::{BStackBlock, BStackShared};
 use crate::layout;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
 use crate::vec::{BYTEVEC_HEADER, VecDesc};
-use crate::wal::{
+use crate::io_core::wal::{
     HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
     wal_capacity_of, wal_set_idle,
 };
@@ -137,7 +137,7 @@ pub struct ClonePlan {
     /// the allocator opts out of reclamation ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)
     /// is `None`) or nothing was allocated. Its [`HeldLock`] pins the file's WAL lock
     /// through commit; its logged `Pending` `Alloc` entries are *exactly*
-    /// [`allocated`](Self::allocated), so [`finish`](crate::wal::finish) reclaims
+    /// [`allocated`](Self::allocated), so [`finish`](crate::io_core::wal::finish) reclaims
     /// precisely those on abandon.
     wal: Option<CloneWal>,
 }
@@ -510,7 +510,7 @@ impl ClonePlan {
     /// before [`commit`](Self::commit).
     ///
     /// With an intention-first WAL in flight, the fresh allocations are logged
-    /// `Pending`, so this abandons that transaction via [`finish`](crate::wal::finish)
+    /// `Pending`, so this abandons that transaction via [`finish`](crate::io_core::wal::finish)
     /// (freeing exactly the logged allocs — which equal `allocated` — and marking the
     /// persistent block idle), the same path a real crash takes; the WAL lock is held
     /// by `self` and released as it drops. Without a WAL the ranges are freed directly.
@@ -539,7 +539,7 @@ impl ClonePlan {
     /// **Crash reclamation is automatic**: when the allocator names a WAL anchor
     /// ([`BStackRaiiAllocator::wal_anchor`] returns `Some`), the plan's fresh
     /// allocations were already logged `Pending` *during the descent*
-    /// ([`alloc_raw`](Self::alloc_raw)) and are reclaimed by [`crate::wal::finish`]
+    /// ([`alloc_raw`](Self::alloc_raw)) and are reclaimed by [`crate::io_core::wal::finish`]
     /// on the next open if the process dies before the commit lands; here that
     /// transaction is flipped `Complete` *inside* the commit batch, so "clone
     /// committed" and "WAL Complete" are the same atomic event. An allocator that

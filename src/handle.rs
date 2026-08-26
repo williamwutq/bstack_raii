@@ -23,7 +23,8 @@ use crate::block::{BStackBlock, BStackWeakable};
 use crate::layout;
 use crate::io_core::refcount;
 use crate::reference::BStackRef;
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::BStackDrop;
 
 /// `#[bstack_owned]`: an exclusively-owned child.
 ///
@@ -108,25 +109,25 @@ impl<T: BStackBlock> BStackDrop for OwnedRef<T> {
         // Bound the in-file owned recursion (this is the chokepoint every
         // generated `__bstack_drop_children` re-enters through): an owned cycle
         // errors here instead of overflowing the native stack.
-        let _depth = crate::teardown::TeardownDepthGuard::enter()?;
+        let _depth = crate::io_core::teardown::TeardownDepthGuard::enter()?;
         // An owned child is freed by running the block's own recursive teardown,
         // which frees its children (post-order) and then deallocs the block.
         // SAFETY: an `OwnedRef` is an ownership token minted (via the `unsafe`
         // `new`) over a live block this token exclusively owns.
-        unsafe { crate::teardown::drop_block::<T, A>(self.0.into_range(), allocator) }
+        unsafe { crate::io_core::teardown::drop_block::<T, A>(self.0.into_range(), allocator) }
     }
 }
 
 impl<T: BStackBlock> BStackDrop for StrongRef<T> {
     fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
-        let _depth = crate::teardown::TeardownDepthGuard::enter()?;
+        let _depth = crate::io_core::teardown::TeardownDepthGuard::enter()?;
         let data_range = self.0.into_range();
         let off = layout::checked_off(data_range.start(), layout::RC_REFCOUNT_OFFSET)?;
         // Decrement the inline refcount; only the last owner frees the block.
         if refcount::fetch_sub(allocator.stack(), off, 1)? == 1 {
             // SAFETY: last strong owner (the fetch_sub hit 1) of a live block.
-            unsafe { crate::teardown::drop_block::<T, A>(data_range, allocator)? };
+            unsafe { crate::io_core::teardown::drop_block::<T, A>(data_range, allocator)? };
         }
         Ok(())
     }
@@ -171,14 +172,14 @@ pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
     ctrl_range: BStackRange,
 ) -> io::Result<()> {
     // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
-    let _depth = crate::teardown::TeardownDepthGuard::enter()?;
+    let _depth = crate::io_core::teardown::TeardownDepthGuard::enter()?;
     let stack = allocator.stack();
     let strong_off = layout::checked_off(ctrl_range.start(), layout::CTRL_STRONG_OFFSET)?;
     // Phase 1: last strong owner frees the data block (children + shell), then
     // releases the phantom weak the strong owners collectively held.
     if refcount::fetch_sub(stack, strong_off, 1)? == 1 {
         // SAFETY: last strong owner of a live `(rc, weak)` data block.
-        unsafe { crate::teardown::drop_block::<T, A>(data_range, allocator)? };
+        unsafe { crate::io_core::teardown::drop_block::<T, A>(data_range, allocator)? };
         let weak_off = layout::checked_off(ctrl_range.start(), layout::CTRL_WEAK_OFFSET)?;
         // Phase 2 (early): if no real weak handles remain, the phantom release
         // drives weak to zero and the control block is freed here.

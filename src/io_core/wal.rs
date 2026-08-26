@@ -57,41 +57,44 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use bstack::{BStackBulkAllocator, BStackOwnedSlice, BStackRange};
+use bstack::BStackRange;
 use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
+use crate::primitives::{NonNullOffset, Offset};
 use crate::registry::{self, FileId};
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
+use crate::util::io_errorfn;
 
-/// `R'`: an allocation requirement carrying identity — a length whose address has
-/// been "forgotten", plus an `id` that keeps equal-length requirements distinct.
-/// The `id` is a wrapping autoincrement (see [`WalLog::fresh_id`]).
-///
-/// `file_id` names the file the allocation targets — `0` = the local file
-/// ([`FileId::SELF`], the common case), non-zero = a foreign file. [`reduce`] only
-/// repurposes a freed slice for a requirement in the **same** file, so a foreign
-/// requirement never reuses local storage (or vice versa).
-// `reduce` (and the `AllocReq` / `Reduced` shapes it operates on) implements the
-// groupoid-reduction optimisation described above, but nothing in the crate
-// currently calls it — no commit path (`bulk`, `clone`, `teardown`) reuses a
-// freed slice for a same-length allocation. Kept `#[cfg(test)]` (exercised by
-// the unit tests below) rather than deleted, since wiring it in is tracked
-// separately.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AllocReq {
-    pub id: u64,
-    pub len: u64,
-    /// Target file: `0` = local ([`FileId::SELF`]), non-zero = a foreign [`FileId`]
-    /// (a `FileId` *is* a `u32`). Split from `_obj_id` to mirror [`WalEntry`]'s
-    /// on-disk `(file_id, _obj_id)` word, so the planning form and the log form share
-    /// one file-identity shape.
-    pub file_id: u32,
-    /// Reserved companion to `file_id` (a future intra-file object id / RTTI);
-    /// currently always `0` and unused, mirroring [`WalEntry`].
-    pub _obj_id: u32,
-}
+// --- On-disk constants ------------------------------------------------------
+
+/// Magic word at the head of a persistent WAL block ("bstackWA").
+const WAL_MAGIC: u64 = 0x6273_7461_636b_5741;
+
+/// Minimum entry capacity of the persistent WAL block; larger transactions grow
+/// it to the next power of two.
+const WAL_MIN_CAP: u64 = 8;
+
+/// Ceiling on a persisted WAL header's `capacity` (and, transitively, `count`)
+/// that this crate will ever trust. `header.capacity`/`header.count` are read
+/// straight from disk with only the `magic` field validating the record, so a
+/// corrupted header could otherwise claim billions of entries — driving an
+/// unbounded allocation in [`load_at`] (`handle_alloc_error` aborts the process)
+/// or, worse, letting [`wal_ensure_block`] skip a real reallocation because a
+/// forged `capacity` looks "already big enough" while the real block stays its
+/// old (small) size, so a later [`wal_append_alloc`] writes past it. No real
+/// transaction logs anywhere near this many allocations.
+const WAL_MAX_CAP: u64 = 1 << 20;
+
+/// Offset of the header `count` field (the `u64` after the magic + `txn_status`).
+const WAL_COUNT_OFFSET: u64 = 16;
+
+/// Anchor offset for the bstack-provided freeing allocators: the second `u64`
+/// word of the user-reserved region every one of them keeps at payload offset 0
+/// and never hands out (FirstFit reserves 16 B there, GhostTree 32 B, Slab and
+/// CheckedSlab 24 B — all ≥ 16). Payload offset 0 is left as `bstack_raii`'s null
+/// niche, so the anchor is the *next* word, `[8, 16)`.
+pub const STD_WAL_ANCHOR: u64 = 8;
 
 /// The status lifecycle of a WAL operation: the ordered set
 /// `{None < Pending < Complete}` plus the recovery sink `Abandon`.
@@ -175,14 +178,14 @@ pub(crate) struct WalEntry {
     status: u8,
     op: u8,
     _pad: [u8; 6],
-    /// The file the recorded slice lives in: `0` = this file ([`FileId::SELF`]),
-    /// non-zero = a foreign [`FileId`] resolved through the registry on recovery.
+    /// The file the recorded slice lives in: [`SELF`](FileId::SELF) = this file,
+    /// else a foreign [`FileId`] resolved through the registry on recovery.
     ///
-    /// A `u32` (a [`FileId`] *is* a `u32`) paired with the reserved `_obj_id` word
-    /// below, so the two together fill the same 8 bytes the field used to be a single
-    /// `u64`. On little-endian `file_id` keeps its offset (it was the `u64`'s low
-    /// word), so the on-disk image is unchanged.
-    file_id: u32,
+    /// A [`FileId`] is a `#[repr(transparent)]` `u32`, paired with the reserved
+    /// `_obj_id` word below so the two together fill the same 8 bytes the field used
+    /// to be a single `u64`. On little-endian it keeps its offset (it was the `u64`'s
+    /// low word), so the on-disk image is unchanged.
+    file_id: FileId,
     /// Reserved for a future intra-file object id (e.g. RTTI / sub-object
     /// addressing). Currently always `0` and unread — split out now so the split is
     /// a no-op on disk rather than a later breaking widening.
@@ -210,7 +213,7 @@ impl WalEntry {
             status: status as u8,
             op: WalOp::Alloc as u8,
             _pad: [0; 6],
-            file_id: file.get(),
+            file_id: file,
             _obj_id: 0,
             word_a: slice.start(),
             word_b: slice.len(),
@@ -231,7 +234,7 @@ impl WalEntry {
             status: status as u8,
             op: WalOp::Dealloc as u8,
             _pad: [0; 6],
-            file_id: file.get(),
+            file_id: file,
             _obj_id: 0,
             word_a: slice.start(),
             word_b: slice.len(),
@@ -248,12 +251,11 @@ impl WalEntry {
         WalOp::from_u8(self.op)
     }
 
-    /// The file the recorded slice lives in: `0` = this file ([`FileId::SELF`]),
-    /// non-zero = a foreign [`FileId`] reclaimed through the registry on recovery.
-    /// Widened to `u64` for the recovery path (`FileId::from_u64`); the stored field
-    /// is a `u32`.
+    /// The file the recorded slice lives in — [`SELF`](FileId::SELF) = this file,
+    /// else a foreign [`FileId`] reclaimed through the registry on recovery. Widened
+    /// to `u64` for the recovery path (`FileId::from_u64`).
     pub fn file_id(&self) -> u64 {
-        self.file_id as u64
+        self.file_id.as_u64()
     }
 
     /// The recorded slice `S`, if this is an `Alloc` entry (to be freed on abandon).
@@ -330,48 +332,6 @@ impl WalLog {
     }
 }
 
-/// The result of [`reduce`]: allocation requirements that were satisfied by
-/// repurposing a freed slice (`reused`), and the physical operations that remain.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct Reduced {
-    /// `(requirement, repurposed slice)` — no physical alloc *or* dealloc needed.
-    /// The slice lives in `requirement.file_id` (reuse is always same-file).
-    pub reused: Vec<(AllocReq, BStackRange)>,
-    /// Requirements still needing a physical `Alloc`.
-    pub allocs: Vec<AllocReq>,
-    /// Slices still needing a physical `Dealloc`, each tagged with the file it lives
-    /// in (`0` = local [`FileId::SELF`], non-zero = a foreign [`FileId`], a `u32`).
-    pub deallocs: Vec<(u32, BStackRange)>,
-}
-
-/// The groupoid reduction: cancel each allocation requirement against a to-be-freed
-/// slice **of equal length in the same file**, handing that slice's storage straight
-/// to the new allocation (`ForgetAddress ∘ Dealloc ∘ Alloc ∘ Choice = id`). A slice
-/// in one file can never satisfy a requirement in another (a cross-file `Foreign`
-/// alloc and a local free do not cancel), so the `file_id`s must match. Only the
-/// unpaired remainder becomes physical work.
-#[cfg(test)]
-pub(crate) fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<(u32, BStackRange)>) -> Reduced {
-    let mut reused = Vec::new();
-    let mut rem_allocs = Vec::new();
-    for req in allocs {
-        if let Some(pos) = deallocs
-            .iter()
-            .position(|(fid, d)| *fid == req.file_id && d.len() == req.len)
-        {
-            reused.push((req, deallocs.remove(pos).1));
-        } else {
-            rem_allocs.push(req);
-        }
-    }
-    Reduced {
-        reused,
-        allocs: rem_allocs,
-        deallocs,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // On-disk WAL block + completion runtime.
 //
@@ -392,29 +352,11 @@ pub(crate) fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<(u32, BStackRange)
 // `txn_status` is purely for crash recovery, not live mutual exclusion.
 // ---------------------------------------------------------------------------
 
-const WAL_MAGIC: u64 = 0x6273_7461_636b_5741; // "bstackWA"
-
-/// Minimum entry capacity of the persistent WAL block; larger transactions grow
-/// it to the next power of two.
-const WAL_MIN_CAP: u64 = 8;
-
-/// Ceiling on a persisted WAL header's `capacity` (and, transitively, `count`)
-/// that this crate will ever trust. `header.capacity`/`header.count` are read
-/// straight from disk with only the `magic` field validating the record, so a
-/// corrupted header could otherwise claim billions of entries — driving an
-/// unbounded allocation in [`load_at`] (`handle_alloc_error` aborts the process)
-/// or, worse, letting [`wal_ensure_block`] skip a real reallocation because a
-/// forged `capacity` looks "already big enough" while the real block stays its
-/// old (small) size, so a later [`wal_append_alloc`] writes past it. No real
-/// transaction logs anywhere near this many allocations.
-const WAL_MAX_CAP: u64 = 1 << 20;
-
-fn corrupt_wal_capacity() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "corrupt persistent WAL block: capacity/count out of range",
-    )
-}
+io_errorfn!(
+    corrupt_wal_capacity,
+    InvalidData,
+    "corrupt persistent WAL block: capacity/count out of range"
+);
 
 /// On-disk header of the persistent WAL block. `txn_status` is both the
 /// transaction-level commit marker and the idle/in-use flag (`None` = idle);
@@ -453,126 +395,6 @@ impl WalLog {
         img.extend_from_slice(bytemuck::cast_slice(&self.entries));
         img
     }
-}
-
-// `BStackRaiiAllocator` (the crate-wide allocator bound) is defined at the crate
-// root in `lib.rs`; the impls for bstack's own allocators live here, next to the
-// anchor constant and the WAL machinery they feed.
-
-/// Anchor offset for the bstack-provided freeing allocators: the second `u64`
-/// word of the user-reserved region every one of them keeps at payload offset 0
-/// and never hands out (FirstFit reserves 16 B there, GhostTree 32 B, Slab and
-/// CheckedSlab 24 B — all ≥ 16). Payload offset 0 is left as `bstack_raii`'s null
-/// niche, so the anchor is the *next* word, `[8, 16)`.
-pub const STD_WAL_ANCHOR: u64 = 8;
-
-// SAFETY: each of these allocators documents a user-reserved region at payload
-// offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
-// `[8, 16)` slot sits inside it and persists across open/close.
-/// Emit the three `BStackRaiiAllocator` bulk overrides — `alloc_many` / `free_many`
-/// routed through the atomic [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) /
-/// [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk), and `atomic_bulk` returning
-/// `true` — for a concrete allocator that also implements [`BStackBulkAllocator`].
-///
-/// Invoked inside an `unsafe impl BStackRaiiAllocator` body; the rest of the impl
-/// (e.g. `wal_anchor`) is still written per type. This is a macro rather than a
-/// blanket `impl<A: BStackBulkAllocator>` because that impl can't exist: it would
-/// collide with the per-type `unsafe impl`s (coherence), can't vary `wal_anchor` by
-/// type, and can't blanket-assert each allocator's null-niche safety — and stable
-/// Rust has no specialization to say "override only when also bulk".
-macro_rules! bulk_raii_methods {
-    () => {
-        fn alloc_many(&self, sizes: &[u64]) -> io::Result<Vec<BStackRange>> {
-            bulk_alloc_many(self, sizes)
-        }
-        unsafe fn free_many(
-            &self,
-            ranges: impl IntoIterator<Item = BStackRange>,
-        ) -> io::Result<()> {
-            bulk_free_many(self, ranges)
-        }
-        fn atomic_bulk(&self) -> bool {
-            true
-        }
-    };
-}
-
-unsafe impl BStackRaiiAllocator for bstack::FirstFitBStackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
-        Some(STD_WAL_ANCHOR)
-    }
-}
-unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
-        Some(STD_WAL_ANCHOR)
-    }
-    // GhostTree implements `BStackBulkAllocator` — route the multi-block helpers
-    // through the atomic bulk ops.
-    bulk_raii_methods!();
-}
-unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
-        Some(STD_WAL_ANCHOR)
-    }
-}
-unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
-        Some(STD_WAL_ANCHOR)
-    }
-}
-// FUZZ.md's O2 oracle (overlap / double-free) needs a checking wrapper around a
-// normal allocator; only this crate can bridge a `bstack`-foreign generic
-// (`DebugCheckingAllocator<A>`) to our foreign `BStackRaiiAllocator` (orphan
-// rules), so it lives here rather than in test code. Pinned to `FirstFit` (the
-// allocator the fuzz/test harness actually wraps) rather than written generic
-// over `A: BStackAllocator`, matching every other impl in this block being
-// per-concrete-type, not blanket.
-unsafe impl BStackRaiiAllocator
-    for bstack::DebugCheckingAllocator<bstack::FirstFitBStackAllocator>
-{
-    fn wal_anchor(&self) -> Option<u64> {
-        Some(STD_WAL_ANCHOR)
-    }
-}
-// `LinearBStackAllocator` deliberately does **not** implement `BStackRaiiAllocator`:
-// its `alloc` is a bare `BStack::extend`, so its first allocation hands out payload
-// offset 0 — the crate's null niche — and its `dealloc` is a no-op (teardown would
-// free nothing). Both violate the trait's safety contract, so it stays out (even
-// though it implements `BStackBulkAllocator`).
-
-/// The bulk override shared by every [`BStackBulkAllocator`]: allocate all `sizes`
-/// as one atomic [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and hand back their
-/// ranges. Either all blocks are allocated or none is (and the store is unchanged);
-/// a crash mid-op is reclaimed by the allocator's own recovery, so this needs no WAL.
-fn bulk_alloc_many<A>(allocator: &A, sizes: &[u64]) -> io::Result<Vec<BStackRange>>
-where
-    A: BStackRaiiAllocator + BStackBulkAllocator,
-{
-    let slices = allocator.alloc_bulk(sizes)?;
-    Ok(slices.into_iter().map(|s| s.as_range()).collect())
-}
-
-/// The bulk override shared by every [`BStackBulkAllocator`]: free all `ranges` as
-/// one atomic [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk). Reconstructs an
-/// owned slice per range (as [`crate::teardown::dealloc_range`] does) and frees them
-/// together; on failure the error's `source` is surfaced (the un-freed handles it
-/// carries back are dropped — they are non-RAII, so dropping does not double-free).
-fn bulk_free_many<A>(allocator: &A, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()>
-where
-    A: BStackRaiiAllocator + BStackBulkAllocator,
-{
-    let ranges: Vec<BStackRange> = ranges.into_iter().collect();
-    let handles = ranges
-        .iter()
-        // SAFETY: each range is a live allocation owned by `allocator` that no other
-        // live handle will also free (the `free_many` contract).
-        .map(|&r| unsafe { BStackOwnedSlice::from_raw_range(allocator, r) })
-        .collect::<Vec<_>>();
-    // `dealloc_bulk` is atomic (all-or-nothing), so on failure every range is
-    // still allocated — report them all as unfreed.
-    allocator
-        .dealloc_bulk(handles)
-        .map_err(|e| crate::bulk::FreeManyError::from_parts(e.source, ranges).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -677,38 +499,37 @@ impl Drop for HeldLock {
     }
 }
 
-/// Test-only: hold `alloc`'s clone WAL lock, then attempt to re-acquire it on the same
-/// thread — exactly what a same-file nested clone (owned A→B→A cycle, or a `Foreign`
-/// resolving to the home file) does. The re-entry must return `Err` instead of
-/// deadlocking on the non-reentrant lock (issue F4). Returns whether it was rejected;
-/// the outer lock is released when this returns, so the state is left clean.
-#[cfg(test)]
-pub(crate) fn test_reentrant_acquire_is_rejected<A: BStackRaiiAllocator>(alloc: &A) -> bool {
-    let _outer = HeldLock::acquire(alloc).expect("first acquire should succeed");
-    HeldLock::acquire(alloc).is_err()
-}
+// --- The persistent WAL block: anchor, create / grow, capacity --------------
 
 /// Read the anchor slot: the persistent WAL block's offset, or `None` if the
 /// allocator opts out of reclamation ([`wal_anchor`](BStackRaiiAllocator::wal_anchor)
 /// is `None`) or no block has been created yet.
-fn read_anchor<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<Option<u64>> {
+fn read_anchor<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<Option<NonNullOffset>> {
     let slot = match allocator.wal_anchor() {
         Some(s) => s,
         None => return Ok(None),
     };
     let mut buf = [0u8; 8];
     allocator.stack().get_into(slot, &mut buf)?;
-    let off = u64::from_le_bytes(buf);
-    Ok((off != 0).then_some(off))
+    // `0` is "no block yet"; a real WAL block always sits at a non-zero offset.
+    Ok(Offset::from_raw(u64::from_le_bytes(buf)).to_non_null())
+}
+
+/// The persistent WAL block [`wal_ensure_block`] guarantees: its on-disk byte
+/// [`range`](Self::range) (header + `capacity` entry slots) and its
+/// [`capacity`](Self::capacity) in [`WalEntry`] slots.
+struct WalBlock {
+    range: BStackRange,
+    capacity: u64,
 }
 
 /// Ensure the persistent WAL block exists and holds at least `needed` entry
-/// slots, returning `(block_offset, capacity)`. Lazily allocates it on first use;
+/// slots, returning it as a [`WalBlock`]. Lazily allocates it on first use;
 /// grows it (free old, allocate a larger one — its contents are transient between
 /// transactions) when a transaction needs more capacity. The header is
 /// (re)initialized `None` (idle) whenever the block is created or grown. Errors if
 /// the allocator names no anchor slot (callers gate on `wal_anchor().is_some()`).
-fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::Result<(u64, u64)> {
+fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::Result<WalBlock> {
     let slot = allocator
         .wal_anchor()
         .ok_or_else(|| io::Error::other("allocator names no WAL anchor slot"))?;
@@ -718,6 +539,7 @@ fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::R
 
     let mut old_to_free: Option<BStackRange> = None;
     if let Some(off) = read_anchor(allocator)? {
+        let off = off.as_u64();
         let mut hbuf = [0u8; size_of::<WalHeader>()];
         stack.get_into(off, &mut hbuf)?;
         let header: WalHeader = bytemuck::pod_read_unaligned(&hbuf);
@@ -732,7 +554,10 @@ fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::R
                 return Err(corrupt_wal_capacity());
             }
             if header.capacity >= needed {
-                return Ok((off, header.capacity));
+                return Ok(WalBlock {
+                    range: BStackRange::new(off, hsz + header.capacity * esz),
+                    capacity: header.capacity,
+                });
             }
             // Too small: reclaim the old block *after* the new one is allocated and the
             // anchor repointed — link-before-free, so a crash never leaves the anchor
@@ -762,8 +587,13 @@ fn wal_ensure_block<A: BStackRaiiAllocator>(allocator: &A, needed: u64) -> io::R
     if let Some(old) = old_to_free {
         unsafe { dealloc_range(allocator, old)? };
     }
-    Ok((off, capacity))
+    Ok(WalBlock {
+        range: BStackRange::new(off, hsz + capacity * esz),
+        capacity,
+    })
 }
+
+// --- Staging & completion (append entries, read back, mark idle) ------------
 
 /// Stage `log` into the allocator's persistent WAL block at transaction status
 /// `txn_status`, (lazily) creating or growing the block as needed. Returns the
@@ -775,12 +605,10 @@ pub(crate) fn persist_at<A: BStackRaiiAllocator>(
     log: &WalLog,
     txn_status: WalStatus,
 ) -> io::Result<BStackRange> {
-    let (off, capacity) = wal_ensure_block(allocator, log.entries().len() as u64)?;
-    let image = log.block_image(txn_status, capacity);
-    allocator.stack().set(off, &image)?;
-    let hsz = size_of::<WalHeader>() as u64;
-    let esz = size_of::<WalEntry>() as u64;
-    Ok(BStackRange::new(off, hsz + capacity * esz))
+    let block = wal_ensure_block(allocator, log.entries().len() as u64)?;
+    let image = log.block_image(txn_status, block.capacity);
+    allocator.stack().set(block.range.start(), &image)?;
+    Ok(block.range)
 }
 
 /// Read the staged transaction in the allocator's persistent WAL block, if any.
@@ -791,7 +619,7 @@ fn load_at<A: BStackRaiiAllocator>(
 ) -> io::Result<Option<(BStackRange, WalHeader, Vec<WalEntry>)>> {
     let stack = allocator.stack();
     let wal_off = match read_anchor(allocator)? {
-        Some(off) => off,
+        Some(off) => off.as_u64(),
         None => return Ok(None),
     };
     let mut hbuf = [0u8; size_of::<WalHeader>()];
@@ -831,9 +659,6 @@ pub(crate) fn wal_set_idle<A: BStackRaiiAllocator>(
         .set(block_off + 8, [WalStatus::None as u8])
 }
 
-/// Offset of the header `count` field (the `u64` after the magic + `txn_status`).
-const WAL_COUNT_OFFSET: u64 = 16;
-
 /// Entry-slot capacity of a persistent WAL block, from its full range.
 pub(crate) fn wal_capacity_of(block: BStackRange) -> u64 {
     (block.len() - size_of::<WalHeader>() as u64) / size_of::<WalEntry>() as u64
@@ -862,12 +687,14 @@ pub(crate) fn wal_append_alloc<A: BStackRaiiAllocator>(
     Ok(())
 }
 
+// --- Crash recovery (reclaim orphans on the next open) ----------------------
+
 /// Free one WAL-recorded slice during recovery, in whichever file it lives in.
 ///
 /// * `file_id == 0` ([`FileId::SELF`]) — the WAL's own file: free through the local
 ///   `allocator` (the overwhelmingly common path).
 /// * `file_id != 0` — a foreign file: resolve it through the [registry](crate::registry)
-///   and free via its live [`ForeignHost`]. If that file is **not currently attached**
+///   and free via its live [`BStackRaiiHost`]. If that file is **not currently attached**
 ///   (or the registry is not up), the orphan cannot be reclaimed here — it is *left to
 ///   leak*, which the crate's atomicity contract explicitly permits (a cross-file
 ///   orphan whose file is unavailable at recovery degrades to a leak, exactly as if
@@ -995,6 +822,96 @@ pub fn finish<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<usize> {
     finish_at_locked(allocator)
 }
 
+// --- Groupoid reduction (test-only) -----------------------------------------
+//
+// The reduction optimisation described in the module docs (reuse a freed slice
+// for an equal-length allocation). Nothing in the crate currently wires it into a
+// commit path, so it and its shapes are `#[cfg(test)]`, exercised by the unit
+// tests below.
+
+/// `R'`: an allocation requirement carrying identity — a length whose address has
+/// been "forgotten", plus an `id` that keeps equal-length requirements distinct.
+/// The `id` is a wrapping autoincrement (see [`WalLog::fresh_id`]).
+///
+/// `file_id` names the file the allocation targets — `0` = the local file
+/// ([`FileId::SELF`], the common case), non-zero = a foreign file. [`reduce`] only
+/// repurposes a freed slice for a requirement in the **same** file, so a foreign
+/// requirement never reuses local storage (or vice versa).
+// `reduce` (and the `AllocReq` / `Reduced` shapes it operates on) implements the
+// groupoid-reduction optimisation described above, but nothing in the crate
+// currently calls it — no commit path (`bulk`, `clone`, `teardown`) reuses a
+// freed slice for a same-length allocation. Kept `#[cfg(test)]` (exercised by
+// the unit tests below) rather than deleted, since wiring it in is tracked
+// separately.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AllocReq {
+    pub id: u64,
+    pub len: u64,
+    /// Target file: [`SELF`](FileId::SELF) = local, else a foreign [`FileId`].
+    /// Mirrors [`WalEntry`]'s on-disk `(file_id, _obj_id)` word, so the planning form
+    /// and the log form share one file-identity shape.
+    pub file_id: FileId,
+    /// Reserved companion to `file_id` (a future intra-file object id / RTTI);
+    /// currently always `0` and unused, mirroring [`WalEntry`].
+    pub _obj_id: u32,
+}
+
+/// The result of [`reduce`]: allocation requirements that were satisfied by
+/// repurposing a freed slice (`reused`), and the physical operations that remain.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Reduced {
+    /// `(requirement, repurposed slice)` — no physical alloc *or* dealloc needed.
+    /// The slice lives in `requirement.file_id` (reuse is always same-file).
+    pub reused: Vec<(AllocReq, BStackRange)>,
+    /// Requirements still needing a physical `Alloc`.
+    pub allocs: Vec<AllocReq>,
+    /// Slices still needing a physical `Dealloc`, each tagged with the file it lives
+    /// in ([`SELF`](FileId::SELF) = local, else a foreign [`FileId`]).
+    pub deallocs: Vec<(FileId, BStackRange)>,
+}
+
+/// The groupoid reduction: cancel each allocation requirement against a to-be-freed
+/// slice **of equal length in the same file**, handing that slice's storage straight
+/// to the new allocation (`ForgetAddress ∘ Dealloc ∘ Alloc ∘ Choice = id`). A slice
+/// in one file can never satisfy a requirement in another (a cross-file `Foreign`
+/// alloc and a local free do not cancel), so the `file_id`s must match. Only the
+/// unpaired remainder becomes physical work.
+#[cfg(test)]
+pub(crate) fn reduce(allocs: Vec<AllocReq>, mut deallocs: Vec<(FileId, BStackRange)>) -> Reduced {
+    let mut reused = Vec::new();
+    let mut rem_allocs = Vec::new();
+    for req in allocs {
+        if let Some(pos) = deallocs
+            .iter()
+            .position(|(fid, d)| *fid == req.file_id && d.len() == req.len)
+        {
+            reused.push((req, deallocs.remove(pos).1));
+        } else {
+            rem_allocs.push(req);
+        }
+    }
+    Reduced {
+        reused,
+        allocs: rem_allocs,
+        deallocs,
+    }
+}
+
+// --- Other test-only helpers ------------------------------------------------
+
+/// Test-only: hold `alloc`'s clone WAL lock, then attempt to re-acquire it on the same
+/// thread — exactly what a same-file nested clone (owned A→B→A cycle, or a `Foreign`
+/// resolving to the home file) does. The re-entry must return `Err` instead of
+/// deadlocking on the non-reentrant lock (issue F4). Returns whether it was rejected;
+/// the outer lock is released when this returns, so the state is left clean.
+#[cfg(test)]
+pub(crate) fn test_reentrant_acquire_is_rejected<A: BStackRaiiAllocator>(alloc: &A) -> bool {
+    let _outer = HeldLock::acquire(alloc).expect("first acquire should succeed");
+    HeldLock::acquire(alloc).is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,17 +1000,17 @@ mod tests {
             AllocReq {
                 id: 0,
                 len: 256,
-                file_id: 0,
+                file_id: FileId::SELF,
                 _obj_id: 0,
             },
             AllocReq {
                 id: 1,
                 len: 600,
-                file_id: 0,
+                file_id: FileId::SELF,
                 _obj_id: 0,
             },
         ];
-        let deallocs = vec![(0, BStackRange::new(0x1FF0, 256))];
+        let deallocs = vec![(FileId::SELF, BStackRange::new(0x1FF0, 256))];
         let r = reduce(allocs, deallocs);
         assert_eq!(r.reused.len(), 1);
         assert_eq!(
@@ -1101,7 +1018,7 @@ mod tests {
             AllocReq {
                 id: 0,
                 len: 256,
-                file_id: 0,
+                file_id: FileId::SELF,
                 _obj_id: 0,
             }
         );
@@ -1111,7 +1028,7 @@ mod tests {
             vec![AllocReq {
                 id: 1,
                 len: 600,
-                file_id: 0,
+                file_id: FileId::SELF,
                 _obj_id: 0,
             }]
         );
@@ -1123,10 +1040,10 @@ mod tests {
         let allocs = vec![AllocReq {
             id: 0,
             len: 100,
-            file_id: 0,
+            file_id: FileId::SELF,
             _obj_id: 0,
         }];
-        let deallocs = vec![(0, BStackRange::new(8, 200))];
+        let deallocs = vec![(FileId::SELF, BStackRange::new(8, 200))];
         let r = reduce(allocs, deallocs);
         assert!(r.reused.is_empty());
         assert_eq!(r.allocs.len(), 1);
@@ -1140,10 +1057,10 @@ mod tests {
         let allocs = vec![AllocReq {
             id: 0,
             len: 128,
-            file_id: 4,
+            file_id: FileId::from_u64(4).unwrap(),
             _obj_id: 0,
         }];
-        let deallocs = vec![(0, BStackRange::new(0x100, 128))];
+        let deallocs = vec![(FileId::SELF, BStackRange::new(0x100, 128))];
         let r = reduce(allocs, deallocs);
         assert!(r.reused.is_empty());
         assert_eq!(r.allocs.len(), 1);

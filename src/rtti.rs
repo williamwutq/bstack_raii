@@ -77,7 +77,7 @@ use crate::layout::{
 use crate::io_core::refcount;
 use crate::registry::{self, FileId, ForeignHostAllocator};
 use crate::util::small_map::SmallStringMap;
-use crate::wal::{
+use crate::io_core::wal::{
     HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
     wal_capacity_of, wal_set_idle,
 };
@@ -1352,7 +1352,7 @@ struct CloneState {
     allocated: Vec<BStackRange>,
     /// The in-flight intention-first WAL transaction: when the allocator
     /// names a WAL anchor, each `alloc_copy` block is logged `Pending` before it is
-    /// used, so a **crash** mid-clone is reclaimed by [`wal::finish`](crate::wal::finish)
+    /// used, so a **crash** mid-clone is reclaimed by [`wal::finish`](crate::io_core::wal::finish)
     /// on the next open (the in-process error path already frees `allocated`). `None`
     /// when the allocator opts out of reclamation or nothing has been allocated yet.
     wal: Option<CloneWal>,
@@ -1988,7 +1988,7 @@ impl RttiRegistry {
         // rather than leaking permanently.
         // SAFETY: every range in `to_free` was collected by the walk from
         // owned slots of the structure being torn down, in this file.
-        unsafe { crate::teardown::commit_home_frees(alloc, to_free) }
+        unsafe { crate::io_core::teardown::commit_home_frees(alloc, to_free) }
     }
 
     /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown)):
@@ -2024,7 +2024,7 @@ impl RttiRegistry {
 
     /// Tear down a `Foreign` reference's target **in the target's own file**. `SELF`
     /// (`file_id == 0`) resolves against `home`; a registered file is reached through
-    /// its [`ForeignHost`](crate::registry::ForeignHost) — a detached / unknown file
+    /// its [`BStackRaiiHost`](crate::registry::BStackRaiiHost) — a detached / unknown file
     /// leaks (the design permits it) rather than erroring. `offset == 0` (null) is a
     /// no-op.
     fn teardown_foreign<A: BStackRaiiAllocator>(
@@ -2684,7 +2684,7 @@ impl RttiRegistry {
         // SAFETY: the shell is the caller-owned root (its fields already moved out);
         // the control block, if included, has no remaining references; both live in
         // this file.
-        if let Err(e) = unsafe { crate::teardown::commit_home_frees(alloc, to_free) } {
+        if let Err(e) = unsafe { crate::io_core::teardown::commit_home_frees(alloc, to_free) } {
             // SAFETY: `materialized` are this call's own embed copies.
             let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
             return Err(e);

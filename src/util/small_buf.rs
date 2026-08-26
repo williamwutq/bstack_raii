@@ -23,6 +23,7 @@ impl SmallBuf {
         Self::Buf8([0u8; 8])
     }
 
+    #[allow(unused)]
     #[inline(always)]
     pub(crate) fn buf_40() -> Self {
         Self::Buf40([0u8; 40])

@@ -12,7 +12,7 @@
 //! fallback in generic code), so we don't try. Instead `alloc_many` / `free_many`
 //! are **provided methods on [`BStackRaiiAllocator`]**: the default bodies are these
 //! sequential helpers, and each bulk-capable allocator *overrides* them to call
-//! `alloc_bulk` / `dealloc_bulk` (see the impls in [`crate::wal`]). Ordinary trait
+//! `alloc_bulk` / `dealloc_bulk` (see the impls in [`crate::io_core::wal`]). Ordinary trait
 //! dispatch then picks the override at monomorphization — the fast path flows
 //! through generic code, and non-bulk allocators (e.g. `FirstFit`) keep the
 //! sequential path — with no bound leaking onto the public API.
@@ -27,10 +27,10 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use bstack::BStackRange;
+use bstack::{BStackBulkAllocator, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
 
 /// The error a partial [`free_many`](BStackRaiiAllocator::free_many) returns: the
 /// first underlying failure, plus **every range whose free did not cleanly
@@ -152,4 +152,45 @@ pub(crate) fn seq_free_many<A: BStackRaiiAllocator>(
         None => Ok(()),
         Some(source) => Err(FreeManyError { source, unfreed }.into()),
     }
+}
+
+/// The bulk override shared by every [`BStackBulkAllocator`]: allocate all `sizes`
+/// as one atomic [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) and hand back their
+/// ranges. Either all blocks are allocated or none is (and the store is unchanged);
+/// a crash mid-op is reclaimed by the allocator's own recovery, so this needs no WAL.
+/// The `atomic_bulk`-path counterpart of [`seq_alloc_many`], for a
+/// [`BStackBulkAllocator`]; wired in by `BStackRaiiAllocator`'s bulk overrides.
+pub(crate) fn bulk_alloc_many<A>(allocator: &A, sizes: &[u64]) -> io::Result<Vec<BStackRange>>
+where
+    A: BStackRaiiAllocator + BStackBulkAllocator,
+{
+    let slices = allocator.alloc_bulk(sizes)?;
+    Ok(slices.into_iter().map(|s| s.as_range()).collect())
+}
+
+/// The bulk override shared by every [`BStackBulkAllocator`]: free all `ranges` as
+/// one atomic [`dealloc_bulk`](BStackBulkAllocator::dealloc_bulk). Reconstructs an
+/// owned slice per range (as [`crate::io_core::teardown::dealloc_range`] does) and
+/// frees them together; on failure the error's `source` is surfaced (the un-freed
+/// handles it carries back are dropped — they are non-RAII, so dropping does not
+/// double-free). The `atomic_bulk`-path counterpart of [`seq_free_many`].
+pub(crate) fn bulk_free_many<A>(
+    allocator: &A,
+    ranges: impl IntoIterator<Item = BStackRange>,
+) -> io::Result<()>
+where
+    A: BStackRaiiAllocator + BStackBulkAllocator,
+{
+    let ranges: Vec<BStackRange> = ranges.into_iter().collect();
+    let handles = ranges
+        .iter()
+        // SAFETY: each range is a live allocation owned by `allocator` that no other
+        // live handle will also free (the `free_many` contract).
+        .map(|&r| unsafe { BStackOwnedSlice::from_raw_range(allocator, r) })
+        .collect::<Vec<_>>();
+    // `dealloc_bulk` is atomic (all-or-nothing), so on failure every range is
+    // still allocated — report them all as unfreed.
+    allocator
+        .dealloc_bulk(handles)
+        .map_err(|e| FreeManyError::from_parts(e.source, ranges).into())
 }

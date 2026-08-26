@@ -23,7 +23,7 @@ use crate::primitives::EightCC;
 use crate::reference::BStackRef;
 use crate::replace::ReplaceError;
 use crate::shared::{BStackRc, BStackWeak};
-use crate::teardown::BStackDrop;
+use crate::types::drop::BStackDrop;
 
 /// The error a generated `new` constructor returns when a fallible construction
 /// step fails after it has already consumed the caller's owned/strong/embedded
@@ -37,7 +37,7 @@ use crate::teardown::BStackDrop;
 /// **unrecoverable**. So a failed `new` returns this instead,
 /// handing the still-valid children back in [`fields`](Self::fields) — the same
 /// region-hand-back contract as bstack's `BStackAllocError`,
-/// [`ForeignAllocError`](crate::registry::ForeignAllocError), and
+/// [`BStackRaiiAllocError`](crate::registry::BStackRaiiAllocError), and
 /// [`ReplaceError`](crate::ReplaceError).
 ///
 /// `F` is the block's [`Fields`](crate::block::BStackMove::Fields) tuple — exactly
@@ -209,7 +209,7 @@ pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocato
     // old control block is released (and possibly freed) below, and a racing
     // upgrade — which holds no weak count to pin it — would otherwise increment a
     // counter in freed storage. Both take this per-file lock.
-    let lock = crate::wal::wal_lock_for(allocator);
+    let lock = crate::io_core::wal::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let stack = allocator.stack();
 
@@ -285,7 +285,7 @@ pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllo
     // (`increment_if_nonzero`), so a concurrent `set_weak_field` can't free the old
     // control block between the two steps. The field slot is not
     // owned here, so nothing else keeps that block alive.
-    let lock = crate::wal::wal_lock_for(allocator);
+    let lock = crate::io_core::wal::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let off = layout::read_u64_at(allocator.stack(), field_off)?;
     if off == 0 {

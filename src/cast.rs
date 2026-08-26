@@ -15,7 +15,7 @@ use bstack::{BStackOwnedSlice, BStackSlice};
 use crate::block::BStackBlock;
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
-use crate::teardown::AutoDrop;
+use crate::types::drop::AutoDrop;
 
 /// Byte offset of the `tag` within a [`crate::BlockHeader`] (`size: u64` first).
 const TAG_OFFSET: u64 = 8;

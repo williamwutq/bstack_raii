@@ -1641,13 +1641,13 @@ fn clone_wal_lock_reentry_errs_instead_of_deadlocking() {
     // Holding the file's clone lock and re-acquiring it on the same thread must be
     // rejected — the old code blocked forever on the non-reentrant mutex.
     assert!(
-        crate::wal::test_reentrant_acquire_is_rejected(&alloc),
+        crate::io_core::wal::test_reentrant_acquire_is_rejected(&alloc),
         "same-file clone re-entry must be rejected, not deadlock"
     );
     // The outer lock was released (its key removed from the held-set), so a second run
     // succeeds — no stuck/poisoned state.
     assert!(
-        crate::wal::test_reentrant_acquire_is_rejected(&alloc),
+        crate::io_core::wal::test_reentrant_acquire_is_rejected(&alloc),
         "the held-set must be cleaned up after the outer lock drops"
     );
 }
@@ -3047,8 +3047,8 @@ fn macro_clone_embed() {
 
 #[test]
 fn wal_finish_rolls_forward_committed() {
-    use crate::wal::{WalEntry, WalLog, WalStatus};
-    use crate::wal::{finish, persist_at};
+    use crate::io_core::wal::{WalEntry, WalLog, WalStatus};
+    use crate::io_core::wal::{finish, persist_at};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator(); // FirstFit: wal_anchor() == Some(8), zeroed on a fresh file
@@ -3074,8 +3074,8 @@ fn wal_finish_rolls_forward_committed() {
 
 #[test]
 fn wal_finish_abandons_uncommitted() {
-    use crate::wal::{WalEntry, WalLog, WalStatus};
-    use crate::wal::{finish, persist_at};
+    use crate::io_core::wal::{WalEntry, WalLog, WalStatus};
+    use crate::io_core::wal::{finish, persist_at};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
@@ -3095,8 +3095,8 @@ fn wal_finish_abandons_uncommitted() {
 
 #[test]
 fn wal_anchor_trait_reclaims_via_finish() {
-    use crate::wal::{WalEntry, WalLog, WalStatus};
-    use crate::wal::{finish, persist_at};
+    use crate::io_core::wal::{WalEntry, WalLog, WalStatus};
+    use crate::io_core::wal::{finish, persist_at};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator(); // FirstFitBStackAllocator: wal_anchor() == Some(8)
@@ -3115,8 +3115,8 @@ fn wal_anchor_trait_reclaims_via_finish() {
 
 #[test]
 fn wal_finish_reclaims_abandoned_allocs() {
-    use crate::wal::{WalEntry, WalLog, WalStatus};
-    use crate::wal::{finish, persist_at};
+    use crate::io_core::wal::{WalEntry, WalLog, WalStatus};
+    use crate::io_core::wal::{finish, persist_at};
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator();
@@ -3155,7 +3155,7 @@ fn wal_clone_descent_orphans_reclaimed_by_finish() {
     // reclaim both — the window this closes (before, a mid-descent crash leaked the
     // whole partially-built subtree, since the WAL was only written at commit time).
     use crate::ClonePlan;
-    use crate::wal::finish;
+    use crate::io_core::wal::finish;
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator(); // FirstFit names a WAL anchor
@@ -3193,8 +3193,8 @@ fn wal_finish_reclaims_foreign_orphan_via_registry() {
     // (`free_recorded`) resolves foreign frees through it, exactly as real teardown /
     // clone will.
     use crate::registry;
-    use crate::wal::{WalEntry, WalLog, WalStatus};
-    use crate::wal::{finish, persist_at};
+    use crate::io_core::wal::{WalEntry, WalLog, WalStatus};
+    use crate::io_core::wal::{finish, persist_at};
 
     // The op's home file (where the WAL is staged) and a separate foreign file.
     let home = TempStack::new();
@@ -5364,7 +5364,7 @@ fn wal_teardown_reclaims_on_free_fault() {
 
     // `finish` rolls the committed teardown forward, reclaiming the whole subtree.
     assert!(
-        crate::wal::finish(&alloc).unwrap() > 0,
+        crate::io_core::wal::finish(&alloc).unwrap() > 0,
         "finish should reclaim the committed teardown's slices"
     );
 
@@ -5414,7 +5414,7 @@ fn registry_paths_persist_and_live_host_round_trips() {
 
         // Attach the foreign file's own allocator as its live host (same path ->
         // same id), then read/write/alloc through the type-erased facade.
-        let host: Arc<dyn crate::registry::ForeignHost> = Arc::new(foreign.allocator());
+        let host: Arc<dyn crate::registry::BStackRaiiHost> = Arc::new(foreign.allocator());
         let id = reg.attach(&foreign.path, host).unwrap();
         assert_eq!(id, id_a);
         assert!(reg.is_live(id));

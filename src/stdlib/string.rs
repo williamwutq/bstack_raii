@@ -33,7 +33,7 @@ use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackString`]: header, a pointer to the UTF-8 bytes
 /// block (`0` = empty), and the byte length. `#[repr(C)]`, `u64` fields only —

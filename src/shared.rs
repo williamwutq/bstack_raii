@@ -19,7 +19,8 @@ use crate::layout;
 use crate::owned::BStackOwned;
 use crate::io_core::refcount;
 use crate::reference::BStackRef;
-use crate::teardown::{AutoDrop, BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::{AutoDrop, BStackDrop};
 
 /// The without-allocator drop core of a [`BStackRc`]: the data ref plus the
 /// optional control-block range.

@@ -16,7 +16,8 @@ use std::io;
 
 use crate::BStackRaiiAllocator;
 use crate::block::{BStackBlock, BStackMove, BStackMoveExpr};
-use crate::teardown::{AutoDrop, BStackDrop, BlockShell, wal_teardown};
+use crate::io_core::teardown::{wal_teardown};
+use crate::types::drop::{AutoDrop, BStackDrop, BlockShell};
 
 /// A uniquely-owned handle to a block: an ownership marker over an inner
 /// [`BStackDrop`] handle whose teardown recursively frees the block on disk.

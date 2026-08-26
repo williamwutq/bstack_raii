@@ -71,17 +71,15 @@ mod primitives;
 mod io_core;
 mod reference;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
-pub mod registry;
 mod replace;
 /// Runtime Type Information: a persisted, self-describing schema stack for
 /// interpreting `bstack_raii` structures on disk with no compiled-in types.
 pub mod rtti;
 mod shared;
 mod stdlib;
-mod teardown;
+mod types;
 mod util;
 mod vec;
-mod wal;
 
 #[cfg(test)]
 mod tests;
@@ -105,14 +103,16 @@ pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
 /// `#[bstack_block]` code names it through `::bstack_raii::WidePtr`; user code should
 /// never use it directly.
 #[doc(hidden)]
+pub use io_core::registry;
 pub use primitives::WidePtr;
+pub use types::alloc::BStackRaiiAllocator;
 pub use handback::HandBack;
 pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
 pub use layout::{BlockHeader, get_u64};
 pub use primitives::EightCC;
 pub use owned::BStackOwned;
 pub use reference::BStackRef;
-pub use registry::ForeignHostAllocator;
+pub use io_core::registry::ForeignHostAllocator;
 pub use replace::ReplaceError;
 pub use shared::{BStackRc, BStackWeak};
 pub use util::small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
@@ -123,9 +123,87 @@ pub use stdlib::{
     HashSetIter, HashSetOnDisk, HeapOnDisk, ListIter, ListOnDisk, MapOnDisk, NodeOnDisk,
     StringOnDisk, TreeOnDisk, TreeSetOnDisk,
 };
-pub use teardown::{AutoDrop, BStackDrop, dealloc_range, wal_teardown};
+pub use io_core::teardown::{dealloc_range, wal_teardown};
+pub use types::drop::{AutoDrop, BStackDrop};
 pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};
-pub use wal::{STD_WAL_ANCHOR, finish};
+pub use io_core::wal::{STD_WAL_ANCHOR, finish};
+
+// -- `BStackRaiiAllocator` for bstack's concrete allocators --------------------
+//
+// Implementing the crate's allocator capability for the concrete allocator types
+// `bstack` ships is the glue between the two crates, so it lives here at the root.
+// Each asserts the null niche and a stable WAL anchor; the bulk-capable ones route
+// the multi-block methods through the atomic bulk ops via `bulk_raii_methods!`
+// (which calls the helpers in [`crate::bulk`]).
+
+/// Emit the three `BStackRaiiAllocator` bulk overrides — `alloc_many` / `free_many`
+/// routed through the atomic bulk ops, and `atomic_bulk` returning `true` — for a
+/// concrete allocator that also implements [`bstack::BStackBulkAllocator`]. A macro
+/// rather than a blanket `impl` because that would collide with the per-type
+/// `unsafe impl`s (coherence), can't vary `wal_anchor` by type, and can't blanket-
+/// assert each allocator's null-niche safety.
+macro_rules! bulk_raii_methods {
+    () => {
+        fn alloc_many(
+            &self,
+            sizes: &[u64],
+        ) -> ::std::io::Result<::std::vec::Vec<::bstack::BStackRange>> {
+            crate::bulk::bulk_alloc_many(self, sizes)
+        }
+        unsafe fn free_many(
+            &self,
+            ranges: impl ::core::iter::IntoIterator<Item = ::bstack::BStackRange>,
+        ) -> ::std::io::Result<()> {
+            crate::bulk::bulk_free_many(self, ranges)
+        }
+        fn atomic_bulk(&self) -> bool {
+            true
+        }
+    };
+}
+
+// SAFETY: each of these allocators documents a user-reserved region at payload
+// offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
+// `[8, 16)` slot sits inside it and persists across open/close.
+unsafe impl BStackRaiiAllocator for bstack::FirstFitBStackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+    // GhostTree implements `BStackBulkAllocator` — route the multi-block helpers
+    // through the atomic bulk ops.
+    bulk_raii_methods!();
+}
+unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+// The O2 fuzz oracle (overlap / double-free) needs a checking wrapper around a
+// normal allocator; only this crate can bridge a `bstack`-foreign generic
+// (`DebugCheckingAllocator<A>`) to our `BStackRaiiAllocator` (orphan rules), so it
+// lives here. Pinned to `FirstFit` (what the harness wraps), matching every other
+// per-concrete-type impl in this block.
+unsafe impl BStackRaiiAllocator
+    for bstack::DebugCheckingAllocator<bstack::FirstFitBStackAllocator>
+{
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+// `LinearBStackAllocator` deliberately does **not** implement `BStackRaiiAllocator`:
+// its `alloc` is a bare `BStack::extend`, so its first allocation hands out payload
+// offset 0 — the crate's null niche — and its `dealloc` is a no-op. Both violate the
+// trait's safety contract, so it stays out (even though it implements `BStackBulkAllocator`).
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
 // generated code can name everything through `::bstack_raii::…` and downstream
@@ -133,121 +211,6 @@ pub use wal::{STD_WAL_ANCHOR, finish};
 pub use bstack::{BStack, BStackAllocator, BStackOwnedSliceAllocator, BStackRange, BStackSlice};
 pub use bytemuck::{Pod, Zeroable};
 
-/// The allocator every `bstack_raii` operation is bound on: a
-/// [`BStackOwnedSliceAllocator`] the layer can soundly build owning handles on top
-/// of. It is the crate-wide allocator capability — constructors, `try_clone_in`,
-/// `bstack_drop`, and every stdlib collection require it.
-///
-/// Beyond its supertrait it carries two things the layer relies on: the **null
-/// niche** at payload offset 0 (a hard safety requirement, see below) and an
-/// **optional** WAL anchor slot. The anchor is what lets `try_clone_in` /
-/// `bstack_drop` reclaim orphaned allocations on the next open **automatically**
-/// (they read [`wal_anchor`](Self::wal_anchor) directly); `None` (the default)
-/// means "no reclamation" — those ops behave exactly as before, minus the
-/// crash-orphan cleanup. Every bstack-provided allocator implements this trait; a
-/// custom allocator that upholds the null niche adds a one-line
-/// `unsafe impl BStackRaiiAllocator for MyAlloc {}` (defaulting to `None`, or
-/// returning `Some(slot)` if it reserves a stable slot).
-///
-/// The WAL machinery it feeds lives in the `wal` module; the trait itself is the
-/// crate's front-door allocator bound, hence its home here at the root.
-///
-/// # Safety
-///
-/// An implementor asserts **both** of the following:
-///
-/// 1. **Null niche.** The allocator **never** hands out a live slice whose
-///    `start()` is `0`. `bstack_raii` reserves payload offset 0 as its universal
-///    null sentinel — a `0` offset means "none" everywhere in the layer (an absent
-///    handle / [`Option`] niche, a dead weak reference, "no WAL block", …). An
-///    allocator that could return offset 0 is **unsound** with this crate: a real
-///    allocation would be indistinguishable from null. (Every bstack allocator
-///    satisfies this: each keeps a reserved region at payload offset 0 that it
-///    never allocates from.)
-///
-/// 2. **WAL anchor (only when returning `Some(off)`).** `[off, off + 8)` is a
-///    stable, persistent 8-byte region the allocator **never** hands out via
-///    `alloc` and **never** uses for its own metadata, and that survives across
-///    open/close. `bstack_raii` stores the current WAL block's offset there
-///    (`0` = none). Returning `None` asserts nothing beyond (1).
-pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
-        None
-    }
-
-    /// The [`FileId`](crate::registry::FileId) whose file this allocator's frees
-    /// belong to, used to **tag WAL teardown entries**. A normal file-owning
-    /// allocator represents *its own* file, so it returns [`FileId::SELF`](crate::registry::FileId::SELF)
-    /// (`0`) — its WAL entries mean "this file". The cross-file teardown adapter
-    /// [`ForeignHostAllocator`](crate::registry::ForeignHostAllocator) overrides this
-    /// with the foreign file's id, so a free collected while tearing down a foreign
-    /// subtree is recorded against — and, on recovery, reclaimed in — *that* file
-    /// (see [`crate::wal`]'s `free_recorded`). Callers other than the teardown WAL
-    /// have no reason to read this.
-    fn wal_file_id(&self) -> crate::registry::FileId {
-        crate::registry::FileId::SELF
-    }
-
-    /// Allocate one block per length in `sizes`, returning their ranges in order.
-    ///
-    /// The default is a **sequential** fallback: each `alloc` is individually
-    /// crash-atomic, but the set is not (a crash mid-sequence orphans the blocks
-    /// done so far — a leak the WAL layer reclaims, never a torn structure). It
-    /// unwinds already-allocated blocks on any failure, so a partial allocation
-    /// never leaks *within* the call.
-    ///
-    /// A bulk-capable allocator ([`bstack::BStackBulkAllocator`]) **overrides** this
-    /// to route through the atomic [`alloc_bulk`](bstack::BStackBulkAllocator::alloc_bulk),
-    /// so the whole set becomes one crash-atomic operation recovered by the
-    /// allocator's own machinery. Ordinary trait dispatch picks the override at
-    /// monomorphization, so compound ops generic over `A` get the fast path for free.
-    fn alloc_many(&self, sizes: &[u64]) -> std::io::Result<Vec<BStackRange>> {
-        crate::bulk::seq_alloc_many(self, sizes)
-    }
-
-    /// Free every range in `ranges`. The default is a **sequential** fallback
-    /// (each `dealloc` individually atomic); a bulk-capable allocator overrides it
-    /// to route through the atomic [`dealloc_bulk`](bstack::BStackBulkAllocator::dealloc_bulk).
-    ///
-    /// On a partial failure the fallback **frees every range it can** (rather than
-    /// stopping at the first error and leaving an unknown suffix allocated) and
-    /// returns a [`FreeManyError`](crate::FreeManyError) (wrapped in the
-    /// [`io::Error`]) naming every range whose free did not cleanly complete — a
-    /// superset of those still allocated, so nothing is silently leaked.
-    /// Downcast the error's source to `FreeManyError` to recover
-    /// them.
-    ///
-    /// # Safety
-    /// Each range must be a live allocation owned by `self` that no other live
-    /// handle will also free (as for [`crate::teardown`]'s `dealloc_range`, whose
-    /// obligation this method carries range-by-range). `BStackRange::new` is a
-    /// safe constructor, so nothing gates the argument but this contract; the safe
-    /// ways to free remain [`BStackDrop`] / [`AutoDrop`].
-    unsafe fn free_many(
-        &self,
-        ranges: impl IntoIterator<Item = BStackRange>,
-    ) -> std::io::Result<()> {
-        crate::bulk::seq_free_many(self, ranges)
-    }
-
-    /// Whether this allocator provides **atomic, self-recovering** bulk
-    /// alloc/free — i.e. it implements [`bstack::BStackBulkAllocator`] and
-    /// overrides [`alloc_many`](Self::alloc_many) / [`free_many`](Self::free_many)
-    /// to route through it. Default `false`.
-    ///
-    /// When `true`, a compound op whose blocks all live in **this** file can free
-    /// (or allocate) them as one atomic `dealloc_bulk` / `alloc_bulk` and **skip the
-    /// WAL** entirely: the WAL exists to emulate atomic batch alloc/free for
-    /// allocators that lack it, and wrapping an already-atomic bulk op in it is both
-    /// redundant and unsound (the allocator's crash-recovery direction is opaque, so
-    /// a WAL retry on reopen could double-free). A crash mid-bulk is left to the
-    /// allocator's own recovery — consistent, leak-at-worst, exactly the guarantee
-    /// the WAL would have provided. Cross-file (mixed [`FileId`](crate::registry::FileId))
-    /// batches fall back to the WAL for its registry routing.
-    fn atomic_bulk(&self) -> bool {
-        false
-    }
-}
 // Re-exported whole so generated code can call `::bstack_raii::bytemuck::bytes_of`.
 pub use bytemuck;
 

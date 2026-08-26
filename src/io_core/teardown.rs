@@ -6,15 +6,14 @@
 //! plus an explicit allocator, so it is generic over all handle-like types.
 
 use core::cell::RefCell;
-use core::mem::ManuallyDrop;
-use core::ops::Deref;
 use std::io;
 
 use bstack::{BStackGenOp, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::registry::FileId;
-use crate::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
+use crate::types::drop::BStackDrop;
+use crate::io_core::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
 
 /// A collected teardown transaction: the installing allocator's **stack identity**
 /// (scoping the sink to its file) plus the `(file, range)` frees gathered so far.
@@ -107,7 +106,7 @@ impl Drop for TeardownDepthGuard {
 /// While the sink is installed, every [`dealloc_range`] in the (ordinary,
 /// generic) teardown recursion *collects* its slice rather than freeing it;
 /// afterwards the whole set commits as one `Dealloc` transaction and is executed
-/// via [`finish`](crate::wal::finish)'s completion path (the same path crash
+/// via [`finish`](crate::io_core::wal::finish)'s completion path (the same path crash
 /// recovery takes). Nested owned frees (e.g. a collection freeing its values
 /// through `BStackOwned::bstack_drop`) see the sink already set and just collect,
 /// so exactly one transaction wraps the outermost teardown.
@@ -251,21 +250,6 @@ pub(crate) unsafe fn commit_home_frees<A: BStackRaiiAllocator>(
     }
 }
 
-/// Recursively free a block and all of its owned children.
-///
-/// Because a bare [`BStackRange`] carries no allocator, freeing is done by
-/// reconstructing a [`BStackOwnedSlice`] and handing it to the allocator's
-/// `dealloc` — see [`dealloc_range`]. There is deliberately no `dealloc_range`
-/// method on the allocator trait itself.
-///
-/// The allocator is bound to the crate-wide [`BStackRaiiAllocator`], whose
-/// [`BStackOwnedSliceAllocator`] supertrait pins `Allocated<'a> =
-/// BStackOwnedSlice<'a, A>` (so a reconstructed owned slice is the accepted
-/// `dealloc` handle) and `Error = io::Error` (so the layer speaks [`io::Result`]).
-pub trait BStackDrop: Sized {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()>;
-}
-
 /// Free a block by range: recurse into its owned children, then dealloc the shell.
 ///
 /// The single implementation of "tear down a `T` block", shared by every affine
@@ -283,31 +267,6 @@ pub(crate) unsafe fn drop_block<T: crate::block::BStackBlock, A: BStackRaiiAlloc
 ) -> io::Result<()> {
     T::__bstack_drop_children(range, allocator)?;
     unsafe { dealloc_range(allocator, range) }
-}
-
-/// An affine (non-`Copy`) teardown token for a `T` block, so [`wal_teardown`] can
-/// drive the block teardown of a [`BStackOwned<T>`] without the block handle itself
-/// implementing [`BStackDrop`]. Not public: minted only inside `bstack_drop`.
-pub(crate) struct BlockShell<T: crate::block::BStackBlock> {
-    range: BStackRange,
-    _marker: core::marker::PhantomData<fn() -> T>,
-}
-
-impl<T: crate::block::BStackBlock> BlockShell<T> {
-    pub(crate) fn new(range: BStackRange) -> Self {
-        Self {
-            range,
-            _marker: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<T: crate::block::BStackBlock> BStackDrop for BlockShell<T> {
-    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
-        // SAFETY: a `BlockShell` is minted only by `BStackOwned::bstack_drop` from
-        // a handle that asserted sole ownership at construction.
-        unsafe { drop_block::<T, A>(self.range, allocator) }
-    }
 }
 
 /// Free a raw block range by reconstructing an owned slice and delegating to the
@@ -349,73 +308,4 @@ pub unsafe fn dealloc_range<A: BStackRaiiAllocator>(
     let owned: BStackOwnedSlice<'_, A> =
         unsafe { BStackOwnedSlice::from_raw_range(allocator, range) };
     allocator.dealloc(owned).map_err(|e| e.source)
-}
-
-/// A guard that runs [`BStackDrop::bstack_drop`] on its inner handle when it goes
-/// out of scope, bridging fallible on-disk teardown to Rust's `Drop`.
-///
-/// It is the *one* place that calls `bstack_drop` from a `Drop` impl: every
-/// allocator-bound handle that wants automatic cleanup is (or embeds) an
-/// `AutoDrop`, rather than hand-writing its own `Drop`. A bare [`BStackDrop`]
-/// handle that is not wrapped frees nothing on its own — its `bstack_drop` is
-/// invoked explicitly, or runs as a child of a parent block's recursive
-/// teardown.
-///
-/// It is a newtype over `(ManuallyDrop<T>, &'a A)`; `bstack_move!` and the raw
-/// accessors defuse it via [`into_raw_parts`](Self::into_raw_parts) so no
-/// parallel destruction path exists.
-pub struct AutoDrop<'a, T: BStackDrop, A: BStackRaiiAllocator> {
-    inner: ManuallyDrop<T>,
-    allocator: &'a A,
-}
-
-impl<'a, T: BStackDrop, A: BStackRaiiAllocator> AutoDrop<'a, T, A> {
-    /// Pair an inner handle with its allocator into an auto-dropping guard.
-    ///
-    /// # Safety
-    /// The caller asserts `inner` describes a live allocation owned by
-    /// `allocator` and that no other handle will also free it.
-    pub unsafe fn from_raw(inner: T, allocator: &'a A) -> Self {
-        Self {
-            inner: ManuallyDrop::new(inner),
-            allocator,
-        }
-    }
-
-    /// Split into the raw inner handle and allocator **without** running the
-    /// disk-level `Drop`. The caller takes over responsibility for the
-    /// allocation (e.g. `bstack_move!`, which frees only the parent shell).
-    pub fn into_raw_parts(self) -> (T, &'a A) {
-        // Wrapping `self` in ManuallyDrop defuses our own `Drop`, so
-        // `bstack_drop` is not called; then move the inner `T` out.
-        let mut me = ManuallyDrop::new(self);
-        let inner = unsafe { ManuallyDrop::take(&mut me.inner) };
-        (inner, me.allocator)
-    }
-
-    /// The allocator this handle is bound to.
-    pub fn allocator(&self) -> &'a A {
-        self.allocator
-    }
-
-    /// Borrow the underlying handle, e.g. to call generated field accessors:
-    /// `owned.handle().get_field(stack)`.
-    pub fn handle(&self) -> &T {
-        &self.inner
-    }
-}
-
-impl<'a, T: BStackDrop, A: BStackRaiiAllocator> Deref for AutoDrop<'a, T, A> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.inner
-    }
-}
-
-impl<'a, T: BStackDrop, A: BStackRaiiAllocator> Drop for AutoDrop<'a, T, A> {
-    fn drop(&mut self) {
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        // Errors are swallowed, matching the contract of Rust's `Drop`.
-        let _ = inner.bstack_drop(self.allocator);
-    }
 }

@@ -1,4 +1,16 @@
-//! Low-level **on-disk I/O core**: atomic primitives over a `bstack` file that sit
-//! below the object model. Currently the [`refcount`] counter operations.
+//! The crate's low-level **on-disk I/O core**: atomic primitives and stateful
+//! mechanism over `bstack` files that sit *below* the object model — as opposed to
+//! [`crate::types`], which holds the semantic vocabulary these drive.
+//!
+//! * [`refcount`] — atomic on-disk `u64` counter ops.
+//! * [`wal`] — the write-ahead log for atomic multi-slice transactions.
+//! * [`teardown`] — the recursive block-teardown mechanism (`dealloc_range`, the
+//!   WAL-integrated `wal_teardown`).
+//! * [`registry`] — the process-wide path↔[`FileId`](registry::FileId) map
+//!   resolving cross-file (`Foreign<T>`) pointers. Re-exported publicly as
+//!   `crate::registry`.
 
 pub(crate) mod refcount;
+pub mod registry;
+pub(crate) mod teardown;
+pub(crate) mod wal;

@@ -7,7 +7,7 @@
 //! dedicated error that wraps the underlying [`io::Error`] **and hands the
 //! resource back**: [`ConstructError`](crate::ConstructError),
 //! [`ReplaceError`](crate::ReplaceError),
-//! [`ForeignAllocError`](crate::registry::ForeignAllocError),
+//! [`BStackRaiiAllocError`](crate::registry::BStackRaiiAllocError),
 //! [`FreeManyError`](crate::FreeManyError), and the cast
 //! [`CastError`](crate::CastError).
 //!
@@ -34,7 +34,7 @@ pub trait HandBack {
 /// error whose underlying `io::Error` lives in a `source` field. `Debug` is left
 /// to the type (it masks the non-`Debug` handed-back resource).
 ///
-/// Usage: `impl_source_error!(ForeignAllocError);` or, for a generic type,
+/// Usage: `impl_source_error!(BStackRaiiAllocError);` or, for a generic type,
 /// `impl_source_error!(ReplaceError<V>);`.
 macro_rules! impl_source_error {
     ($ty:ident $(< $($g:ident),+ >)?) => {

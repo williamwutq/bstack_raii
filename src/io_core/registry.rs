@@ -15,7 +15,7 @@
 //!   run. Paths are *never removed* (that would renumber ids and dangle stored
 //!   `Foreign`s); only appended.
 //! * **In-memory** — mirrors the path↔id maps and adds `id -> live host`: the
-//!   *open* allocator for a file, type-erased behind [`ForeignHost`]. Guarded by a
+//!   *open* allocator for a file, type-erased behind [`BStackRaiiHost`]. Guarded by a
 //!   [`parking_lot::RwLock`].
 //!
 //! ## Why an `RwLock` (and why `parking_lot`)
@@ -35,205 +35,27 @@
 //! never instantiates it, so ordinary single-file ops pay nothing. It is brought
 //! up explicitly with [`init`].
 
-use core::fmt;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackRange};
+use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice};
 use parking_lot::RwLock;
 
-use crate::handback::impl_source_error;
 use crate::primitives::WidePtr;
 use crate::{BStackRaiiAllocator, get_u64};
+
+/// The allocator capability's cross-file projection, defined among the
+/// [semantic types](crate::types::alloc); re-exported here because resolving a
+/// [`FileId`] to a live host is the registry's job.
+pub use crate::types::alloc::SyncBStackRaiiAllocator;
+pub use crate::types::alloc::host::{BStackRaiiAllocError, BStackRaiiHost};
 
 /// The stable per-file identity underlying `Foreign<T>`. Defined among the wide
 /// pointer's [components](crate::primitives); re-exported here as its resolution
 /// (path table, live hosts) is the registry's job.
 pub use crate::primitives::FileId;
-
-/// A thread-shareable [`BStackRaiiAllocator`] — the bound a file's live host must
-/// satisfy to be stored in (and resolved from) the registry across threads.
-///
-/// Purely a convenience alias (`BStackRaiiAllocator + Send + Sync`, blanket-impl'd)
-/// so call sites don't repeat the `+ Send + Sync` every time. It is **not** what
-/// the registry stores: `BStackRaiiAllocator` is not object-safe (`BStackAllocator:
-/// Sized`, plus the GAT `Allocated<'a>` and `alloc -> Self::Allocated<'_>`), so
-/// there is no `dyn SyncBStackRaiiAllocator`. [`ForeignHost`] is its object-safe
-/// projection, and what actually goes behind the `Arc<dyn …>`.
-pub trait SyncBStackRaiiAllocator: BStackRaiiAllocator + Send + Sync {}
-impl<A: BStackRaiiAllocator + Send + Sync> SyncBStackRaiiAllocator for A {}
-
-/// Error returned by [`ForeignHost::realloc`] and [`ForeignHost::dealloc`] when the
-/// operation fails — the object-safe, range-based analogue of bstack's
-/// `BStackAllocError`.
-///
-/// A failed resize or free almost always leaves a valid allocation behind — the
-/// original region untouched, or the new region fully committed. This type carries
-/// that surviving region's range back to the caller so it can retry, fall back, or
-/// explicitly [`dealloc`](ForeignHost::dealloc) it rather than leak it. Because a
-/// bare [`BStackRange`] carries no ownership or `Drop`, *not* returning it here
-/// would silently lose the region.
-///
-/// Implements [`std::error::Error`] (delegating [`Display`](fmt::Display) to
-/// [`source`](Self::source)), so `?` works in functions that return it.
-pub struct ForeignAllocError {
-    /// The underlying I/O error that caused the operation to fail.
-    pub source: io::Error,
-    /// The recovered region's range, if it survived the failure.
-    ///
-    /// * `Some` — the allocation is intact and owned by the caller again (the
-    ///   overwhelmingly common case: an untouched original or a fully committed new
-    ///   region).
-    /// * `None` — the region was consumed or lost during the failed operation (a
-    ///   multi-step path whose later step failed, or a crash mid-op); any bytes are
-    ///   recoverable only through the file's crash-recovery / WAL. Treat `None` as
-    ///   "not recoverable here," not as impossible.
-    pub handle: Option<BStackRange>,
-}
-
-impl ForeignAllocError {
-    /// Construct an error that hands the still-valid range back to the caller.
-    #[inline]
-    pub fn with_handle(source: io::Error, handle: BStackRange) -> Self {
-        Self {
-            source,
-            handle: Some(handle),
-        }
-    }
-
-    /// Construct an error whose region was consumed or lost and cannot be returned.
-    #[inline]
-    pub fn lost(source: io::Error) -> Self {
-        Self {
-            source,
-            handle: None,
-        }
-    }
-}
-
-impl fmt::Debug for ForeignAllocError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ForeignAllocError")
-            .field("source", &self.source)
-            .field("handle", &self.handle)
-            .finish()
-    }
-}
-
-impl_source_error!(ForeignAllocError);
-
-/// An **object-safe, range-based** view of a live file's allocator — the
-/// type-erased handle a `Foreign<T>` uses to reach *into another file*.
-///
-/// This mirrors bstack's `BStackAllocator` surface (`stack` / `alloc` / `realloc` /
-/// `dealloc`, plus `len` / `is_empty`), but is deliberately object-safe so the
-/// registry can store `Arc<dyn ForeignHost>` for files backed by different
-/// allocator types: it drops the GAT `Allocated<'a>` handle and the associated
-/// `Error` in favour of a plain [`BStackRange`] and [`io::Error`] — the very things
-/// that make `BStackRaiiAllocator` itself non-object-safe (see
-/// [`SyncBStackRaiiAllocator`]). Blanket-implemented for every
-/// [`SyncBStackRaiiAllocator`], forwarding to the real allocator.
-///
-/// Because a [`BStackRange`] carries no ownership (unlike a `BStackOwnedSlice`),
-/// [`realloc`](Self::realloc) and [`dealloc`](Self::dealloc) are `unsafe`: the
-/// caller asserts the range is a live allocation in this file that no other handle
-/// will also resize or free. On the failure path they return a [`ForeignAllocError`]
-/// carrying the surviving range, so a failed op never silently leaks. Raw reads and
-/// writes go through [`stack`](Self::stack) (`get_into` / `set`).
-///
-/// # Crash consistency
-///
-/// Every method forwards to a single underlying allocator/stack call, so it
-/// inherits that call's crash-consistency class (see the concrete allocator's docs).
-pub trait ForeignHost: Send + Sync {
-    /// A shared reference to this file's underlying [`BStack`], for raw reads and
-    /// writes (`get_into` / `set`) at a resolved offset.
-    fn stack(&self) -> &BStack;
-
-    /// Allocate `len` zero-initialised bytes, returning the region's range. The
-    /// region is durably synced before returning; `len = 0` is valid.
-    fn alloc(&self, len: u64) -> io::Result<BStackRange>;
-
-    /// Resize the region at `handle` to `new_len` bytes, returning the (possibly
-    /// moved) new range.
-    ///
-    /// # Safety
-    /// `handle` must be a live allocation in this file, solely owned by the caller.
-    ///
-    /// # Errors
-    /// Returns a [`ForeignAllocError`] on failure (including when the allocator does
-    /// not support reallocation). A failed resize leaves the original region intact,
-    /// so implementations return it in [`ForeignAllocError::handle`] (`Some`)
-    /// whenever it survives, reserving `None` for a genuinely lost region.
-    unsafe fn realloc(
-        &self,
-        handle: BStackRange,
-        new_len: u64,
-    ) -> Result<BStackRange, ForeignAllocError>;
-
-    /// Release the region at `handle`.
-    ///
-    /// # Safety
-    /// `handle` must be a live allocation in this file, solely owned by the caller
-    /// and freed exactly once.
-    ///
-    /// # Errors
-    /// Returns a [`ForeignAllocError`] on failure. A failed free normally leaves the
-    /// region still allocated, so implementations return it in
-    /// [`ForeignAllocError::handle`] (`Some`) whenever it survives, reserving `None`
-    /// for a genuinely lost region (where handing it back would risk a double-free).
-    unsafe fn dealloc(&self, handle: BStackRange) -> Result<(), ForeignAllocError>;
-
-    /// This file's WAL anchor slot, if it participates in crash reclamation
-    /// ([`BStackRaiiAllocator::wal_anchor`]).
-    fn wal_anchor(&self) -> Option<u64>;
-}
-
-impl<A: SyncBStackRaiiAllocator> ForeignHost for A {
-    fn stack(&self) -> &BStack {
-        <A as BStackAllocator>::stack(self)
-    }
-
-    fn alloc(&self, len: u64) -> io::Result<BStackRange> {
-        Ok(<A as BStackAllocator>::alloc(self, len)?.as_range())
-    }
-
-    unsafe fn realloc(
-        &self,
-        handle: BStackRange,
-        new_len: u64,
-    ) -> Result<BStackRange, ForeignAllocError> {
-        // SAFETY: caller's contract — a live, solely-owned allocation in this file.
-        let slice: BStackOwnedSlice<'_, A> =
-            unsafe { BStackOwnedSlice::from_raw_range(self, handle) };
-        match <A as BStackAllocator>::realloc(self, slice, new_len) {
-            Ok(s) => Ok(s.as_range()),
-            Err(e) => Err(ForeignAllocError {
-                source: e.source,
-                handle: e.handle.map(|h| h.as_range()),
-            }),
-        }
-    }
-
-    unsafe fn dealloc(&self, handle: BStackRange) -> Result<(), ForeignAllocError> {
-        // SAFETY: caller's contract — a live, solely-owned allocation in this file.
-        let slice: BStackOwnedSlice<'_, A> =
-            unsafe { BStackOwnedSlice::from_raw_range(self, handle) };
-        match <A as BStackAllocator>::dealloc(self, slice) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(ForeignAllocError {
-                source: e.source,
-                handle: e.handle.map(|h| h.as_range()),
-            }),
-        }
-    }
-
-    fn wal_anchor(&self) -> Option<u64> {
-        <A as BStackRaiiAllocator>::wal_anchor(self)
-    }
-}
 
 /// An **allocator adapter over a live foreign host** — the bridge that lets the
 /// crate's entirely generic teardown / clone machinery (`OwnedRef`, `StrongRef`,
@@ -245,7 +67,7 @@ impl<A: SyncBStackRaiiAllocator> ForeignHost for A {
 /// and every free is [tagged](BStackRaiiAllocator::wal_file_id) with the foreign
 /// [`FileId`] so the home file's WAL reclaims it *there*.
 ///
-/// It owns an `Arc<dyn ForeignHost>` (not a borrow) precisely so it can be
+/// It owns an `Arc<dyn BStackRaiiHost>` (not a borrow) precisely so it can be
 /// `'static`, which [`BStackRaiiAllocator`]'s `'static` supertrait
 /// ([`BStackOwnedSliceAllocator`]) demands — and so the host stays alive for the
 /// whole teardown even if it is concurrently [`detach`](FileRegistry::detach)ed.
@@ -254,7 +76,7 @@ impl<A: SyncBStackRaiiAllocator> ForeignHost for A {
 /// own its `BStack` — the host does); it panics if ever called. The teardown path
 /// only ever uses `stack` / `dealloc` / the refcount primitives, never `into_stack`.
 pub struct ForeignHostAllocator {
-    host: Arc<dyn ForeignHost + 'static>,
+    host: Arc<dyn BStackRaiiHost + 'static>,
     file_id: FileId,
 }
 
@@ -262,7 +84,7 @@ impl ForeignHostAllocator {
     /// Adapt a live foreign `host` (as an owned `Arc`, e.g. from
     /// [`host_arc`](FileRegistry::host_arc)) into an allocator whose frees are tagged
     /// with `file_id`.
-    pub fn new(host: Arc<dyn ForeignHost + 'static>, file_id: FileId) -> Self {
+    pub fn new(host: Arc<dyn BStackRaiiHost + 'static>, file_id: FileId) -> Self {
         Self { host, file_id }
     }
 }
@@ -327,12 +149,12 @@ unsafe impl BStackRaiiAllocator for ForeignHostAllocator {
     }
 }
 
-/// Convert a host-level [`ForeignAllocError`] (range-based) into the allocator-level
+/// Convert a host-level [`BStackRaiiAllocError`] (range-based) into the allocator-level
 /// [`BStackAllocError`] the `BStackAllocator` trait speaks, re-wrapping any surviving
 /// range as an owned handle bound to `alloc`.
 fn foreign_to_alloc_error(
     alloc: &ForeignHostAllocator,
-    e: ForeignAllocError,
+    e: BStackRaiiAllocError,
 ) -> BStackAllocError<'_, ForeignHostAllocator> {
     match e.handle {
         // SAFETY: `h` is the region the failed op left intact in the host's file.
@@ -414,7 +236,7 @@ struct RegistryInner<'h> {
     by_path: HashMap<PathBuf, FileId>,
     /// `id -> live host` (the open allocator), or `None` when the file is not
     /// currently attached. In-memory only.
-    live: Vec<Option<Arc<dyn ForeignHost + 'h>>>,
+    live: Vec<Option<Arc<dyn BStackRaiiHost + 'h>>>,
     /// Reverse map `host BStack address -> id`, for turning a live handle back into
     /// its [`FileId`] (`bstack_cast!(slice as Foreign<T>)`). In-memory only;
     /// populated on [`attach`](FileRegistry::attach), pruned on
@@ -491,7 +313,7 @@ impl<'h> FileRegistry<'h> {
     ///
     /// `host` need only live as long as `'h` (until this registry — or the host's
     /// [`detach`](Self::detach) — drops it), not `'static`.
-    pub fn attach(&self, path: &Path, host: Arc<dyn ForeignHost + 'h>) -> io::Result<FileId> {
+    pub fn attach(&self, path: &Path, host: Arc<dyn BStackRaiiHost + 'h>) -> io::Result<FileId> {
         let id = self.register_path(path)?;
         let stack_key = core::ptr::from_ref(host.stack()) as usize;
         let mut g = self.inner.write();
@@ -556,7 +378,7 @@ impl<'h> FileRegistry<'h> {
     /// `detach` can be starved by a continuous stream of readers — acceptable, since
     /// detaching is cold and a perpetually-in-use file cannot be safely detached
     /// anyway.
-    pub fn with_host<R>(&self, id: FileId, f: impl FnOnce(&dyn ForeignHost) -> R) -> Option<R> {
+    pub fn with_host<R>(&self, id: FileId, f: impl FnOnce(&dyn BStackRaiiHost) -> R) -> Option<R> {
         // `SELF` / special ids name no registry entry, so return without ever taking
         // the lock — the caller resolves `SELF` against its own local allocator.
         let idx = id.table_index()?;
@@ -567,11 +389,11 @@ impl<'h> FileRegistry<'h> {
 
     /// Clone out `id`'s live host as an owned [`Arc`], or `None` if `id` is unknown /
     /// not currently live. Unlike [`with_host`](Self::with_host) (which lends a
-    /// `&dyn ForeignHost` only for the span of a closure), this hands back an owned
+    /// `&dyn BStackRaiiHost` only for the span of a closure), this hands back an owned
     /// handle that keeps the host alive independently of the registry — the basis for
     /// the `'static` [`ForeignHostAllocator`], which needs to outlive the lock and
     /// survive a concurrent [`detach`](Self::detach) mid-teardown.
-    pub fn host_arc(&self, id: FileId) -> Option<Arc<dyn ForeignHost + 'h>> {
+    pub fn host_arc(&self, id: FileId) -> Option<Arc<dyn BStackRaiiHost + 'h>> {
         let idx = id.table_index()?;
         self.inner.read_recursive().live.get(idx)?.clone()
     }
@@ -666,7 +488,7 @@ pub fn detach(id: FileId) {
 
 /// [`FileRegistry::with_host`] on the process-wide registry (`None` if
 /// uninitialized or `id` is not live).
-pub fn with_host<R>(id: FileId, f: impl FnOnce(&dyn ForeignHost) -> R) -> Option<R> {
+pub fn with_host<R>(id: FileId, f: impl FnOnce(&dyn BStackRaiiHost) -> R) -> Option<R> {
     REGISTRY.get()?.with_host(id, f)
 }
 
@@ -732,7 +554,7 @@ pub fn home_relative_repr(repr: WidePtr, home: &BStack) -> WidePtr {
 
 /// [`FileRegistry::host_arc`] on the process-wide registry — the owned-`Arc` host
 /// lookup that cross-file teardown/clone use to build a [`ForeignHostAllocator`].
-pub fn host_arc(id: FileId) -> Option<Arc<dyn ForeignHost + 'static>> {
+pub fn host_arc(id: FileId) -> Option<Arc<dyn BStackRaiiHost + 'static>> {
     REGISTRY.get()?.host_arc(id)
 }
 

@@ -14,7 +14,7 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 use super::hash::fnv1a;
 use crate::layout::{HEADER_SIZE, get_u64};
 use crate::util::small_buf::SmallBuf;
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
 
 /// Read a little-endian `u64` at absolute offset `off`.
 pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {

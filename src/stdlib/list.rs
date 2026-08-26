@@ -45,7 +45,8 @@ use crate::layout::{BlockHeader, HEADER_SIZE, checked_off};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
 use crate::replace::{ReplaceError, finish_handback};
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackLinkedList`]: the block header followed by the
 /// `head`/`tail` node offsets (`0` = empty) and the element count. `#[repr(C)]`

@@ -7,7 +7,7 @@ use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
 use crate::handback::impl_source_error;
-use crate::teardown::{AutoDrop, BStackDrop};
+use crate::types::drop::{AutoDrop, BStackDrop};
 
 /// Resolve a consuming operation that guarded its input in an [`AutoDrop`]:
 ///
@@ -45,7 +45,7 @@ pub(crate) fn finish_handback<T: BStackDrop, A: BStackRaiiAllocator, R>(
 /// neither linked into the field nor returned, an unreachable orphan. So a failed
 /// `replace_` returns this instead, handing the still-valid value back in
 /// [`value`](Self::value) — the same region-hand-back contract as bstack's
-/// `BStackAllocError` and [`ForeignAllocError`](crate::registry::ForeignAllocError).
+/// `BStackAllocError` and [`BStackRaiiAllocError`](crate::registry::BStackRaiiAllocError).
 ///
 /// When the **commit** fails the old value is never at risk: the swap is a single
 /// crash-atomic exchange, so the field still holds it (it is simply not moved

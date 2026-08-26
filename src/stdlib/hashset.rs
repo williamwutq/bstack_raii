@@ -46,7 +46,8 @@ use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE, get_u64};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
-use crate::teardown::{BStackDrop, dealloc_range};
+use crate::io_core::teardown::{dealloc_range};
+use crate::types::drop::BStackDrop;
 
 /// The on-disk image of a [`BStackHashSet`]: header, bucket-block pointer,
 /// bucket count `cap`, key count `len`, `used` (occupied + tombstone), and the

@@ -49,7 +49,7 @@ use crate::clone::{ClonePlan, TryCloneIn};
 use crate::layout::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
 use crate::owned::BStackOwned;
-use crate::teardown::dealloc_range;
+use crate::io_core::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackCountingBloomFilter`]: header, counter-array
 /// pointer (`0` = none), counter count `m`, hash count `k`, and inserted-item

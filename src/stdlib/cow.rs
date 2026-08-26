@@ -25,7 +25,7 @@ use crate::block::BStackBlock;
 use crate::clone::TryCloneIn;
 use crate::owned::BStackOwned;
 use crate::reference::BStackRef;
-use crate::teardown::{AutoDrop, BStackDrop};
+use crate::types::drop::{AutoDrop, BStackDrop};
 
 /// Clone-on-write ownership of a block of type `T`.
 ///
