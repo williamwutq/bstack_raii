@@ -12,6 +12,7 @@ use std::io;
 
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
+use crate::io_core::wal::STD_WAL_ANCHOR;
 use crate::registry::FileId;
 
 /// The allocator every `bstack_raii` operation is bound on: a
@@ -142,3 +143,80 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
 /// object-safe projection, and what actually goes behind the `Arc<dyn …>`.
 pub trait SyncBStackRaiiAllocator: BStackRaiiAllocator + Send + Sync {}
 impl<A: BStackRaiiAllocator + Send + Sync> SyncBStackRaiiAllocator for A {}
+
+// -- `BStackRaiiAllocator` for bstack's concrete allocators --------------------
+//
+// Implementing the crate's allocator capability for the concrete allocator types
+// `bstack` ships is the glue between the two crates, so it lives here beside the
+// trait it implements. Each asserts the null niche and a stable WAL anchor; the
+// bulk-capable ones route the multi-block methods through the atomic bulk ops via
+// `bulk_raii_methods!` (which calls the helpers in [`crate::bulk`]).
+
+/// Emit the three `BStackRaiiAllocator` bulk overrides — `alloc_many` / `free_many`
+/// routed through the atomic bulk ops, and `atomic_bulk` returning `true` — for a
+/// concrete allocator that also implements [`bstack::BStackBulkAllocator`]. A macro
+/// rather than a blanket `impl` because that would collide with the per-type
+/// `unsafe impl`s (coherence), can't vary `wal_anchor` by type, and can't blanket-
+/// assert each allocator's null-niche safety.
+macro_rules! bulk_raii_methods {
+    () => {
+        fn alloc_many(
+            &self,
+            sizes: &[u64],
+        ) -> ::std::io::Result<::std::vec::Vec<::bstack::BStackRange>> {
+            crate::bulk::bulk_alloc_many(self, sizes)
+        }
+        unsafe fn free_many(
+            &self,
+            ranges: impl ::core::iter::IntoIterator<Item = ::bstack::BStackRange>,
+        ) -> ::std::io::Result<()> {
+            crate::bulk::bulk_free_many(self, ranges)
+        }
+        fn atomic_bulk(&self) -> bool {
+            true
+        }
+    };
+}
+
+// SAFETY: each of these allocators documents a user-reserved region at payload
+// offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
+// `[8, 16)` slot sits inside it and persists across open/close.
+unsafe impl BStackRaiiAllocator for bstack::FirstFitBStackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+    // GhostTree implements `BStackBulkAllocator` — route the multi-block helpers
+    // through the atomic bulk ops.
+    bulk_raii_methods!();
+}
+unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+// The O2 fuzz oracle (overlap / double-free) needs a checking wrapper around a
+// normal allocator; only this crate can bridge a `bstack`-foreign generic
+// (`DebugCheckingAllocator<A>`) to our `BStackRaiiAllocator` (orphan rules), so it
+// lives here. Pinned to `FirstFit` (what the harness wraps), matching every other
+// per-concrete-type impl in this block.
+unsafe impl BStackRaiiAllocator
+    for bstack::DebugCheckingAllocator<bstack::FirstFitBStackAllocator>
+{
+    fn wal_anchor(&self) -> Option<u64> {
+        Some(STD_WAL_ANCHOR)
+    }
+}
+// `LinearBStackAllocator` deliberately does **not** implement `BStackRaiiAllocator`:
+// its `alloc` is a bare `BStack::extend`, so its first allocation hands out payload
+// offset 0 — the crate's null niche — and its `dealloc` is a no-op. Both violate the
+// trait's safety contract, so it stays out (even though it implements `BStackBulkAllocator`).
