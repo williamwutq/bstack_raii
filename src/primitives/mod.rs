@@ -28,16 +28,19 @@
 //! (`new` / `new_unchecked` / `get` / `From` / `TryFrom`), with the base component
 //! standing in for the primitive integer.
 //!
-//! Each is `#[repr(transparent)]` and [`Pod`](bytemuck::Pod), so the fat pointer can
-//! be built by *composing* them into one `#[repr(C)]` record with no wire-format
-//! change — that composition is the next step and is not written yet.
+//! Each is `#[repr(transparent)]` and [`Pod`](bytemuck::Pod), so the wide pointer
+//! [`WidePtr`] is built by *composing* them into one `#[repr(C)]` record with no
+//! wire-format change — 16 bytes, byte-for-byte the raw `{ file_id, type_index,
+//! offset }` triple it replaces.
 // TypeId/Offset/NonNullOffset land before the fat pointer that composes them.
 #![allow(dead_code, unused_imports)]
 
 mod file_id;
 mod offset;
 mod type_id;
+mod wide_ptr;
 
 pub use file_id::{FileId, ResolvedFileId, UnresolvedFileIdError};
 pub use offset::{NonNullOffset, NullOffsetError, Offset};
 pub use type_id::{ResolvedTypeId, TypeId, UntypedTypeIdError};
+pub use wide_ptr::WidePtr;
