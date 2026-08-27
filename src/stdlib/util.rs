@@ -12,17 +12,9 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackGenOp, BStackRange};
 
 use super::hash::fnv1a;
-use crate::io_core::teardown::dealloc_range;
-use crate::types::compiled::block::HEADER_SIZE;
-use crate::util::bytes::get_u64;
-use crate::util::small_buf::SmallBuf;
-
-/// Read a little-endian `u64` at absolute offset `off`.
-pub(super) fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    stack.get_into(off, &mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
+use crate::io_core::dealloc_range;
+use crate::types::compiled::HEADER_SIZE;
+use crate::util::{SmallBuf, get_u64, read_u64};
 
 /// Build a `(offset, value)` write-tuple for a `u64` field: little-endian into
 /// an inline [`SmallBuf::Buf8`], no allocation. Replaces the repeated

@@ -14,9 +14,9 @@ use std::io;
 use bstack::BStackRange;
 use bytemuck::Pod;
 
-use super::reference::BStackRef;
+use super::BStackRef;
 use crate::BStackRaiiAllocator;
-use crate::clone::ClonePlan;
+use crate::io_core::ClonePlan;
 use crate::primitives::{EightCC, NonNullOffset};
 
 /// The downcast discriminant. The returned [`EightCC`] must match the tag in a
@@ -152,7 +152,7 @@ pub trait BStackBlock: BStackCast + Sized {
         offset: NonNullOffset,
     ) -> io::Result<u64>
     where
-        Self: crate::clone::TryCloneIn,
+        Self: crate::io_core::TryCloneIn,
     {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::foreign::foreign_clone_owned::<Self, A>(alloc, offset) }

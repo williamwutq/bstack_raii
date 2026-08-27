@@ -3,8 +3,8 @@
 
 use std::io;
 
-use super::super::compiled::owned::BStackOwned;
-use super::block::BStackBlock;
+use super::super::compiled::BStackOwned;
+use super::BStackBlock;
 use crate::BStackRaiiAllocator;
 
 /// The per-block field destructure behind `bstack_move!`: read every field, then

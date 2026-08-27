@@ -40,16 +40,13 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
-use crate::clone::{ClonePlan, TryCloneIn};
+use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, w8};
 use crate::handback::ReplaceError;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::types::traits::drop::BStackDrop;
-use crate::util::small_buf::SmallBuf;
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
+use crate::util::{SmallBuf, read_u64};
 
 /// The on-disk image of a [`BStackDeque`]: the block header, a pointer to the
 /// ring data block (`0` = none), its capacity in slots, and the circular
@@ -562,7 +559,7 @@ impl<T: BStackBlock> BStackCast for BStackDeque<T> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<T: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackDeque<T> {}
+impl<T: BStackBlock> crate::types::traits::BStackEmbeddable for BStackDeque<T> {}
 
 impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     type OnDisk = DequeOnDisk;

@@ -42,14 +42,12 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
-use super::util::{alloc_image, read_fields, read_u64, w8};
-use crate::clone::{ClonePlan, TryCloneIn};
-use crate::io_core::teardown::dealloc_range;
+use super::util::{alloc_image, read_fields, w8};
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::util::small_buf::SmallBuf;
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast};
+use crate::util::{SmallBuf, read_u64};
 
 /// The on-disk image of a [`BStackCountingBloomFilter`]: header, counter-array
 /// pointer (`0` = none), counter count `m`, hash count `k`, and inserted-item
@@ -354,7 +352,7 @@ impl<K: Pod> BStackCast for BStackCountingBloomFilter<K> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod> crate::types::traits::embed::BStackEmbeddable for BStackCountingBloomFilter<K> {}
+impl<K: Pod> crate::types::traits::BStackEmbeddable for BStackCountingBloomFilter<K> {}
 
 impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
     type OnDisk = BloomOnDisk;

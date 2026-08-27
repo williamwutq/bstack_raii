@@ -43,18 +43,14 @@ use bytemuck::{Pod, Zeroable};
 
 use super::hash::fnv1a;
 use super::util::{
-    Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8,
+    Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, w8,
 };
-use crate::clone::{ClonePlan, TryCloneIn};
 use crate::handback::ReplaceError;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::types::traits::drop::BStackDrop;
-use crate::util::bytes::get_u64;
-use crate::util::small_buf::SmallBuf;
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
+use crate::util::{SmallBuf, get_u64, read_u64};
 
 /// The on-disk image of a [`BStackHashMap`]: header, bucket-block pointer (`0` =
 /// none), bucket count `cap`, live-entry count `len`, and `used` (occupied +
@@ -502,7 +498,7 @@ impl<K: Pod, V: BStackBlock> BStackCast for BStackHashMap<K, V> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod, V: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackHashMap<K, V> {}
+impl<K: Pod, V: BStackBlock> crate::types::traits::BStackEmbeddable for BStackHashMap<K, V> {}
 
 impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     type OnDisk = MapOnDisk;

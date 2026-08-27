@@ -67,16 +67,14 @@ use bstack::{BStack, BStackRange};
 use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
-use crate::io_core::refcount;
-use crate::io_core::wal::WalTxn;
+use crate::io_core::{WalTxn, refcount};
 use crate::primitives::{EightCC, NonNullOffset, WidePtr};
 use crate::registry::{self, FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::util::bytes::{get_u64, read_u64_at};
-use crate::util::small_map::SmallStringMap;
+use crate::types::traits::{BStackBlock, BStackCast};
+use crate::util::{SmallStringMap, get_u64, read_u64};
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
 /// `linkme` without the downstream crate depending on it directly. The generated
@@ -235,7 +233,7 @@ impl AnyRef {
         Self { tag, offset }
     }
 
-    /// Recover the type tag from the target block's on-disk [`BlockHeader`](crate::layout::BlockHeader)
+    /// Recover the type tag from the target block's on-disk [`BlockHeader`](crate::BlockHeader)
     /// (`tag` at offset 8) — the no-registry path, one small read.
     pub fn from_block(data: &BStack, offset: u64) -> io::Result<Self> {
         let mut tag = [0u8; 8];
@@ -1489,7 +1487,7 @@ impl RttiRegistry {
                         results.push(Value::Class(value));
                     }
                     Shape::Owned(tag) | Shape::Strong(tag) => {
-                        let child = read_u64_at(data, offset)?;
+                        let child = read_u64(data, offset)?;
                         if child == 0 {
                             results.push(Value::Null);
                         } else {
@@ -1511,7 +1509,7 @@ impl RttiRegistry {
                     Shape::Weak(tag) | Shape::Ref(tag) => {
                         results.push(Value::Ref {
                             tag,
-                            offset: read_u64_at(data, offset)?,
+                            offset: read_u64(data, offset)?,
                         });
                     }
                     Shape::Foreign { tag, kind } => {
@@ -1558,17 +1556,17 @@ impl RttiRegistry {
                         work.extend(elem_ops);
                     }
                     Shape::Vec(inner) => {
-                        let data_off = read_u64_at(data, offset)?; // VecDesc.data_off @0
+                        let data_off = read_u64(data, offset)?; // VecDesc.data_off @0
                         if data_off == 0 {
                             results.push(Value::Vec(Box::default()));
                         } else {
                             // `@0` is the byte length, validated against the block size
                             // (`VecDesc.data_size` @8) so a forged length can't drive an
                             // out-of-block read / petabyte allocation.
-                            let data_size = read_u64_at(data, add_off(offset, 8)?)?;
+                            let data_size = read_u64(data, add_off(offset, 8)?)?;
                             let base = add_off(data_off, BYTEVEC_HEADER)?;
                             let stride = self.shape_stride(&inner, &mut cache)?;
-                            let byte_len = read_u64_at(data, data_off)?;
+                            let byte_len = read_u64(data, data_off)?;
                             let len = checked_vec_len(byte_len, data_size, stride)?;
                             // Charge the budget for all elements up front — the ops are
                             // materialized eagerly, so a huge (but in-block) length must
@@ -1795,7 +1793,7 @@ impl RttiRegistry {
                     // Nothing to free: inline bytes, an alias, or a schema-side value.
                     Shape::Pod { .. } | Shape::Ref(_) | Shape::Class { .. } => {}
                     Shape::Owned(tag) => {
-                        let child = read_u64_at(data, offset)?;
+                        let child = read_u64(data, offset)?;
                         if child != 0 {
                             work.push(TdOp::Block {
                                 ord: self.ordinal_of(tag).ok_or_else(unknown_tag)?,
@@ -1814,14 +1812,14 @@ impl RttiRegistry {
                         });
                     }
                     Shape::Strong(tag) => {
-                        let data_off = read_u64_at(data, offset)?;
+                        let data_off = read_u64(data, offset)?;
                         if data_off != 0 {
                             strong_releases.push((tag, data_off));
                         }
                     }
                     Shape::Weak(_) => {
                         // A weak field's slot holds the *control* offset directly.
-                        let ctrl_off = read_u64_at(data, offset)?;
+                        let ctrl_off = read_u64(data, offset)?;
                         if ctrl_off != 0 {
                             weak_releases.push(ctrl_off);
                         }
@@ -1868,23 +1866,23 @@ impl RttiRegistry {
                         }
                     }
                     Shape::Vec(inner) => {
-                        let data_off = read_u64_at(data, offset)?; // VecDesc.data_off @0
+                        let data_off = read_u64(data, offset)?; // VecDesc.data_off @0
                         if data_off != 0 {
-                            let data_size = read_u64_at(data, add_off(offset, 8)?)?; // .data_size @8
+                            let data_size = read_u64(data, add_off(offset, 8)?)?; // .data_size @8
                             // A vector of owning/shared elements releases each element
                             // from the data block's element area too. The `@0` word is
                             // the byte length, so the count is `byte_len / stride`
                             // (stride = 8 for a `u64` offset, 16 for a `WidePtr`).
                             let base = add_off(data_off, BYTEVEC_HEADER)?;
                             let stride = self.shape_stride(&inner, &mut cache)?;
-                            let byte_len = read_u64_at(data, data_off)?;
+                            let byte_len = read_u64(data, data_off)?;
                             let len = checked_vec_len(byte_len, data_size, stride)?;
                             match &*inner {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {
                                         let e =
-                                            read_u64_at(data, add_off(base, mul_off(i, stride)?)?)?;
+                                            read_u64(data, add_off(base, mul_off(i, stride)?)?)?;
                                         if e != 0 {
                                             work.push(TdOp::Block {
                                                 ord,
@@ -1897,7 +1895,7 @@ impl RttiRegistry {
                                 Shape::Strong(tag) => {
                                     for i in 0..len {
                                         let e =
-                                            read_u64_at(data, add_off(base, mul_off(i, stride)?)?)?;
+                                            read_u64(data, add_off(base, mul_off(i, stride)?)?)?;
                                         if e != 0 {
                                             strong_releases.push((*tag, e));
                                         }
@@ -1906,7 +1904,7 @@ impl RttiRegistry {
                                 Shape::Weak(_) => {
                                     for i in 0..len {
                                         let c =
-                                            read_u64_at(data, add_off(base, mul_off(i, stride)?)?)?;
+                                            read_u64(data, add_off(base, mul_off(i, stride)?)?)?;
                                         if c != 0 {
                                             weak_releases.push(c);
                                         }
@@ -1970,7 +1968,7 @@ impl RttiRegistry {
         // rather than leaking permanently.
         // SAFETY: every range in `to_free` was collected by the walk from
         // owned slots of the structure being torn down, in this file.
-        unsafe { crate::io_core::wal::commit_home_frees(alloc, to_free) }
+        unsafe { crate::io_core::commit_home_frees(alloc, to_free) }
     }
 
     /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown)):
@@ -1987,7 +1985,7 @@ impl RttiRegistry {
         let data = alloc.stack();
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         if self.load_type(ord)?.weak {
-            let ctrl_off = read_u64_at(data, add_off(data_off, CTRL_BACKPTR_OFFSET)?)?;
+            let ctrl_off = read_u64(data, add_off(data_off, CTRL_BACKPTR_OFFSET)?)?;
             if refcount::fetch_sub(
                 data,
                 NonNullOffset::from_field(add_off(ctrl_off, CTRL_STRONG_OFFSET)?)?,
@@ -2072,7 +2070,7 @@ impl RttiRegistry {
             OwnershipKind::Owned => unsafe { self.teardown(target, ord, offset) },
             OwnershipKind::Strong => {
                 if self.load_type(ord)?.weak {
-                    let ctrl = read_u64_at(data, add_off(offset, CTRL_BACKPTR_OFFSET)?)?;
+                    let ctrl = read_u64(data, add_off(offset, CTRL_BACKPTR_OFFSET)?)?;
                     if refcount::fetch_sub(
                         data,
                         NonNullOffset::from_field(add_off(ctrl, CTRL_STRONG_OFFSET)?)?,
@@ -2186,7 +2184,7 @@ impl RttiRegistry {
             }
             OwnershipKind::Strong => {
                 let off = if self.load_type(ord)?.weak {
-                    let ctrl = read_u64_at(tstack, add_off(src_target, CTRL_BACKPTR_OFFSET)?)?;
+                    let ctrl = read_u64(tstack, add_off(src_target, CTRL_BACKPTR_OFFSET)?)?;
                     add_off(ctrl, CTRL_STRONG_OFFSET)?
                 } else {
                     add_off(src_target, RC_REFCOUNT_OFFSET)?
@@ -2267,7 +2265,7 @@ impl RttiRegistry {
             // Descend into a block reference for the next segment.
             match &field.shape {
                 Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
-                    let child = read_u64_at(data, field_off)?;
+                    let child = read_u64(data, field_off)?;
                     if child == 0 {
                         return Err(set_error(format!("null reference at `{seg}`")));
                     }
@@ -2468,9 +2466,9 @@ impl RttiRegistry {
                     }
                 }
                 // (2) Forward data pointer + backpointer round-trip.
-                let data_ptr = read_u64_at(data, add_off(new.offset(), CTRL_DATA_OFFSET)?)?;
+                let data_ptr = read_u64(data, add_off(new.offset(), CTRL_DATA_OFFSET)?)?;
                 verify_data_block(data, data_ptr, tag)?;
-                let backptr = read_u64_at(data, add_off(data_ptr, CTRL_BACKPTR_OFFSET)?)?;
+                let backptr = read_u64(data, add_off(data_ptr, CTRL_BACKPTR_OFFSET)?)?;
                 if backptr != new.offset() {
                     return Err(swap_error(format!(
                         "[BSTACK0815] RTTI mutator: offset {} is not the target's \
@@ -2643,7 +2641,7 @@ impl RttiRegistry {
             let root = &cache[&ordinal];
             if root.rc {
                 let (strong_slot, ctrl) = if root.weak {
-                    let c = read_u64_at(data, add_off(block_off, CTRL_BACKPTR_OFFSET)?)?;
+                    let c = read_u64(data, add_off(block_off, CTRL_BACKPTR_OFFSET)?)?;
                     (add_off(c, CTRL_STRONG_OFFSET)?, Some(c))
                 } else {
                     (add_off(block_off, RC_REFCOUNT_OFFSET)?, None)
@@ -2653,7 +2651,7 @@ impl RttiRegistry {
                 // either beats the move (the CAS fails cleanly) or is refused by
                 // the zero count for the whole field walk — never both succeeding.
                 if !refcount::cas(data, NonNullOffset::from_field(strong_slot)?, 1, 0)? {
-                    let strong = read_u64_at(data, strong_slot)?;
+                    let strong = read_u64(data, strong_slot)?;
                     return Err(corrupt(format!(
                         "[BSTACK0819] RTTI move_out of a shared reference-counted block \
                          (strong count {strong}); only the sole owner may disassemble it"
@@ -2711,7 +2709,7 @@ impl RttiRegistry {
         // SAFETY: the shell is the caller-owned root (its fields already moved out);
         // the control block, if included, has no remaining references; both live in
         // this file.
-        if let Err(e) = unsafe { crate::io_core::wal::commit_home_frees(alloc, to_free) } {
+        if let Err(e) = unsafe { crate::io_core::commit_home_frees(alloc, to_free) } {
             // SAFETY: `materialized` are this call's own embed copies.
             let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
             return Err(e);
@@ -2816,11 +2814,11 @@ impl RttiRegistry {
             // moved-out block's own slot (or is a block this fn just allocated),
             // and each tag is the slot's schema-declared element tag.
             Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
-                let child = read_u64_at(data, off)?;
+                let child = read_u64(data, off)?;
                 Moved::Ref((child != 0).then(|| unsafe { AnyRef::new(*tag, child) }))
             }
             Shape::Weak(tag) => {
-                let ctrl = read_u64_at(data, off)?;
+                let ctrl = read_u64(data, off)?;
                 Moved::Weak((ctrl != 0).then(|| unsafe { AnyRef::new(*tag, ctrl) }))
             }
             Shape::Embed(tag) => {
@@ -2853,13 +2851,13 @@ impl RttiRegistry {
                 self.move_field(alloc, data, inner, off, cache, materialized)?
             }
             Shape::Vec(inner) => {
-                let data_off = read_u64_at(data, off)?; // VecDesc.data_off @0
+                let data_off = read_u64(data, off)?; // VecDesc.data_off @0
                 if data_off == 0 {
                     Moved::Vec(None)
                 } else {
                     Moved::Vec(Some(VecRef {
                         data_off,
-                        data_size: read_u64_at(data, add_off(off, 8)?)?,
+                        data_size: read_u64(data, add_off(off, 8)?)?,
                         elem: (**inner).clone(),
                     }))
                 }
@@ -2890,7 +2888,7 @@ impl RttiRegistry {
                     // so a control offset is never handed back as if it named a `T`.
                     let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
-                        let e = read_u64_at(data, add_off(off, mul_off(i, 8)?)?)?;
+                        let e = read_u64(data, add_off(off, mul_off(i, 8)?)?)?;
                         list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
                     }
                     Moved::WeakList(list.into())
@@ -2899,7 +2897,7 @@ impl RttiRegistry {
                     // element is a `u64` **data** offset at `off + i*8`.
                     let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
-                        let e = read_u64_at(data, add_off(off, mul_off(i, 8)?)?)?;
+                        let e = read_u64(data, add_off(off, mul_off(i, 8)?)?)?;
                         list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
                     }
                     Moved::List(list.into())
@@ -3157,7 +3155,7 @@ impl RttiRegistry {
                     // Copied verbatim: inline bytes, a schema value, or a `ref` alias.
                     Shape::Pod { .. } | Shape::Class { .. } | Shape::Ref(_) => {}
                     Shape::Owned(tag) => {
-                        let child = read_u64_at(data, src_off)?;
+                        let child = read_u64(data, src_off)?;
                         if child != 0 {
                             let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
                             st.patches.push((new_off, child));
@@ -3176,14 +3174,14 @@ impl RttiRegistry {
                         });
                     }
                     Shape::Strong(tag) => {
-                        let child = read_u64_at(data, src_off)?;
+                        let child = read_u64(data, src_off)?;
                         if child != 0 {
                             let off = self.strong_bump_off(data, tag, child, st)?;
                             st.bumps.push(off);
                         }
                     }
                     Shape::Weak(_) => {
-                        let ctrl = read_u64_at(data, src_off)?;
+                        let ctrl = read_u64(data, src_off)?;
                         if ctrl != 0 {
                             st.bumps.push(add_off(ctrl, CTRL_WEAK_OFFSET)?);
                         }
@@ -3238,9 +3236,9 @@ impl RttiRegistry {
                         }
                     }
                     Shape::Vec(inner) => {
-                        let src_data = read_u64_at(data, src_off)?; // VecDesc.data_off
+                        let src_data = read_u64(data, src_off)?; // VecDesc.data_off
                         if src_data != 0 {
-                            let data_size = read_u64_at(data, add_off(src_off, 8)?)?;
+                            let data_size = read_u64(data, add_off(src_off, 8)?)?;
                             let new_data = self.alloc_copy(alloc, data, src_data, data_size, st)?;
                             // Repoint the (freshly-copied) descriptor's data pointer;
                             // its size word was copied verbatim.
@@ -3248,7 +3246,7 @@ impl RttiRegistry {
                             // `@0` is the byte length; count is `byte_len / stride`
                             // (8 per `u64` offset, 16 per `WidePtr`).
                             let stride = self.shape_stride(&inner, &mut st.cache)?;
-                            let byte_len = read_u64_at(data, src_data)?;
+                            let byte_len = read_u64(data, src_data)?;
                             let len = checked_vec_len(byte_len, data_size, stride)?;
                             let sbase = add_off(src_data, BYTEVEC_HEADER)?;
                             let nbase = add_off(new_data, BYTEVEC_HEADER)?;
@@ -3257,7 +3255,7 @@ impl RttiRegistry {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {
                                         let delta = mul_off(i, stride)?;
-                                        let e = read_u64_at(data, add_off(sbase, delta)?)?;
+                                        let e = read_u64(data, add_off(sbase, delta)?)?;
                                         if e != 0 {
                                             st.patches.push((add_off(nbase, delta)?, e));
                                             work.push(CloneOp::Block { src_off: e, ord });
@@ -3266,10 +3264,8 @@ impl RttiRegistry {
                                 }
                                 Shape::Strong(tag) => {
                                     for i in 0..len {
-                                        let e = read_u64_at(
-                                            data,
-                                            add_off(sbase, mul_off(i, stride)?)?,
-                                        )?;
+                                        let e =
+                                            read_u64(data, add_off(sbase, mul_off(i, stride)?)?)?;
                                         if e != 0 {
                                             let off = self.strong_bump_off(data, *tag, e, st)?;
                                             st.bumps.push(off);
@@ -3278,10 +3274,8 @@ impl RttiRegistry {
                                 }
                                 Shape::Weak(_) => {
                                     for i in 0..len {
-                                        let c = read_u64_at(
-                                            data,
-                                            add_off(sbase, mul_off(i, stride)?)?,
-                                        )?;
+                                        let c =
+                                            read_u64(data, add_off(sbase, mul_off(i, stride)?)?)?;
                                         if c != 0 {
                                             st.bumps.push(add_off(c, CTRL_WEAK_OFFSET)?);
                                         }
@@ -3356,7 +3350,7 @@ impl RttiRegistry {
 
     /// Log a just-made clone allocation to the intention-first WAL, (lazily) beginning
     /// the transaction (and taking the file's WAL lock) on the first call. Mirrors
-    /// [`crate::clone::ClonePlan`]'s `wal_log_alloc`: a cheap append while the block
+    /// [`crate::io_core::ClonePlan`]'s `wal_log_alloc`: a cheap append while the block
     /// has spare slots, a full re-`persist_at` (which grows the block) when it is full.
     /// `st.allocated` does **not** yet contain `range` (the caller pushes it only after
     /// this succeeds), so the grow path logs all of `allocated` *plus* `range`.
@@ -3391,7 +3385,7 @@ impl RttiRegistry {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         self.ensure_type(ord, st)?;
         if st.cache[&ord].weak {
-            let ctrl = read_u64_at(data, add_off(data_child, CTRL_BACKPTR_OFFSET)?)?;
+            let ctrl = read_u64(data, add_off(data_child, CTRL_BACKPTR_OFFSET)?)?;
             add_off(ctrl, CTRL_STRONG_OFFSET)
         } else {
             add_off(data_child, RC_REFCOUNT_OFFSET)
@@ -3564,7 +3558,7 @@ fn foreign_leaf(shape: &Shape) -> Option<(EightCC, OwnershipKind)> {
 fn option_present(data: &BStack, inner: &Shape, base: u64) -> io::Result<bool> {
     Ok(match inner {
         Shape::Foreign { .. } => !WidePtr::read_from_stack(data, base)?.is_null(),
-        _ => read_u64_at(data, base)? != 0,
+        _ => read_u64(data, base)? != 0,
     })
 }
 

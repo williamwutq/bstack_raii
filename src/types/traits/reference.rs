@@ -5,7 +5,7 @@ use std::io;
 
 use bstack::{BStack, BStackRange, BStackSlice};
 
-use super::block::BStackBlock;
+use super::BStackBlock;
 
 /// A typed reference to a block of type `T`.
 ///

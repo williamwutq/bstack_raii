@@ -17,7 +17,7 @@ use std::io;
 
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
-use crate::io_core::wal::STD_WAL_ANCHOR;
+use crate::io_core::STD_WAL_ANCHOR;
 use crate::primitives::NonNullOffset;
 use crate::registry::FileId;
 

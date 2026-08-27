@@ -1,8 +1,7 @@
 //! [`CastError<S>`]: the error a fallible `bstack_cast!` downcast returns.
 
 use std::error::Error;
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 /// The error a fallible downcast ([`BStackCastInto::cast_into`](crate::BStackCastInto::cast_into))
 /// returns. It always hands the input **slice back** so an ownership-carrying

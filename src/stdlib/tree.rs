@@ -45,17 +45,13 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{Scratch, alloc_image, read_fields, read_u64, w8};
-use crate::clone::{ClonePlan, TryCloneIn};
+use super::util::{Scratch, alloc_image, read_fields, w8};
 use crate::handback::ReplaceError;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::types::traits::drop::BStackDrop;
-use crate::util::bytes::get_u64;
-use crate::util::small_buf::SmallBuf;
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
+use crate::util::{SmallBuf, get_u64, read_u64};
 
 /// The on-disk image of a [`BStackBTreeMap`]: header, root node pointer (`0` =
 /// empty), and entry count. Non-generic.
@@ -1082,10 +1078,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackCast for BStackBTreeMap<K, V> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod + Ord, V: BStackBlock> crate::types::traits::embed::BStackEmbeddable
-    for BStackBTreeMap<K, V>
-{
-}
+impl<K: Pod + Ord, V: BStackBlock> crate::types::traits::BStackEmbeddable for BStackBTreeMap<K, V> {}
 
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     type OnDisk = TreeOnDisk;

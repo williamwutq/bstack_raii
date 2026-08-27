@@ -1,6 +1,6 @@
 //! The `#[embed]` capability marker, [`BStackEmbeddable`].
 
-use super::block::BStackBlock;
+use super::BStackBlock;
 
 /// Marker for a block that may be [`#[embed]`](macro@crate::bstack_block)ded: a
 /// **self-contained** block whose entire state lives in its own `OnDisk` payload, with

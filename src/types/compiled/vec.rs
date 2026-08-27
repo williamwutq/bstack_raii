@@ -41,18 +41,12 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::super::traits::block::BStackBlock;
-use super::super::traits::drop::BStackDrop;
-use super::super::traits::rc::{BStackShared, BStackWeakable};
-use super::super::traits::reference::BStackRef;
-use super::owned::BStackOwned;
-use super::rc::WeakRef;
-use super::rc::{BStackRc, BStackWeak};
-use crate::clone::ClonePlan;
+use super::super::traits::{BStackBlock, BStackDrop, BStackRef, BStackShared, BStackWeakable};
+use super::{BStackOwned, BStackRc, BStackWeak, WeakRef};
 use crate::handback::ReplaceError;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::{ClonePlan, dealloc_range};
 use crate::primitives::{NonNullOffset, Offset};
-use crate::util::bytes::{get_u64, put_u64};
+use crate::util::{get_u64, put_u64};
 
 /// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,
 /// `cap: u64` @ 8, elements from offset 16. Fixed by bstack's ABI (stable across
@@ -336,7 +330,7 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
         if self.writeback.is_some() {
             // Serialize field-resident pushes on this file, and re-read the
             // descriptor inside the lock — our in-memory snapshot may be stale.
-            let lock = crate::io_core::wal::wal_lock_for(self.allocator);
+            let lock = crate::io_core::wal_lock_for(self.allocator);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let loc = self.writeback.expect("field-resident vec has a writeback");
             self.data =

@@ -16,7 +16,7 @@ use bstack::BStack;
 /// The one place the crate builds on-disk integer fields by hand, instead of
 /// repeating `copy_from_slice(&x.to_le_bytes())` at every image builder.
 #[inline(always)]
-pub(crate) fn put_u64(buf: &mut [u8], off: u64, val: u64) {
+pub fn put_u64(buf: &mut [u8], off: u64, val: u64) {
     let o = off as usize;
     buf[o..o + 8].copy_from_slice(&val.to_le_bytes());
 }
@@ -35,7 +35,7 @@ pub fn get_u64(buf: &[u8]) -> u64 {
 /// linked-structure offsets, refcounts) is decoded through this.
 // NOTE LATER: change to NonZeroOffset
 #[inline(always)]
-pub(crate) fn read_u64_at(stack: &BStack, off: u64) -> io::Result<u64> {
+pub fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     stack.get_into(off, &mut buf)?;
     Ok(get_u64(&buf))

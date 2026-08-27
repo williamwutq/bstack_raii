@@ -1,13 +1,12 @@
 //! [`ReplaceError<V>`]: the error a generated `replace_<field>` mutator returns.
 
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 use bstack::BStackRange;
 
 use super::impl_source_error;
 use crate::BStackRaiiAllocator;
-use crate::types::traits::drop::BStackDrop;
+use crate::types::traits::BStackDrop;
 
 /// The error a [`#[bstack_mut]`](crate::bstack_block) `replace_<field>` mutator
 /// returns when the swap fails partway through.

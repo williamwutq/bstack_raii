@@ -14,7 +14,7 @@ use bstack::{BStack, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::registry::FileId;
-use crate::types::traits::drop::BStackDrop;
+use crate::types::traits::BStackDrop;
 
 /// A collected teardown transaction: a raw pointer to the installing allocator's
 /// [`BStack`] (its identity, scoping the sink to that file — compared via `BStack`'s
@@ -240,7 +240,7 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
     result?;
     // Commit the collected subtree frees — bulk-or-WAL dispatch lives in
     // [`wal::commit_frees`], shared with the RTTI interpreter's `commit_home_frees`.
-    crate::io_core::wal::commit_frees(allocator, slices)
+    crate::io_core::commit_frees(allocator, slices)
 }
 
 /// Free a raw block range by reconstructing an owned slice and delegating to the

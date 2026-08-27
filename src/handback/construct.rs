@@ -1,8 +1,7 @@
 //! [`ConstructError<F>`]: the error a generated `new` constructor returns when it
 //! fails after consuming the caller's children.
 
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 use super::impl_source_error;
 

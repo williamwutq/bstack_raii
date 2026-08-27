@@ -24,13 +24,12 @@
 //!   leak, never a torn structure), which the WAL layer reclaims.
 
 use std::error::Error;
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 use bstack::{BStackBulkAllocator, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::dealloc_range;
 
 /// The error a partial [`free_many`](BStackRaiiAllocator::free_many) returns: the
 /// first underlying failure, plus **every range whose free did not cleanly

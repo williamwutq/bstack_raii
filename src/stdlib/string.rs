@@ -27,13 +27,12 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use super::util::{alloc_image, read_fields, read_u64};
-use crate::clone::{ClonePlan, TryCloneIn};
-use crate::io_core::teardown::dealloc_range;
+use super::util::{alloc_image, read_fields};
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast};
+use crate::util::read_u64;
 
 /// The on-disk image of a [`BStackString`]: header, a pointer to the UTF-8 bytes
 /// block (`0` = empty), and the byte length. `#[repr(C)]`, `u64` fields only —
@@ -256,7 +255,7 @@ impl BStackCast for BStackString {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl crate::types::traits::embed::BStackEmbeddable for BStackString {}
+impl crate::types::traits::BStackEmbeddable for BStackString {}
 
 impl BStackBlock for BStackString {
     type OnDisk = StringOnDisk;

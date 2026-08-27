@@ -14,12 +14,12 @@
 use core::ops::Deref;
 use std::io;
 
-use super::super::traits::block::BStackBlock;
-use super::super::traits::drop::{AutoDrop, BStackDrop, BlockShell, drop_block};
-use super::super::traits::r#move::{BStackMove, BStackMoveExpr};
-use super::super::traits::reference::BStackRef;
+use super::super::traits::drop::{BlockShell, drop_block};
+use super::super::traits::{
+    AutoDrop, BStackBlock, BStackDrop, BStackMove, BStackMoveExpr, BStackRef,
+};
 use crate::BStackRaiiAllocator;
-use crate::io_core::teardown::{TeardownDepthGuard, wal_teardown};
+use crate::io_core::{TeardownDepthGuard, wal_teardown};
 
 /// A uniquely-owned handle to a block: an ownership marker over an inner
 /// [`BStackDrop`] handle whose teardown recursively frees the block on disk.

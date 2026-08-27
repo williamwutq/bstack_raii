@@ -24,14 +24,10 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use crate::clone::{ClonePlan, TryCloneIn};
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::types::traits::r#move::BStackMove;
-use crate::types::traits::reference::BStackRef;
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast, BStackMove, BStackRef};
 
 /// The on-disk image of a [`BStackBox<T>`]: the standard [`BlockHeader`] followed
 /// by the boxed value. `#[repr(C, packed)]` (like every generated `XOnDisk`) so
@@ -125,7 +121,7 @@ impl<T: Pod> BStackCast for BStackBox<T> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<T: Pod> crate::types::traits::embed::BStackEmbeddable for BStackBox<T> {}
+impl<T: Pod> crate::types::traits::BStackEmbeddable for BStackBox<T> {}
 
 impl<T: Pod> BStackBlock for BStackBox<T> {
     type OnDisk = BoxOnDisk<T>;

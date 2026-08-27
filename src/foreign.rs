@@ -35,22 +35,16 @@ use std::io;
 use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
 
 use crate::BStackRaiiAllocator;
-use crate::clone::TryCloneIn;
-use crate::io_core::refcount;
-use crate::layout;
-use crate::primitives::{BrandedWidePtr, NonNullOffset, Offset, WidePtr};
+use crate::io_core::{TryCloneIn, refcount};
+use crate::primitives::{BrandedWidePtr, NonNullOffset, Offset, WidePtr, checked_off};
 #[cfg(test)]
 use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
-use crate::types::compiled::owned::{BStackOwned, OwnedRef};
-use crate::types::compiled::rc::WeakRef;
 use crate::types::compiled::rc::{
     BStackRc, BStackWeak, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::types::traits::block::BStackBlock;
-use crate::types::traits::drop::BStackDrop;
-use crate::types::traits::rc::{BStackShared, BStackWeakable};
-use crate::types::traits::reference::BStackRef;
+use crate::types::compiled::{BStackOwned, OwnedRef, WeakRef};
+use crate::types::traits::{BStackBlock, BStackDrop, BStackRef, BStackShared, BStackWeakable};
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or
@@ -665,8 +659,8 @@ pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocato
     let data = unsafe { BStackRef::<T>::from_range(range) };
     let (data_ref, ctrl) = <T as BStackShared>::strong_parts(data, alloc)?;
     let off = match ctrl {
-        None => layout::checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
-        Some(c) => layout::checked_off(c.start(), CTRL_STRONG_OFFSET)?,
+        None => checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
+        Some(c) => checked_off(c.start(), CTRL_STRONG_OFFSET)?,
     };
     refcount::fetch_add(alloc.stack(), NonNullOffset::from_field(off)?, 1)?;
     Ok(())

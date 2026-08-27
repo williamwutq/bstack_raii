@@ -3,8 +3,7 @@
 
 use core::num::NonZeroU64;
 use std::error::Error;
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 use bstack::{BStackRange, BStackSlice};
 use bytemuck::{Pod, Zeroable};
@@ -25,7 +24,7 @@ use crate::util::io_errorfn;
 /// silently wrap to an unrelated in-bounds address a later read/write would then
 /// corrupt, so the arithmetic here is **overflow-checked** and yields `InvalidData`
 /// rather than wrapping. (This is the single home for `add_off` / `mul_off`
-/// [`crate::rtti`] and `checked_off` [`crate::layout`].)
+/// [`crate::rtti`] and [`checked_off`].)
 ///
 /// `#[repr(transparent)]` over `u64`, so it composes into the fat-pointer record with
 /// no encoding change.
@@ -158,7 +157,7 @@ impl NonNullOffset {
     /// field address past the block header (a refcount / control counter, a live
     /// child slot) — erroring rather than panicking on the `0` that only a corrupt
     /// or forged base could produce. The bridge from the `u64` that offset
-    /// arithmetic ([`checked_off`](crate::layout::checked_off), `add_off`) yields to
+    /// arithmetic ([`checked_off`], `add_off`) yields to
     /// the [`NonNullOffset`] the counter ops ([`crate::io_core::refcount`]) require.
     #[inline]
     pub fn from_field(off: u64) -> io::Result<NonNullOffset> {
@@ -231,3 +230,19 @@ io_errorfn!(
     InvalidData,
     "field offset resolved to null"
 );
+
+io_errorfn!(block_offset_overflow, InvalidData, "block offset overflow");
+
+/// Add a small field-offset constant to a base offset, rejecting overflow.
+/// The base routinely originates from an on-disk pointer that can be corrupted
+/// or forged, so plain `+` would either panic under `overflow-checks` or
+/// silently wrap to an unrelated in-bounds offset that a later read/write would
+/// then corrupt.
+///
+/// The raw-`u64` twin of [`Offset::checked_add`]: same guarantee, for the many
+/// call sites that compute an absolute field position from a raw base and a
+/// compile-time constant delta.
+#[inline(always)]
+pub fn checked_off(base: u64, delta: u64) -> io::Result<u64> {
+    base.checked_add(delta).ok_or_else(block_offset_overflow)
+}

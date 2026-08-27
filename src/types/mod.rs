@@ -9,7 +9,7 @@
 //!   among the block-level contracts.
 //! * [`traits`] — the interfaces and contracts the block model is written against
 //!   (the block / refcount / move / embed / cast / drop protocols, and the typed
-//!   [`BStackRef`](traits::reference::BStackRef)).
+//!   [`BStackRef`](traits::BStackRef)).
 //! * [`compiled`] — the concrete, hand-written handle and on-disk types built *on*
 //!   those contracts ([`BStackOwned`](compiled::owned::BStackOwned), the shared
 //!   [`BStackRc`](compiled::rc::BStackRc) / [`BStackWeak`](compiled::rc::BStackWeak),

@@ -6,8 +6,7 @@
 //! site). This trait is that erased view; the stateful path↔id map that resolves a
 //! `FileId` to a live host lives in [`crate::registry`].
 
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 use bstack::{BStack, BStackAllocator, BStackOwnedSlice, BStackRange};
 

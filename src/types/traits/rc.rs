@@ -7,9 +7,8 @@ use std::io;
 use bstack::BStackRange;
 use bytemuck::Pod;
 
-use super::super::compiled::rc::{BStackRc, BStackWeak};
-use super::block::BStackBlock;
-use super::reference::BStackRef;
+use super::super::compiled::{BStackRc, BStackWeak};
+use super::{BStackBlock, BStackRef};
 use crate::BStackRaiiAllocator;
 use crate::handback::ReplaceError;
 use crate::primitives::{EightCC, NonNullOffset};

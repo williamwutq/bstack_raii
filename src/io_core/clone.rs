@@ -51,16 +51,12 @@ use std::io;
 use bstack::{BStackGenOp, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::io_core::teardown::dealloc_range;
-use crate::io_core::wal::{WalStatus, WalTxn};
-use crate::layout;
-use crate::primitives::Offset;
+use crate::io_core::{WalStatus, WalTxn, dealloc_range};
+use crate::primitives::{Offset, checked_off};
 use crate::types::compiled::owned::BStackOwned;
 use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
 use crate::types::compiled::vec::{BYTEVEC_HEADER, VecDesc};
-use crate::types::traits::block::BStackBlock;
-use crate::types::traits::rc::BStackShared;
-use crate::types::traits::reference::BStackRef;
+use crate::types::traits::{BStackBlock, BStackRef, BStackShared};
 
 /// Deep-clone a whole block into a fresh, independent [`BStackOwned`] copy,
 /// allocating the copy with the supplied allocator.
@@ -338,8 +334,8 @@ impl ClonePlan {
         }
         let (data_ref, ctrl) = T::strong_parts(data, allocator)?;
         let off = match ctrl {
-            None => layout::checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
-            Some(c) => layout::checked_off(c.start(), CTRL_STRONG_OFFSET)?,
+            None => checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
+            Some(c) => checked_off(c.start(), CTRL_STRONG_OFFSET)?,
         };
         self.bumps.push(off);
         Ok(())
@@ -350,8 +346,7 @@ impl ClonePlan {
     /// acquires.
     pub fn bump_weak(&mut self, ctrl_off: u64) -> io::Result<()> {
         if self.mode != Mode::Measure {
-            self.bumps
-                .push(layout::checked_off(ctrl_off, CTRL_WEAK_OFFSET)?);
+            self.bumps.push(checked_off(ctrl_off, CTRL_WEAK_OFFSET)?);
         }
         Ok(())
     }

@@ -12,18 +12,15 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::BStackRange;
 
-use super::super::traits::block::BStackBlock;
-use super::super::traits::drop::{AutoDrop, BStackDrop, drop_block};
-use super::super::traits::r#move::{BStackMove, BStackMoveExpr};
-use super::super::traits::rc::BStackWeakable;
-use super::super::traits::reference::BStackRef;
-use super::owned::BStackOwned;
+use super::super::traits::drop::drop_block;
+use super::super::traits::{
+    AutoDrop, BStackBlock, BStackDrop, BStackMove, BStackMoveExpr, BStackRef, BStackWeakable,
+};
+use super::BStackOwned;
 use crate::handback::ReplaceError;
-use crate::io_core::refcount;
-use crate::io_core::teardown::{TeardownDepthGuard, dealloc_range};
-use crate::layout;
-use crate::primitives::{EightCC, NonNullOffset, TryClone};
-use crate::util::bytes::{put_u64, read_u64_at};
+use crate::io_core::{TeardownDepthGuard, dealloc_range, refcount};
+use crate::primitives::{EightCC, NonNullOffset, TryClone, checked_off};
+use crate::util::{put_u64, read_u64};
 
 use super::block::{BlockHeader, HEADER_SIZE};
 
@@ -101,10 +98,7 @@ impl<T: BStackBlock> BStackDrop for StrongRef<T> {
         // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
         let _depth = TeardownDepthGuard::enter()?;
         let data_range = self.0.into_range();
-        let off = NonNullOffset::from_field(layout::checked_off(
-            data_range.start(),
-            RC_REFCOUNT_OFFSET,
-        )?)?;
+        let off = NonNullOffset::from_field(checked_off(data_range.start(), RC_REFCOUNT_OFFSET)?)?;
         // Decrement the inline refcount; only the last owner frees the block.
         if refcount::fetch_sub(allocator.stack(), off, 1)? == 1 {
             // SAFETY: last strong owner (the fetch_sub hit 1) of a live block.
@@ -184,7 +178,7 @@ impl<T: BStackWeakable> WeakRef<T> {
         data_ref: BStackRef<T>,
         allocator: &A,
     ) -> io::Result<BStackRef<T::Control>> {
-        let pos = layout::checked_off(data_ref.into_range().start(), CTRL_BACKPTR_OFFSET)?;
+        let pos = checked_off(data_ref.into_range().start(), CTRL_BACKPTR_OFFSET)?;
         let mut bytes = [0u8; 8];
         allocator.stack().get_into(pos, &mut bytes)?;
         let ctrl_offset = u64::from_le_bytes(bytes);
@@ -227,8 +221,7 @@ impl<T: BStackWeakable> BStackDrop for WeakRef<T> {
 /// count being paid — both call sites do (a consumed `WeakRef`, or the last
 /// strong owner's phantom).
 fn release_weak<A: BStackRaiiAllocator>(allocator: &A, ctrl_range: BStackRange) -> io::Result<()> {
-    let weak_off =
-        NonNullOffset::from_field(layout::checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?)?;
+    let weak_off = NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?)?;
     if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {
         // SAFETY: last weak holder of a live control block; nothing else frees it.
         unsafe { dealloc_range(allocator, ctrl_range)? };
@@ -250,7 +243,7 @@ pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
     // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
     let _depth = TeardownDepthGuard::enter()?;
     let strong_off =
-        NonNullOffset::from_field(layout::checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?)?;
+        NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?)?;
     // Phase 1: last strong owner frees the data block (children + shell), then
     // releases the phantom weak the strong owners collectively held — which is
     // exactly a weak-handle drop on the control block ([`release_weak`], the same
@@ -365,8 +358,8 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
     /// Byte offset of the strong counter for this handle's block kind.
     fn strong_offset(&self) -> io::Result<NonNullOffset> {
         let off = match self.ctrl() {
-            None => layout::checked_off(self.data().into_range().start(), RC_REFCOUNT_OFFSET)?,
-            Some(ctrl) => layout::checked_off(ctrl.start(), CTRL_STRONG_OFFSET)?,
+            None => checked_off(self.data().into_range().start(), RC_REFCOUNT_OFFSET)?,
+            Some(ctrl) => checked_off(ctrl.start(), CTRL_STRONG_OFFSET)?,
         };
         NonNullOffset::from_field(off)
     }
@@ -408,7 +401,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
             .ctrl()
             .expect("BStackRc<T: BStackWeakable> always has a control block");
         let weak_off =
-            NonNullOffset::from_field(layout::checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?)?;
+            NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?)?;
         refcount::fetch_add(self.allocator().stack(), weak_off, 1)?;
         let ctrl = unsafe { BStackRef::<T::Control>::from_range(ctrl_range) };
         // SAFETY: the fetch_add above established the weak count this handle holds.
@@ -446,8 +439,7 @@ impl<'a, T: BStackMove, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
 
         // `(rc, weak)`: release the phantom weak; free the control block at zero.
         if let Some(ctrl) = ctrl {
-            let weak_off =
-                NonNullOffset::from_field(layout::checked_off(ctrl.start(), CTRL_WEAK_OFFSET)?)?;
+            let weak_off = NonNullOffset::from_field(checked_off(ctrl.start(), CTRL_WEAK_OFFSET)?)?;
             if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {
                 unsafe { dealloc_range(allocator, ctrl)? };
             }
@@ -510,11 +502,9 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
         // Both offsets are computed (and can fail) up front, before any mutation —
         // so an overflowing `ctrl_range.start()` never leaves a claimed strong
         // count with nothing to release it.
-        let strong_off = NonNullOffset::from_field(layout::checked_off(
-            ctrl_range.start(),
-            CTRL_STRONG_OFFSET,
-        )?)?;
-        let data_pos = layout::checked_off(ctrl_range.start(), CTRL_DATA_OFFSET)?;
+        let strong_off =
+            NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?)?;
+        let data_pos = checked_off(ctrl_range.start(), CTRL_DATA_OFFSET)?;
         if refcount::increment_if_nonzero(stack, strong_off)?.is_none() {
             return Ok(None);
         }
@@ -555,7 +545,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
 /// than deep-copying — there is no `TryCloneIn` for a weak reference.
 impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> TryClone for BStackWeak<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
-        let weak_off = NonNullOffset::from_field(layout::checked_off(
+        let weak_off = NonNullOffset::from_field(checked_off(
             self.ctrl().into_range().start(),
             CTRL_WEAK_OFFSET,
         )?)?;
@@ -623,7 +613,7 @@ pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocato
     // old control block is released (and possibly freed) below, and a racing
     // upgrade — which holds no weak count to pin it — would otherwise increment a
     // counter in freed storage. Both take this per-file lock.
-    let lock = crate::io_core::wal::wal_lock_for(allocator);
+    let lock = crate::io_core::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let stack = allocator.stack();
 
@@ -699,9 +689,9 @@ pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllo
     // (`increment_if_nonzero`), so a concurrent `set_weak_field` can't free the old
     // control block between the two steps. The field slot is not
     // owned here, so nothing else keeps that block alive.
-    let lock = crate::io_core::wal::wal_lock_for(allocator);
+    let lock = crate::io_core::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let off = read_u64_at(allocator.stack(), field_off.as_u64())?;
+    let off = read_u64(allocator.stack(), field_off.as_u64())?;
     if off == 0 {
         return Ok(None);
     }

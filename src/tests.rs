@@ -1709,7 +1709,7 @@ fn clone_wal_lock_reentry_errs_instead_of_deadlocking() {
 // old guard was a `debug_assert` compiled out in release.
 #[test]
 fn clone_build_size_mismatch_errors_instead_of_oob_write() {
-    use crate::clone::ClonePlan;
+    use crate::ClonePlan;
     use bstack::BStackRange;
 
     let tmp = TempStack::new();

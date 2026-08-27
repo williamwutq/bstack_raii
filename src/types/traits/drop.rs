@@ -14,11 +14,11 @@ use std::io;
 
 use bstack::{BStackOwnedSlice, BStackRange};
 
-use super::super::compiled::owned::BStackOwned;
-use super::block::BStackBlock;
+use super::super::compiled::BStackOwned;
+use super::BStackBlock;
 use crate::BStackRaiiAllocator;
 use crate::handback::ReplaceError;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::dealloc_range;
 
 /// The safe teardown protocol for an affine (non-`Copy`) owning handle: consume
 /// `self` and free the on-disk block(s) it owns.

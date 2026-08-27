@@ -3,7 +3,7 @@
 //! `BlockHeader` is [`bytemuck::Pod`] so it embeds directly in a generated
 //! `XOnDisk` struct and reads back with `bytemuck::from_bytes`. This is the
 //! compiled on-disk *shape* of a block's header — distinct from the
-//! [`BStackBlock`](super::super::traits::block::BStackBlock) trait that describes a
+//! [`BStackBlock`](super::super::traits::BStackBlock) trait that describes a
 //! block's behaviour.
 
 use bytemuck::{Pod, Zeroable};

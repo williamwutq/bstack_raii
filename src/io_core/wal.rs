@@ -60,10 +60,10 @@ use bstack::{BStackGenOp, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use crate::BStackRaiiAllocator;
-use crate::io_core::teardown::dealloc_range;
+use crate::io_core::dealloc_range;
 use crate::primitives::{NonNullOffset, Offset};
 use crate::registry::{self, FileId};
-use crate::util::bytes::read_u64_at;
+use crate::util::bytes::read_u64;
 use crate::util::io_errorfn;
 
 // --- On-disk constants ------------------------------------------------------
@@ -449,7 +449,7 @@ thread_local! {
 /// The file's WAL [`Mutex`] held across a whole clone / RTTI-clone transaction. It
 /// owns the `Arc` so the lifetime-extended guard can never outlive the mutex it
 /// borrows; `Drop` releases the guard *before* the `Arc` is dropped. Shared by
-/// [`crate::clone::ClonePlan`] and the RTTI `clone_value` interpreter.
+/// [`crate::io_core::ClonePlan`] and the RTTI `clone_value` interpreter.
 pub(crate) struct HeldLock {
     /// `Some` while held; taken in `Drop` so the guard releases before `_arc`.
     guard: Option<MutexGuard<'static, ()>>,
@@ -518,7 +518,7 @@ impl HeldLock {
             None => return Ok(None),
         };
         // `0` is "no block yet"; a real WAL block always sits at a non-zero offset.
-        let raw = read_u64_at(allocator.stack(), slot.as_u64())?;
+        let raw = read_u64(allocator.stack(), slot.as_u64())?;
         Ok(Offset::from_raw(raw).to_non_null())
     }
 
@@ -845,7 +845,7 @@ impl HeldLock {
 /// how many entries have been published so far.
 ///
 /// It is the single home for the "log each fresh allocation the instant it is made,
-/// growing the block when it fills" logic that [`crate::clone::ClonePlan`] and the
+/// growing the block when it fills" logic that [`crate::io_core::ClonePlan`] and the
 /// RTTI `clone_value` interpreter both drive — they used to carry a private copy of
 /// this state (`CloneWal`) and a duplicated `wal_log_alloc`.
 pub(crate) struct WalTxn {

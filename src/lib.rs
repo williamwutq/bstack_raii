@@ -21,7 +21,7 @@
 //! | [`block`]      | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
 //! | `bulk`         | Sequential fallbacks for [`BStackRaiiAllocator::alloc_many`] / [`free_many`](BStackRaiiAllocator::free_many); bulk allocators override those trait methods. |
-//! | [`clone`]      | [`TryClone`] / [`TryCloneIn`]: fallible clone for handles that touch disk. |
+//! | `clone`        | [`TryClone`] / [`TryCloneIn`]: fallible clone for handles that touch disk. |
 //! | [`owned`]      | [`BStackOwned`] + the [`OwnedRef`] without-allocator drop core. |
 //! | [`shared`]     | [`BStackRc`] / [`BStackWeak`] + the [`StrongRef`] / [`StrongWeakRef`] / [`WeakRef`] drop cores. |
 //! | `cast`         | Typed ↔ untyped handle conversion — the runtime behind `bstack_cast!`. |
@@ -55,11 +55,9 @@
 // `::bstack_raii::…` even from within the crate's own tests.
 extern crate self as bstack_raii;
 
-mod clone;
 mod foreign;
 mod handback;
 mod io_core;
-mod layout;
 mod primitives;
 /// Runtime Type Information: a persisted, self-describing schema stack for
 /// interpreting `bstack_raii` structures on disk with no compiled-in types.
@@ -71,14 +69,14 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
+pub use handback::{CastError, ConstructError, HandBack, ReplaceError};
 /// Codegen plumbing, re-exported for `#[bstack_block]`-generated code only. It is
 /// named in [`BStackBlock`]'s (hidden) trait-method signatures, so the type must
 /// stay `pub`; the supported way to clone is [`TryClone`] / [`TryCloneIn`].
 #[doc(hidden)]
-pub use clone::ClonePlan;
-pub use clone::TryCloneIn;
-pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
-pub use handback::{CastError, ConstructError, HandBack, ReplaceError};
+pub use io_core::ClonePlan;
+pub use io_core::TryCloneIn;
 /// The inert on-disk **wire** form of a [`Foreign`] pointer — the composed
 /// [wide pointer](crate::primitives). Not part of the public API — generated
 /// `#[bstack_block]` code names it through `::bstack_raii::WidePtr`; user code should
@@ -134,7 +132,7 @@ pub mod __private {
     /// on-disk pointer that is corrupted or forged, and a bare `+` would
     /// either panic under `overflow-checks` or silently wrap to an unrelated
     /// in-bounds offset that the accessor would then read or write.
-    pub use crate::layout::checked_off as checked_field_offset;
+    pub use crate::primitives::checked_off as checked_field_offset;
     pub use crate::registry::{home_relative_repr, resolve_self_repr};
     /// Narrow a layout quantity to the `u32` the RTTI wire format uses,
     /// panicking with a clear diagnostic on overflow rather than silently

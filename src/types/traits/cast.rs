@@ -10,8 +10,8 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::{BStackOwnedSlice, BStackSlice};
 
-use super::super::compiled::owned::BStackOwned;
-use super::block::BStackBlock;
+use super::super::compiled::BStackOwned;
+use super::BStackBlock;
 use crate::handback::CastError;
 use crate::primitives::EightCC;
 

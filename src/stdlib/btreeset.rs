@@ -28,16 +28,12 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
-use super::util::{Scratch, alloc_image, read_fields, read_u64, w8};
-use crate::clone::{ClonePlan, TryCloneIn};
-use crate::io_core::teardown::dealloc_range;
+use super::util::{Scratch, alloc_image, read_fields, w8};
+use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::owned::BStackOwned;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::types::traits::drop::BStackDrop;
-use crate::util::bytes::get_u64;
-use crate::util::small_buf::SmallBuf;
+use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
+use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
+use crate::util::{SmallBuf, get_u64, read_u64};
 
 /// The on-disk image of a [`BStackBTreeSet`]: header, root node pointer (`0` =
 /// empty), key count, and the embedded Bloom filter's handle offset.
@@ -893,7 +889,7 @@ impl<K: Pod + Ord> BStackCast for BStackBTreeSet<K> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod + Ord> crate::types::traits::embed::BStackEmbeddable for BStackBTreeSet<K> {}
+impl<K: Pod + Ord> crate::types::traits::BStackEmbeddable for BStackBTreeSet<K> {}
 
 impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     type OnDisk = TreeSetOnDisk;

@@ -6,7 +6,8 @@ pub(crate) mod small_buf;
 pub(crate) mod small_map;
 
 // Facade: the utility surface re-exported at the crate root.
-pub use bytes::get_u64;
+pub use bytes::{get_u64, put_u64, read_u64};
+pub(crate) use small_buf::SmallBuf;
 pub use small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
 
 // `io_error` is exported for direct use at call sites (dynamic messages); adoption
