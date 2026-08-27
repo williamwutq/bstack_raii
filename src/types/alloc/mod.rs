@@ -8,6 +8,11 @@
 
 pub mod host;
 
+// Facade: the allocator capability ([`BStackRaiiAllocator`], below) plus its host
+// projection, re-exported at this module's root. (`registry` also re-exports the
+// host types, where the cross-file plumbing that consumes them lives.)
+pub use host::{BStackRaiiAllocError, BStackRaiiHost};
+
 use std::io;
 
 use bstack::{BStackOwnedSliceAllocator, BStackRange};

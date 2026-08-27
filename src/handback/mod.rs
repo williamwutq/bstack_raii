@@ -1,24 +1,37 @@
-//! Shared machinery for the crate's **hand-back errors**.
+//! The crate's **hand-back errors** — one home for the family and its shared
+//! machinery.
 //!
 //! Several operations *consume* a resource (a moved-in child, a value to install,
-//! a freshly resized region). When such an operation fails partway, a bare
-//! `io::Error` would silently drop that resource — its on-disk block neither
-//! linked nor returned, an unreachable orphan. So each such operation returns a
-//! dedicated error that wraps the underlying [`io::Error`] **and hands the
-//! resource back**: [`ConstructError`](crate::ConstructError),
-//! [`ReplaceError`](crate::ReplaceError),
-//! [`BStackRaiiAllocError`](crate::registry::BStackRaiiAllocError),
-//! [`FreeManyError`](crate::FreeManyError), and the cast
-//! [`CastError`](crate::CastError).
+//! a freshly resized region, a slice being downcast). When such an operation fails
+//! partway, a bare `io::Error` would silently drop that resource — its on-disk
+//! block neither linked nor returned, an unreachable orphan. So each such
+//! operation returns a dedicated error that wraps the underlying [`io::Error`]
+//! **and hands the resource back**.
 //!
-//! Every one wraps an `io::Error` in a `source` field and delegates
-//! [`Display`](std::fmt::Display) / [`Error`](std::error::Error) to it identically.
+//! The concrete errors live here: [`ConstructError`] (a failed `new`),
+//! [`ReplaceError`] (a failed `replace_<field>`), and [`CastError`] (a failed
+//! `bstack_cast!`). Two more share this contract but live with their functional
+//! siblings: [`BStackRaiiAllocError`](crate::registry::BStackRaiiAllocError) and
+//! [`FreeManyError`](crate::FreeManyError).
+//!
+//! Every `source`-field error wraps an `io::Error` and delegates
+//! [`Display`](std::fmt::Display) / [`Error`](std::error::Error) to it identically;
 //! [`impl_source_error!`] emits that shared boilerplate (and the [`HandBack`] impl)
-//! so each type only hand-writes what actually differs: its constructors, its
+//! so each type only hand-writes what differs: its constructors, its
 //! recovered-resource accessors, and its `Debug` (which masks the handed-back
-//! resource, since the resource generally is not `Debug`).
+//! resource, since the resource generally is not `Debug`). [`CastError`] is instead
+//! a two-variant enum — a clean tag/size mismatch is *not* an I/O error — so it
+//! hand-writes its impls and does not implement [`HandBack`].
 
 use std::io;
+
+mod cast;
+mod construct;
+mod replace;
+
+pub use cast::CastError;
+pub use construct::ConstructError;
+pub use replace::ReplaceError;
 
 /// The common surface of a hand-back error: it wraps an underlying [`io::Error`].
 ///
@@ -48,7 +61,7 @@ macro_rules! impl_source_error {
                 ::core::option::Option::Some(&self.source)
             }
         }
-        impl $(< $($g),+ >)? $crate::util::handback::HandBack for $ty $(< $($g),+ >)? {
+        impl $(< $($g),+ >)? $crate::handback::HandBack for $ty $(< $($g),+ >)? {
             fn io(&self) -> &::std::io::Error {
                 &self.source
             }

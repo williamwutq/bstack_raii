@@ -14,3 +14,9 @@ pub mod block;
 pub mod owned;
 pub mod rc;
 pub mod vec;
+
+// Facade: this subsystem's public surface, re-exported once at the crate root.
+pub use block::BlockHeader;
+pub use owned::{BStackOwned, OwnedRef};
+pub use rc::{BStackRc, BStackWeak, StrongRef, StrongWeakRef, WeakRef};
+pub use vec::{BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc};

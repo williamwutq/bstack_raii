@@ -18,12 +18,14 @@ use super::super::traits::r#move::{BStackMove, BStackMoveExpr};
 use super::super::traits::rc::BStackWeakable;
 use super::super::traits::reference::BStackRef;
 use super::owned::BStackOwned;
+use crate::handback::ReplaceError;
 use crate::io_core::refcount;
 use crate::io_core::teardown::{TeardownDepthGuard, dealloc_range};
 use crate::layout;
-use crate::primitives::{NonNullOffset, TryClone};
+use crate::primitives::{EightCC, NonNullOffset, TryClone};
+use crate::util::bytes::{put_u64, read_u64_at};
 
-use super::block::HEADER_SIZE;
+use super::block::{BlockHeader, HEADER_SIZE};
 
 // The macros inject the refcount / control back-pointer / control counters
 // immediately after the header, ahead of any user fields and in a fixed order.
@@ -561,4 +563,155 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> TryClone for BStackWeak<'a, 
         // SAFETY: the fetch_add above established the weak count this clone holds.
         Ok(unsafe { Self::from_raw(self.ctrl(), self.allocator()) })
     }
+}
+
+// ---------------------------------------------------------------------------
+// `(rc, weak)` build & field-mutation machinery.
+//
+// The *build* side of the control block (the drop-core `*Ref` tokens above are
+// the teardown side), plus the runtime behind a generated `#[bstack_weak]`
+// field's setter/upgrade. All of it speaks only rc/weak vocabulary — the
+// control-block offsets, `WeakRef`, `BStackWeak`, `BStackRc` — so it lives here.
+// ---------------------------------------------------------------------------
+
+/// Build a `(rc, weak)` control-block payload image in memory (no allocation, no
+/// write): header, `strong = 1`, `weak = 1` (the phantom weak the strong owners
+/// hold), and the `x` forward pointer to the data block at `data_start`.
+///
+/// The building block for a **batched** constructor: the caller allocates the
+/// data and control blocks up front, bakes the control offset into the data
+/// block's `ctrl` back-pointer, and commits both block images in one
+/// [`bstack::BStack::set_batched`] — so a `(rc, weak)` block is created atomically,
+/// with no separate back-pointer write and no transient half-wired state.
+pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u64) -> Vec<u8> {
+    // NOTE: control_size probably have an upper bound, so no need for vec here
+    let mut payload = vec![0u8; control_size as usize];
+    let header = BlockHeader {
+        size: control_size,
+        tag: ctrl_tag,
+    };
+    payload[..HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));
+    put_u64(&mut payload, CTRL_STRONG_OFFSET, 1);
+    put_u64(&mut payload, CTRL_WEAK_OFFSET, 1);
+    put_u64(&mut payload, CTRL_DATA_OFFSET, data_start);
+    payload
+}
+
+/// Set a `#[bstack_weak]` field, located at absolute on-disk offset `field_off`,
+/// to point at `new_weak` — releasing any weak reference the field previously
+/// held.
+///
+/// The field stores the child's **control-block** offset, not its data offset:
+/// the control block outlives the data block (it lives while `weak > 0`), so
+/// resolving it at teardown is sound even after the target's data has been
+/// freed. `new_weak` is consumed and the weak count it holds becomes the field's;
+/// a previous non-null target has its weak count decremented. 0 means "unset".
+///
+/// # Safety
+///
+/// `field_off` must be the absolute offset of a live `#[bstack_weak]` field of
+/// declared target type `T`, owned by a block in `allocator`'s file. The old
+/// value read from it is released as a control-block reference: a wrong offset
+/// decrements (and can free) a control block at whatever offset that location
+/// happens to hold.
+pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocator>(
+    allocator: &'w A,
+    field_off: NonNullOffset,
+    new_weak: BStackWeak<'w, T, A>,
+) -> Result<(), ReplaceError<BStackWeak<'w, T, A>>> {
+    // Serialize against a concurrent `upgrade_weak_field` on the same field: the
+    // old control block is released (and possibly freed) below, and a racing
+    // upgrade — which holds no weak count to pin it — would otherwise increment a
+    // counter in freed storage. Both take this per-file lock.
+    let lock = crate::io_core::wal::wal_lock_for(allocator);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let stack = allocator.stack();
+
+    // Exchange the new pointer for the old one in a single atomic `swap`: the read
+    // of the old control offset and the write of the new happen together under one
+    // lock, so two concurrent setters each take (and release) the distinct old
+    // control block they displaced — never the same one twice.
+    // `new_weak` is consumed without decrementing — its weak count becomes the
+    // field's.
+    let ctrl = new_weak.into_raw();
+    let ctrl_off = ctrl.into_range().start();
+    let old_bytes = match stack.swap(field_off.as_u64(), ctrl_off.to_le_bytes()) {
+        Ok(b) => b,
+        Err(e) => {
+            // Commit failed: the field still points at the old target, and
+            // `new_weak` was already consumed (`into_raw` defused its decrement).
+            // Hand it back rather than release its just-transferred weak count, so
+            // the caller can retry or release at their discretion.
+            // SAFETY: `ctrl_off` carries the weak count `new_weak` transferred in.
+            let weak = unsafe {
+                BStackWeak::from_raw(
+                    BStackRef::<T::Control>::from_range(BStackRange::new(
+                        ctrl_off,
+                        size_of::<T::Control>() as u64,
+                    )),
+                    allocator,
+                )
+            };
+            return Err(ReplaceError::recovered(e, weak));
+        }
+    };
+    let old = u64::from_le_bytes(old_bytes[..8].try_into().unwrap());
+
+    // Only now release the old target — pure reclamation, since the field no
+    // longer refers to it. A crash before this leaks at most the old control
+    // block (its weak count stays one too high), never a dangling field.
+    if old != 0 {
+        let old_ctrl = unsafe {
+            BStackRef::<T::Control>::from_range(BStackRange::new(
+                old,
+                size_of::<T::Control>() as u64,
+            ))
+        };
+        // SAFETY: `old_ctrl` carries the weak count the field held until the
+        // commit above displaced it.
+        if let Err(e) = unsafe { WeakRef::<T>::new(old_ctrl) }.bstack_drop(allocator) {
+            // The new weak is already installed (the swap committed); only the old
+            // target's weak-count release failed, leaving it one-too-high — the
+            // leak teardown always tolerates. Nothing is handed back (`lost`): the
+            // new value is in the field, and the caller cannot re-drive this.
+            return Err(ReplaceError::lost(e));
+        }
+    }
+    Ok(())
+}
+
+/// Attempt to upgrade a `#[bstack_weak]` field (holding a control-block offset at
+/// `field_off`) to a strong handle. Returns `None` if the field is unset (0) or
+/// the target's strong count has already reached zero. What a generated weak
+/// field accessor calls.
+///
+/// # Safety
+///
+/// `field_off` must be the absolute offset of a live `#[bstack_weak]` field of
+/// declared target type `T` in `allocator`'s file: the u64 read there is
+/// treated as a control-block offset and its counters are read and written —
+/// a wrong offset manufactures an owning `BStackRc` from arbitrary bytes.
+pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllocator>(
+    allocator: &'a A,
+    field_off: NonNullOffset,
+) -> io::Result<Option<BStackRc<'a, T, A>>> {
+    // Hold the per-file lock across the read of the control offset and the pin
+    // (`increment_if_nonzero`), so a concurrent `set_weak_field` can't free the old
+    // control block between the two steps. The field slot is not
+    // owned here, so nothing else keeps that block alive.
+    let lock = crate::io_core::wal::wal_lock_for(allocator);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let off = read_u64_at(allocator.stack(), field_off.as_u64())?;
+    if off == 0 {
+        return Ok(None);
+    }
+    let ctrl = unsafe {
+        BStackRef::<T::Control>::from_range(BStackRange::new(off, size_of::<T::Control>() as u64))
+    };
+    // Borrow a weak over the field's control ref just long enough to upgrade;
+    // consume it via `into_raw` so the field's own weak count is untouched.
+    let weak = unsafe { BStackWeak::from_raw(ctrl, allocator) };
+    let result = weak.upgrade();
+    let _ = weak.into_raw();
+    result
 }

@@ -188,15 +188,11 @@ fn warmup(a: &Recorder) {
     a.reset_log();
 }
 
+/// A set of `(offset, len)` block extents.
+type ExtentSet = BTreeSet<(u64, u64)>;
+
 /// One differential run. Returns `(built, freed_static, freed_rtti)`.
-fn differential(
-    reg: &RttiRegistry,
-    spec: &Spec,
-) -> (
-    BTreeSet<(u64, u64)>,
-    BTreeSet<(u64, u64)>,
-    BTreeSet<(u64, u64)>,
-) {
+fn differential(reg: &RttiRegistry, spec: &Spec) -> (ExtentSet, ExtentSet, ExtentSet) {
     let ord = reg.ordinal_of(Node::eightcc()).unwrap();
 
     // --- run A: the generated teardown -----------------------------------

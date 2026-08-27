@@ -127,7 +127,7 @@ mod clonediff {
             [b"aa".as_slice(), b"bb".as_slice()],
         )
         .unwrap();
-        let orig = probe(&root.handle(), &alloc);
+        let orig = probe(root.handle(), &alloc);
 
         let static_clone: Wide = {
             let c = root.try_clone_in(&alloc).unwrap();
@@ -246,8 +246,8 @@ mod tddiff {
         let m1 = Leaf::new(&alloc, 6).unwrap();
 
         let leaf_sz = core::mem::size_of::<<Leaf as BStackBlock>::OnDisk>() as u64;
-        let mut rec: Vec<(&str, u64, u64)> = Vec::new(); // (name, off, len)
-        rec.push(("a", a.handle().range().start(), leaf_sz));
+        // (name, off, len)
+        let mut rec: Vec<(&str, u64, u64)> = vec![("a", a.handle().range().start(), leaf_sz)];
         rec.push(("b", b.handle().range().start(), leaf_sz));
         rec.push(("many[0]", m0.handle().range().start(), leaf_sz));
         rec.push(("many[1]", m1.handle().range().start(), leaf_sz));

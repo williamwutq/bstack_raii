@@ -47,9 +47,9 @@ use bytemuck::{Pod, Zeroable};
 
 use super::util::{Scratch, alloc_image, read_fields, read_u64, w8};
 use crate::clone::{ClonePlan, TryCloneIn};
+use crate::handback::ReplaceError;
 use crate::io_core::teardown::dealloc_range;
 use crate::primitives::EightCC;
-use crate::replace::ReplaceError;
 use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::types::compiled::owned::BStackOwned;
 use crate::types::traits::block::{BStackBlock, BStackCast};

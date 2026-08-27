@@ -50,7 +50,7 @@ use crate::{BStackRaiiAllocator, get_u64};
 /// [semantic types](crate::types::alloc); re-exported here because resolving a
 /// [`FileId`] to a live host is the registry's job.
 pub use crate::types::alloc::SyncBStackRaiiAllocator;
-pub use crate::types::alloc::host::{BStackRaiiAllocError, BStackRaiiHost};
+pub use crate::types::alloc::{BStackRaiiAllocError, BStackRaiiHost};
 
 /// The stable per-file identity underlying `Foreign<T>`. Defined among the wide
 /// pointer's [components](crate::primitives); re-exported here as its resolution
@@ -545,11 +545,11 @@ pub fn home_relative_repr(repr: WidePtr, home: &BStack) -> WidePtr {
     if repr.is_self() {
         return repr;
     }
-    if let Some(id) = id_of_host(home) {
-        if repr.file() == id {
-            // Target is the home file ⇒ re-encode as `SELF`, keeping type + address.
-            return WidePtr::with_parts(FileId::SELF, repr.type_id(), repr.offset());
-        }
+    if let Some(id) = id_of_host(home)
+        && repr.file() == id
+    {
+        // Target is the home file ⇒ re-encode as `SELF`, keeping type + address.
+        return WidePtr::with_parts(FileId::SELF, repr.type_id(), repr.offset());
     }
     repr
 }

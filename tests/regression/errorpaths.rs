@@ -318,7 +318,9 @@ mod lost {
         assert_eq!(old.handle().range().start(), a_off);
 
         // Simulate the `lost` outcome: the caller never receives the old handle.
-        core::mem::forget(old);
+        // A bare handle is non-`Drop` (frees nothing on scope exit), so discarding it
+        // leaks the block exactly as a dropped-on-the-floor `lost` value would.
+        let _ = old;
 
         // What the doc says recovery will do for you:
         let reclaimed = bstack_raii::finish(&alloc).unwrap();

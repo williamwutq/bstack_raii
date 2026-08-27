@@ -24,3 +24,12 @@ pub mod embed;
 pub mod r#move;
 pub mod rc;
 pub mod reference;
+
+// Facade: this subsystem's public surface, re-exported once at the crate root.
+pub use block::{BStackBlock, BStackCast};
+pub use cast::{BStackCastAs, BStackCastInto};
+pub use drop::{AutoDrop, BStackDrop};
+pub use embed::BStackEmbeddable;
+pub use r#move::{BStackMove, BStackMoveExpr};
+pub use rc::{BStackShared, BStackWeakable};
+pub use reference::BStackRef;

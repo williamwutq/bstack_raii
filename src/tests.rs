@@ -12,8 +12,8 @@ use bstack::{
     BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator, GhostTreeBstackAllocator,
 };
 
-use crate::construct::{alloc_block, build_control_payload};
 use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::rc::build_control_payload;
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET,
 };
@@ -28,6 +28,26 @@ use crate::{
 /// [`NonNullOffset`](crate::primitives::NonNullOffset) the refcount ops now take.
 fn nn(off: u64) -> crate::primitives::NonNullOffset {
     crate::primitives::NonNullOffset::from_field(off).unwrap()
+}
+
+/// Allocate a `size`-byte block and stamp its `BlockHeader { size, tag }`, returning
+/// its range (the payload after the header is left as the allocator provided it).
+/// A test-only block-minting primitive: production code never mints a bare block —
+/// a header-stamping helper in the public surface would let safe code forge any
+/// type's tag over any size, the credential every header-trusting gate validates —
+/// so generated constructors stamp their header inline and this lives only here.
+fn alloc_block<A: BStackRaiiAllocator>(
+    allocator: &A,
+    tag: EightCC,
+    size: u64,
+) -> io::Result<BStackRange> {
+    let mut slice = allocator.alloc(size)?;
+    let header = BlockHeader { size, tag };
+    if let Err(e) = slice.write(bytemuck::bytes_of(&header)) {
+        let _ = allocator.dealloc(slice);
+        return Err(e);
+    }
+    Ok(slice.as_range())
 }
 
 // --------------------------------------------------------------------------

@@ -49,9 +49,9 @@ use super::owned::BStackOwned;
 use super::rc::WeakRef;
 use super::rc::{BStackRc, BStackWeak};
 use crate::clone::ClonePlan;
+use crate::handback::ReplaceError;
 use crate::io_core::teardown::dealloc_range;
 use crate::primitives::{NonNullOffset, Offset};
-use crate::replace::ReplaceError;
 use crate::util::bytes::{get_u64, put_u64};
 
 /// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,

@@ -91,7 +91,7 @@ impl Error for FreeManyError {
     }
 }
 
-impl crate::util::handback::HandBack for FreeManyError {
+impl crate::handback::HandBack for FreeManyError {
     fn io(&self) -> &io::Error {
         &self.source
     }

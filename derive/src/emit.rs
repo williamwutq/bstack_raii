@@ -110,7 +110,7 @@ pub(crate) fn vec_ctor(
     } else {
         quote!(#fname: #base_param,)
     };
-    (param, prep, quote!(#fname: #fname,))
+    (param, prep, quote!(#fname,))
 }
 
 /// `bstack_move!` field for a `Vec<T>` / `String`: yield a detached `BStackVec`
@@ -315,7 +315,7 @@ pub(crate) fn block_vec_ctor(
                     ::core::option::Option::None => ::core::default::Default::default(),
                 };
             },
-            quote!(#fname: #fname,),
+            quote!(#fname,),
         )
     } else {
         let build = build(quote!(#fname));
@@ -324,7 +324,7 @@ pub(crate) fn block_vec_ctor(
             quote! {
                 let #fname: ::bstack_raii::VecDesc = #build;
             },
-            quote!(#fname: #fname,),
+            quote!(#fname,),
         )
     }
 }
@@ -1588,11 +1588,7 @@ pub(crate) fn ctor_field(
 ) -> (TokenStream, TokenStream, TokenStream) {
     let (handle_ty, to_offset): (TokenStream, TokenStream) = match kind {
         Kind::Pod => {
-            return (
-                quote!(#fname: #inner_ty,),
-                quote!(),
-                quote!(#fname: #fname,),
-            );
+            return (quote!(#fname: #inner_ty,), quote!(), quote!(#fname,));
         }
         Kind::Owned => (
             quote!(::bstack_raii::BStackOwned<#inner_ty>),
@@ -1624,13 +1620,13 @@ pub(crate) fn ctor_field(
                     ::core::option::Option::None => 0u64,
                 };
             },
-            quote!(#fname: #fname,),
+            quote!(#fname,),
         )
     } else {
         (
             quote!(#fname: #handle_ty,),
             quote! { let #fname: u64 = { let __handle = #fname; #to_offset }; },
-            quote!(#fname: #fname,),
+            quote!(#fname,),
         )
     }
 }
@@ -1657,9 +1653,7 @@ pub(crate) fn rename_lifetime(ts: &TokenStream, from: &str, to: &str) -> TokenSt
     ts.clone()
         .into_iter()
         .map(|tt| match tt {
-            TokenTree::Ident(id) if id.to_string() == from => {
-                TokenTree::Ident(Ident::new(to, id.span()))
-            }
+            TokenTree::Ident(id) if id == from => TokenTree::Ident(Ident::new(to, id.span())),
             TokenTree::Group(g) => TokenTree::Group(proc_macro2::Group::new(
                 g.delimiter(),
                 rename_lifetime(&g.stream(), from, to),
@@ -2337,7 +2331,7 @@ pub(crate) fn foreign_field(
                 ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             };
         });
-        parts.ctor_inits.push(quote!(#fname: #fname,));
+        parts.ctor_inits.push(quote!(#fname,));
         parts
             .mv_types
             .push(quote!(::core::option::Option<#mv_leaf_ty>));
@@ -2376,7 +2370,7 @@ pub(crate) fn foreign_field(
             let #fname: ::bstack_raii::WidePtr =
                 ::bstack_raii::__private::home_relative_repr(#fname.repr(), allocator.stack());
         ));
-        parts.ctor_inits.push(quote!(#fname: #fname,));
+        parts.ctor_inits.push(quote!(#fname,));
         parts.mv_types.push(quote!(#mv_leaf_ty));
         parts.mv_recon.push(quote!(#mv_leaf_expr));
     }
@@ -2757,7 +2751,7 @@ pub(crate) fn vec_field(
         };
         parts.ctor_params.push(param);
         parts.ctor_preps.push(prep);
-        parts.ctor_inits.push(quote!(#fname: #fname,));
+        parts.ctor_inits.push(quote!(#fname,));
 
         // ---- Teardown: dispatch each element, then free the data block ----
         let elem_drop = foreign_elem_drop(kind, ftarget);
@@ -3057,7 +3051,7 @@ pub(crate) fn vec_field(
         };
         parts.ctor_params.push(param);
         parts.ctor_preps.push(prep);
-        parts.ctor_inits.push(quote!(#fname: #fname,));
+        parts.ctor_inits.push(quote!(#fname,));
 
         // ---- Teardown: free each child per kind, then the offset block ----
         let free_child = match kind {
@@ -3459,7 +3453,7 @@ pub(crate) fn vec_array_field(
                 __slots
             };
         });
-        parts.ctor_inits.push(quote!(#fname: #fname,));
+        parts.ctor_inits.push(quote!(#fname,));
 
         // Teardown: free each vector's data block.
         parts.drop_stmts.push(quote! {
@@ -3673,7 +3667,7 @@ pub(crate) fn foreign_array_field(
                 __slots
             };
         });
-        parts.ctor_inits.push(quote!(#fname: #fname,));
+        parts.ctor_inits.push(quote!(#fname,));
 
         // ---- Teardown: dispatch each slot (inline; nothing else to free) ----
         let elem_drop = foreign_elem_drop(kind, ftarget);
@@ -4171,7 +4165,7 @@ pub(crate) fn block_array_field(
             __a
         };
     });
-    parts.ctor_inits.push(quote!(#fname: #fname,));
+    parts.ctor_inits.push(quote!(#fname,));
 
     // Teardown: free / release each non-null element (a ref owns nothing).
     let per_teardown = match kind {
@@ -4530,7 +4524,7 @@ pub(crate) fn foreign_tuple_field(
     parts
         .ctor_preps
         .push(quote!(let #fname: #wrapper = #wrapper( #(#ctor_elems),* );));
-    parts.ctor_inits.push(quote!(#fname: #fname,));
+    parts.ctor_inits.push(quote!(#fname,));
 
     // Teardown / clone: dispatch each foreign element from the on-disk wrapper.
     let mut tup_drops = Vec::new();
@@ -4662,7 +4656,7 @@ pub(crate) fn pod_tuple_field(ctx: &FieldCtx, inner_ty: &Type) -> syn::Result<Op
     parts
         .ctor_preps
         .push(quote!(let #fname: #wrapper = #wrapper( #(#fname.#idx),* );));
-    parts.ctor_inits.push(quote!(#fname: #fname,));
+    parts.ctor_inits.push(quote!(#fname,));
     let cap = format_ident!("__cap_{}", fname);
     parts.mv_caps.push(quote!(let #cap = __od.#fname;));
     parts.mv_types.push(quote!(#inner_ty));

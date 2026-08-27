@@ -5,6 +5,7 @@
 //! own `#![cfg(feature = "fault-injection")]`).
 
 mod atomicity {
+    #![allow(clippy::module_inception)]
     //! Regression tests for read-modify-write atomicity of the pointer/vector slots.
     //! Each mutator below fuses the read of the displaced pointer and the write of the
     //! new one into one atomic `BStack::swap` (pointer slots) or a CAS-guarded grow

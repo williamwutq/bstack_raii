@@ -237,13 +237,10 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
     // reclaimable leak, never a torn structure" baseline). Only the collect-and-
     // commit *frees* are undone this way; refcount decrements a `strong` child's
     // teardown already applied are not collected here and remain a retry hazard.
-    if result.is_err() {
-        return result;
-    }
+    result?;
     // Commit the collected subtree frees — bulk-or-WAL dispatch lives in
     // [`wal::commit_frees`], shared with the RTTI interpreter's `commit_home_frees`.
-    crate::io_core::wal::commit_frees(allocator, slices)?;
-    result
+    crate::io_core::wal::commit_frees(allocator, slices)
 }
 
 /// Free a raw block range by reconstructing an owned slice and delegating to the

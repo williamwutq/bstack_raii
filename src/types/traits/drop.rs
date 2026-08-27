@@ -12,12 +12,13 @@ use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use std::io;
 
-use bstack::BStackRange;
+use bstack::{BStackOwnedSlice, BStackRange};
 
+use super::super::compiled::owned::BStackOwned;
 use super::block::BStackBlock;
 use crate::BStackRaiiAllocator;
+use crate::handback::ReplaceError;
 use crate::io_core::teardown::dealloc_range;
-use crate::replace::ReplaceError;
 
 /// The safe teardown protocol for an affine (non-`Copy`) owning handle: consume
 /// `self` and free the on-disk block(s) it owns.
@@ -169,5 +170,19 @@ impl<'a, T: BStackDrop, A: BStackRaiiAllocator> Drop for AutoDrop<'a, T, A> {
         let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
         // Errors are swallowed, matching the contract of Rust's `Drop`.
         let _ = inner.bstack_drop(self.allocator);
+    }
+}
+
+impl<'a, T: BStackBlock, A: BStackRaiiAllocator> AutoDrop<'a, BStackOwned<T>, A> {
+    /// Upcast an auto-freeing owned handle to the untyped owned slice, discarding
+    /// type info (infallible) — the owning counterpart to `bstack_cast!`'s upcast.
+    ///
+    /// Consumes the guard without running its disk-level `Drop`; the returned
+    /// slice owns the allocation. (A bare `BStackOwned<X>` carries no allocator,
+    /// so wrap it — `owned.auto(alloc)` — before upcasting to a slice.)
+    pub fn into_slice(self) -> BStackOwnedSlice<'a, A> {
+        let (owned, allocator) = self.into_raw_parts();
+        let range = owned.into_inner().range();
+        unsafe { BStackOwnedSlice::from_raw_range(allocator, range) }
     }
 }

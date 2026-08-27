@@ -391,10 +391,7 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
     /// only meaningful in the file it was read from — pass that file's allocator);
     /// the caller keeps that obligation, exactly as for a cast-produced
     /// [`BStackRef`].
-    pub fn into_local<'t, A: BStackRaiiAllocator>(
-        self,
-        target: &'t A,
-    ) -> io::Result<BStackOwned<T>> {
+    pub fn into_local<A: BStackRaiiAllocator>(self, target: &A) -> io::Result<BStackOwned<T>> {
         let fid = self.ptr.repr().file_id();
         // NOTE: see previous note
         if fid != 0 {

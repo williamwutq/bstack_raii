@@ -5,9 +5,9 @@ use std::io;
 
 use bstack::BStackRange;
 
+use super::impl_source_error;
 use crate::BStackRaiiAllocator;
 use crate::types::traits::drop::BStackDrop;
-use crate::util::handback::impl_source_error;
 
 /// The error a [`#[bstack_mut]`](crate::bstack_block) `replace_<field>` mutator
 /// returns when the swap fails partway through.

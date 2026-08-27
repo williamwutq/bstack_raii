@@ -1060,6 +1060,10 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // `bstack_drop` runs `__bstack_drop_children` + `dealloc_range` (see
         // `teardown::drop_block`). This is the affine-handle fix.
 
+        // Generated accessors legitimately wrap `?`-terminated resolutions in `Ok(..)`
+        // (e.g. a `Vec<Foreign<T>>` getter's `collect::<io::Result<_>>()?`); the
+        // redundancy is not actionable in generated code.
+        #[allow(clippy::needless_question_mark)]
         impl #impl_g #name #ty_g #where_g {
             #(#accessors)*
             #(#setters)*

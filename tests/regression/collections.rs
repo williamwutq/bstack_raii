@@ -165,6 +165,7 @@ mod iterinvalidate {
 }
 
 mod collections {
+    #![allow(clippy::module_inception)]
     //! Harness: a drop/clone differential across every stdlib collection that
     //! holds **owning** element blocks.
     //!

@@ -18,3 +18,10 @@ pub(crate) mod refcount;
 pub mod registry;
 pub(crate) mod teardown;
 pub(crate) mod wal;
+
+// Facade: this subsystem's public surface, re-exported once at the crate root.
+// (Internal callers still reach the submodule paths directly.)
+pub use bulk::FreeManyError;
+pub use registry::ForeignHostAllocator;
+pub use teardown::{dealloc_range, wal_teardown};
+pub use wal::{STD_WAL_ANCHOR, finish};

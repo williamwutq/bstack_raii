@@ -11,8 +11,8 @@ use super::super::compiled::rc::{BStackRc, BStackWeak};
 use super::block::BStackBlock;
 use super::reference::BStackRef;
 use crate::BStackRaiiAllocator;
+use crate::handback::ReplaceError;
 use crate::primitives::{EightCC, NonNullOffset};
-use crate::replace::ReplaceError;
 
 /// Implemented by refcounted blocks (`#[bstack_block(rc)]` and
 /// `#[bstack_block(rc, weak)]`), i.e. any block that can be the target of a
@@ -144,7 +144,9 @@ pub trait BStackWeakable: BStackBlock {
         new_weak: BStackWeak<'w, Self, A>,
     ) -> Result<(), ReplaceError<BStackWeak<'w, Self, A>>> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::construct::set_weak_field::<Self, A>(allocator, field_off, new_weak) }
+        unsafe {
+            crate::types::compiled::rc::set_weak_field::<Self, A>(allocator, field_off, new_weak)
+        }
     }
 
     /// Attempt to upgrade the `#[bstack_weak]` field at `field_off` to a strong
@@ -160,6 +162,6 @@ pub trait BStackWeakable: BStackBlock {
         field_off: NonNullOffset,
     ) -> io::Result<Option<BStackRc<'a, Self, A>>> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::construct::upgrade_weak_field::<Self, A>(allocator, field_off) }
+        unsafe { crate::types::compiled::rc::upgrade_weak_field::<Self, A>(allocator, field_off) }
     }
 }

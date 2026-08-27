@@ -12,8 +12,8 @@ use std::io;
 use bstack::{BStack, BStackAllocator, BStackOwnedSlice, BStackRange};
 
 use super::{BStackRaiiAllocator, SyncBStackRaiiAllocator};
+use crate::handback::impl_source_error;
 use crate::primitives::NonNullOffset;
-use crate::util::handback::impl_source_error;
 
 /// Error returned by [`BStackRaiiHost::realloc`] / [`BStackRaiiHost::dealloc`] when
 /// the operation fails — the object-safe, range-based analogue of bstack's
