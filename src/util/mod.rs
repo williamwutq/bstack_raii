@@ -2,13 +2,17 @@
 
 pub(crate) mod bytes;
 pub(crate) mod io;
+pub(crate) mod reader;
 pub(crate) mod small_buf;
 pub(crate) mod small_map;
+pub(crate) mod writer;
 
 // Facade: the utility surface re-exported at the crate root.
 pub use bytes::{get_u64, put_u64, read_u64};
+pub(crate) use reader::Reader;
 pub(crate) use small_buf::SmallBuf;
 pub use small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
+pub(crate) use writer::Writer;
 
 // `io_error` is exported for direct use at call sites (dynamic messages); adoption
 // beyond `io_errorfn` is incremental, so it may be momentarily unused.

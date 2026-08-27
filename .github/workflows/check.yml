@@ -25,7 +25,3 @@ jobs:
       run: cargo clippy --workspace --all-targets -- -D warnings
     - name: Clippy (fault-injection)
       run: cargo clippy --workspace --all-targets --features fault-injection -- -D warnings
-    # trybuild compile-fail cases run only here (stable), where their `.stderr`
-    # snapshots were generated — beta/nightly diagnostics would drift them.
-    - name: Compile-fail tests (trybuild)
-      run: cargo test --test hypercube compile_fail

@@ -28,10 +28,9 @@ jobs:
       with:
         toolchain: ${{ matrix.rust }}
     # The trybuild compile-fail UI tests (`compile_fail`) are toolchain-sensitive —
-    # their committed `.stderr` snapshots track one compiler's diagnostics. So the
-    # matrix `Test` steps below skip them, and the dedicated `Compile-fail` step runs
-    # them only on `stable` (where the snapshots were generated); beta/nightly
-    # diagnostics would drift them. (They also run in the Check workflow.)
+    # their committed `.stderr` snapshots track one compiler's exact diagnostics and
+    # drift across compiler versions, so CI does not run them: every `Test` step skips
+    # them. Run them locally with `cargo test --test hypercube compile_fail`.
     - name: Check
       run: cargo check --workspace --all-targets
     - name: Test
@@ -40,6 +39,3 @@ jobs:
       run: cargo test --workspace --release -- --skip compile_fail
     - name: Test (fault-injection)
       run: cargo test --workspace --features fault-injection -- --skip compile_fail
-    - name: Compile-fail tests (trybuild)
-      if: matrix.rust == 'stable'
-      run: cargo test --test hypercube compile_fail
