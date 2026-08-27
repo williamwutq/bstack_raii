@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
+use bstack::{BStackRange, BStackSlice};
 use bytemuck::{Pod, Zeroable};
 
 use crate::util::io_errorfn;
@@ -133,6 +134,25 @@ impl NonNullOffset {
             .map(NonNullOffset)
             .ok_or_else(offset_overflow)
     }
+
+    /// The range's start as a non-null offset, or `None` at offset `0`.
+    ///
+    /// The direct form of [`Offset::from`]`(range)`[`.to_non_null()`](Offset::to_non_null).
+    /// A `From<BStackRange> for Option<NonNullOffset>` impl is disallowed by the
+    /// orphan rule (`Option` is not a local type), so this is a named constructor.
+    #[inline]
+    pub fn from_range(range: BStackRange) -> Option<NonNullOffset> {
+        Self::new(range.into())
+    }
+
+    /// The slice's start as a non-null offset, or `None` at offset `0`.
+    ///
+    /// The direct form of [`Offset::from`]`(slice)`[`.to_non_null()`](Offset::to_non_null);
+    /// a named constructor for the same orphan-rule reason as [`from_range`](Self::from_range).
+    #[inline]
+    pub fn from_slice(slice: BStackSlice<'_>) -> Option<NonNullOffset> {
+        Self::new(slice.into())
+    }
 }
 
 impl From<NonNullOffset> for Offset {
@@ -173,5 +193,21 @@ impl fmt::Display for NullOffsetError {
 }
 
 impl Error for NullOffsetError {}
+
+impl From<BStackRange> for Offset {
+    /// The range's start address.
+    #[inline]
+    fn from(range: BStackRange) -> Offset {
+        Offset::from_raw(range.start())
+    }
+}
+
+impl From<BStackSlice<'_>> for Offset {
+    /// The slice's start address.
+    #[inline]
+    fn from(slice: BStackSlice<'_>) -> Offset {
+        Offset::from_raw(slice.start())
+    }
+}
 
 io_errorfn!(offset_overflow, InvalidData, "on-disk offset arithmetic overflow");
