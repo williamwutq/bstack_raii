@@ -399,7 +399,7 @@ mod freemany {
         for target in 0..24u64 {
             // Re-allocate a fresh trio each sweep so each run starts clean.
             let alloc2 = FirstFitBStackAllocator::new(
-                BStack::open(&path.with_extension(format!("s{target}"))).unwrap(),
+                BStack::open(path.with_extension(format!("s{target}"))).unwrap(),
             )
             .unwrap();
             let rs: Vec<BStackRange> = (0..3)
