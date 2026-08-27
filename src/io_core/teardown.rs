@@ -2,22 +2,29 @@
 //!
 //! [`BStackDrop`] is implemented by every `#[bstack_block]` type (frees the
 //! block and recurses into its owned children) and by the small child-handle
-//! types in [`crate::handle`]. It takes `self` (a *without-allocator* handle)
-//! plus an explicit allocator, so it is generic over all handle-like types.
+//! drop cores in [`crate::types::compiled::owned`] / [`crate::types::compiled::rc`]
+//! (`OwnedRef`, `StrongRef`, `StrongWeakRef`, `WeakRef`). It takes `self` (a
+//! *without-allocator* handle) plus an explicit allocator, so it is generic over
+//! all handle-like types.
 
 use core::cell::RefCell;
 use std::io;
 
-use bstack::{BStackGenOp, BStackOwnedSlice, BStackRange};
+use bstack::{BStack, BStackOwnedSlice, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::registry::FileId;
 use crate::types::traits::drop::BStackDrop;
-use crate::io_core::wal::{WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_lock_for};
 
-/// A collected teardown transaction: the installing allocator's **stack identity**
-/// (scoping the sink to its file) plus the `(file, range)` frees gathered so far.
-type TeardownSink = (usize, Vec<(FileId, BStackRange)>);
+/// A collected teardown transaction: a raw pointer to the installing allocator's
+/// [`BStack`] (its identity, scoping the sink to that file — compared via `BStack`'s
+/// own pointer-identity [`PartialEq`]) plus the `(file, range)` frees gathered so
+/// far. A raw pointer, not `&BStack`, because it must outlive the borrow across the
+/// nested `dealloc_range` calls; sound because the installing allocator is borrowed
+/// for the whole enclosing [`wal_teardown`]. Thread-local, so the `!Send` pointer is
+/// fine (unlike the process-global [`registry`](crate::registry), whose stack keys
+/// must stay `usize`).
+type TeardownSink = (*const BStack, Vec<(FileId, BStackRange)>);
 
 thread_local! {
     /// While a WAL-backed teardown is in progress, the collector that
@@ -43,10 +50,104 @@ thread_local! {
     static TEARDOWN_SINK: RefCell<Option<TeardownSink>> = const { RefCell::new(None) };
 }
 
-/// The address of an allocator's backing `BStack` — a stable per-file identity used to
-/// scope the teardown sink to the file that installed it (see [`TEARDOWN_SINK`]).
-fn stack_addr<A: BStackRaiiAllocator>(allocator: &A) -> usize {
-    allocator.stack() as *const _ as usize
+/// A zero-sized handle over [`TEARDOWN_SINK`] that centralises its whole lifecycle —
+/// install, collect, take, and clear-on-exit — in one place. Previously each of
+/// these was a raw `TEARDOWN_SINK.with(|s| …borrow_mut()…)` scattered across
+/// [`wal_teardown`] and [`dealloc_range`], which is where the F3 clear-on-panic bug
+/// lived (see [`SinkGuard`]).
+struct Sink;
+
+impl Sink {
+    /// Whether a teardown sink is currently installed on this thread (a nested
+    /// teardown, whose frees already collect into the outer driver's sink).
+    fn is_active() -> bool {
+        TEARDOWN_SINK.with(|s| s.borrow().is_some())
+    }
+
+    /// Install a fresh sink keyed by `stack` (the installing allocator's [`BStack`]
+    /// identity), returning the [`SinkGuard`] that clears it on scope exit.
+    fn install(stack: *const BStack) -> SinkGuard {
+        TEARDOWN_SINK.with(|s| *s.borrow_mut() = Some((stack, Vec::new())));
+        SinkGuard
+    }
+
+    /// Collect `range` into the installed sink **iff** it belongs to the file that
+    /// installed it — deferring the free to the batched commit — and report whether
+    /// it did. Returns `false` (i.e. "free it eagerly") when no sink is installed, or
+    /// when the range belongs to a *different* file's ordinary allocator (tagging it
+    /// `SELF` would misdirect it into the installer's file). A genuine cross-file
+    /// `Foreign` free carries a non-`SELF` id and *is* collected, then routed by the
+    /// registry on recovery.
+    fn collect<A: BStackRaiiAllocator>(allocator: &A, range: BStackRange) -> bool {
+        TEARDOWN_SINK.with(|s| match s.borrow_mut().as_mut() {
+            Some((installer, sink)) => {
+                let foreign = allocator.wal_file_id() != FileId::SELF;
+                // SAFETY: `*installer` points at the `BStack` of the allocator that
+                // installed the sink, which is borrowed for the whole enclosing
+                // `wal_teardown` — so it is live here. The `==` is `BStack`'s own
+                // pointer-identity `PartialEq`.
+                if foreign || allocator.stack() == unsafe { &**installer } {
+                    sink.push((allocator.wal_file_id(), range));
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        })
+    }
+
+    /// The sink-aware leaf free: the one dealloc path that consults the teardown
+    /// sink. If a sink is installed and `range` belongs to its file, [`collect`]
+    /// defers the slice into the batched commit; otherwise the range is freed
+    /// eagerly in its own file by reconstructing an owned slice for the allocator.
+    /// This is what distinguishes it from a bulk dealloc, which never touches the
+    /// sink — hence it hangs off [`Sink`].
+    ///
+    /// [`collect`]: Sink::collect
+    ///
+    /// # Safety
+    /// `range` must be a live allocation owned by `allocator` that no other live
+    /// handle will also free.
+    unsafe fn dealloc<A: BStackRaiiAllocator>(allocator: &A, range: BStackRange) -> io::Result<()> {
+        // Inside a WAL-backed teardown, defer the free: collect the slice so the
+        // whole subtree commits (and frees) as one crash-atomic transaction — but
+        // ONLY if it belongs to the file that installed the sink (see [`collect`]).
+        // Otherwise it falls through to an eager free in its own file.
+        if Self::collect(allocator, range) {
+            return Ok(());
+        }
+        let owned: BStackOwnedSlice<'_, A> =
+            unsafe { BStackOwnedSlice::from_raw_range(allocator, range) };
+        allocator.dealloc(owned).map_err(|e| e.source)
+    }
+}
+
+/// RAII guard for an installed [`Sink`]: its `Drop` clears the thread-local on
+/// **every** exit — including an unwind out of `bstack_drop`. A bare `.take()` after
+/// the teardown call is skipped on panic, leaving the sink `Some`; the next
+/// top-level teardown on this thread would then hit [`Sink::is_active`], misdetect a
+/// *nested* call, and silently funnel every free into the stale (never-committed)
+/// sink — leaking the whole subtree while returning `Ok` (issue F3). Making the clear
+/// structural (owned by this guard) rules that out even if a caught panic unwinds
+/// through.
+struct SinkGuard;
+
+impl SinkGuard {
+    /// Take the collected `(file, range)` frees, leaving the sink empty. The guard's
+    /// `Drop` still runs afterwards (an idempotent second clear).
+    fn take(&self) -> Vec<(FileId, BStackRange)> {
+        TEARDOWN_SINK
+            .with(|s| s.borrow_mut().take())
+            .map(|(_, v)| v)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        TEARDOWN_SINK.with(|s| *s.borrow_mut() = None);
+    }
 }
 
 thread_local! {
@@ -116,32 +217,18 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
 ) -> io::Result<()> {
     // Nested teardown: an outer driver already owns the sink; frees already
     // collect, so just recurse (exactly one transaction wraps the whole subtree).
-    if TEARDOWN_SINK.with(|s| s.borrow().is_some()) {
+    if Sink::is_active() {
         return handle.bstack_drop(allocator);
     }
     // No anchor → the allocator opts out of reclamation: plain teardown.
     if allocator.wal_anchor().is_none() {
         return handle.bstack_drop(allocator);
     }
-    TEARDOWN_SINK.with(|s| *s.borrow_mut() = Some((stack_addr(allocator), Vec::new())));
-    // Clear the sink on *every* exit from here on — including an unwind out of
-    // `bstack_drop`. A bare `.take()` after the call is skipped on panic, leaving the
-    // sink `Some`; the next top-level teardown on this thread would then hit the
-    // `is_some()` guard above, misdetect a *nested* call, and silently funnel every free
-    // into the stale (never-committed) sink — leaking the whole subtree while returning
-    // `Ok` (issue F3). The guard restores `None` even if a caught panic unwinds through.
-    struct SinkGuard;
-    impl Drop for SinkGuard {
-        fn drop(&mut self) {
-            TEARDOWN_SINK.with(|s| *s.borrow_mut() = None);
-        }
-    }
-    let _sink_guard = SinkGuard;
+    // The guard clears the sink on *every* exit from here on (including an unwind),
+    // ruling out the F3 stale-sink hazard structurally (see [`SinkGuard`]).
+    let sink_guard = Sink::install(core::ptr::from_ref(allocator.stack()));
     let result = handle.bstack_drop(allocator);
-    let slices = TEARDOWN_SINK
-        .with(|s| s.borrow_mut().take())
-        .map(|(_, v)| v)
-        .unwrap_or_default();
+    let slices = sink_guard.take();
     // A mid-walk error means the teardown did not finish, so the frees it *did*
     // collect must NOT be committed: freeing a partial set while the still-linked
     // parent points at those ranges is an observable torn structure a retry then
@@ -153,125 +240,17 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
     if result.is_err() {
         return result;
     }
-    // Bulk-capable allocator, same-file subtree: `dealloc_bulk` is itself atomic and
-    // self-recovering, so free the whole subtree as one atomic batch and **skip the
-    // WAL** — wrapping an already-atomic bulk free in the WAL is redundant and
-    // unsound (the allocator's recovery direction is opaque, so a WAL retry could
-    // double-free). A crash mid-bulk is reclaimed by the allocator's own recovery.
-    // A cross-file (mixed `FileId`) teardown still routes through the WAL so its
-    // foreign frees are replayed via the registry on recovery.
-    if allocator.atomic_bulk() && slices.iter().all(|(fid, _)| *fid == FileId::SELF) {
-        // SAFETY: the sink's ranges were each collected from an owned handle's
-        // own teardown; the deferral changes when they are freed, not what.
-        unsafe { allocator.free_many(slices.into_iter().map(|(_, r)| r))? };
-    } else {
-        wal_free_all(allocator, slices)?;
-    }
+    // Commit the collected subtree frees — bulk-or-WAL dispatch lives in
+    // [`wal::commit_frees`], shared with the RTTI interpreter's `commit_home_frees`.
+    crate::io_core::wal::commit_frees(allocator, slices)?;
     result
-}
-
-/// Commit `slices` as one committed `Dealloc` transaction and execute the frees.
-/// A crash mid-free leaves a `Complete` WAL that `finish` rolls forward on reopen.
-///
-/// The whole staging→commit→finish critical section runs under the file's WAL
-/// lock, so concurrent teardowns on the same file serialize here (they collect
-/// their subtrees independently first — that part stays concurrent) rather than
-/// racing the single shared anchor slot.
-fn wal_free_all<A: BStackRaiiAllocator>(
-    allocator: &A,
-    slices: Vec<(FileId, BStackRange)>,
-) -> io::Result<()> {
-    if slices.is_empty() {
-        return Ok(());
-    }
-    let lock = wal_lock_for(allocator);
-    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-
-    let mut log = WalLog::with_capacity(slices.len());
-    for (fid, s) in &slices {
-        // `fid == SELF` ⇒ a local free (this file); a foreign id ⇒ reclaimed in that
-        // file through the registry on `finish` (see `wal::free_recorded`).
-        log.append(WalEntry::dealloc_in(WalStatus::Pending, *fid, *s));
-    }
-    // Stage the transaction `Pending`, then commit it by flipping `txn_status` to
-    // `Complete` in one atomic `inplace_gen` — the single commit point (a crash
-    // before it abandons; after it, `finish` rolls the frees forward). With the
-    // sink now cleared, `finish_at_locked` executes the frees and marks the
-    // persistent WAL block idle for reuse.
-    let wal_range = persist_at(allocator, &log, WalStatus::Pending)?;
-    let flip = [WalStatus::Complete as u8];
-    let mut done = false;
-    allocator.stack().inplace_gen(|_feedback| {
-        if done {
-            None
-        } else {
-            done = true;
-            // SAFETY: `flip` outlives the call; the `txn_status` byte follows the
-            // u64 magic at offset 8 in `WalHeader`.
-            let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(&flip[..]) };
-            Some(BStackGenOp::Write {
-                offset: wal_range.start() + 8,
-                data,
-            })
-        }
-    })?;
-    finish_at_locked(allocator)?;
-    Ok(())
-}
-
-/// Commit a batch of **home-file** owned-range frees for crash recovery, routed
-/// exactly as [`wal_teardown`]: a bulk-capable allocator frees them atomically
-/// through its own self-recovering machinery; otherwise they go through the WAL,
-/// so a crash mid-free is rolled forward on the next open rather than leaking
-/// permanently.
-///
-/// This is the sink the RTTI interpreter uses so its collected frees no longer
-/// bypass the WAL their static counterparts (`wal_teardown` / `bstack_move!`) go
-/// through. All ranges must live in `allocator`'s own file
-/// (tagged [`FileId::SELF`]); cross-file releases are handled separately by the
-/// interpreter (`teardown_foreign`).
-///
-/// # Safety
-/// Each range must be a live allocation owned by `allocator` that no other live
-/// handle will also free (as for [`dealloc_range`] / [`free_many`]).
-pub(crate) unsafe fn commit_home_frees<A: BStackRaiiAllocator>(
-    allocator: &A,
-    ranges: Vec<BStackRange>,
-) -> io::Result<()> {
-    if ranges.is_empty() {
-        return Ok(());
-    }
-    if allocator.atomic_bulk() {
-        // SAFETY: forwarded from the caller's contract.
-        unsafe { allocator.free_many(ranges) }
-    } else {
-        let slices = ranges.into_iter().map(|r| (FileId::SELF, r)).collect();
-        wal_free_all(allocator, slices)
-    }
-}
-
-/// Free a block by range: recurse into its owned children, then dealloc the shell.
-///
-/// The single implementation of "tear down a `T` block", shared by every affine
-/// owner ([`BStackOwned`](crate::BStackOwned), the `handle::*Ref` tokens, the
-/// block-element vectors). It replaces the per-type `impl BStackDrop for <handle>`
-/// bodies that used to live on each `Copy` block handle — the handle is now a pure
-/// view, so this is reachable only through a non-`Copy` owner.
-///
-/// # Safety
-/// `range` must be a live `T` block owned by `allocator` that no other live owner
-/// will also free.
-pub(crate) unsafe fn drop_block<T: crate::types::traits::block::BStackBlock, A: BStackRaiiAllocator>(
-    range: BStackRange,
-    allocator: &A,
-) -> io::Result<()> {
-    T::__bstack_drop_children(range, allocator)?;
-    unsafe { dealloc_range(allocator, range) }
 }
 
 /// Free a raw block range by reconstructing an owned slice and delegating to the
 /// allocator. The central sink the generated `bstack_drop` code funnels through,
-/// since ranges carry no allocator of their own.
+/// since ranges carry no allocator of their own — a thin public entry over the
+/// sink-aware [`Sink::dealloc`] (kept a free function because generated
+/// `bstack_drop` code and every collection call it by this name).
 ///
 /// # Safety
 /// `range` must be a live allocation owned by `allocator` that no other live
@@ -280,32 +259,5 @@ pub unsafe fn dealloc_range<A: BStackRaiiAllocator>(
     allocator: &A,
     range: BStackRange,
 ) -> io::Result<()> {
-    // Inside a WAL-backed teardown, defer the free: collect the slice so the whole
-    // subtree commits (and frees) as one crash-atomic transaction — but ONLY if it
-    // belongs to the file that installed the sink. Otherwise a nested `bstack_drop`
-    // against a different file's ordinary allocator would be tagged `SELF` and freed in
-    // the installer's file (a cross-file misdirected free); such a free must go eagerly
-    // to its own file instead.
-    let deferred = TEARDOWN_SINK.with(|s| match s.borrow_mut().as_mut() {
-        Some((installer, sink)) => {
-            // A genuine cross-file `Foreign` free (through a `ForeignHostAllocator`)
-            // carries a non-`SELF` id and is routed to that file by the registry on
-            // recovery — collect it. A same-file free (matching stack identity) is the
-            // ordinary case. Anything else is a *different* file's free: don't collect.
-            let foreign = allocator.wal_file_id() != FileId::SELF;
-            if foreign || stack_addr(allocator) == *installer {
-                sink.push((allocator.wal_file_id(), range));
-                true
-            } else {
-                false
-            }
-        }
-        None => false,
-    });
-    if deferred {
-        return Ok(());
-    }
-    let owned: BStackOwnedSlice<'_, A> =
-        unsafe { BStackOwnedSlice::from_raw_range(allocator, range) };
-    allocator.dealloc(owned).map_err(|e| e.source)
+    unsafe { Sink::dealloc(allocator, range) }
 }

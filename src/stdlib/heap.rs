@@ -35,16 +35,16 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::util::bytes::get_u64;
+use crate::io_core::teardown::dealloc_range;
 use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::replace::ReplaceError;
-use crate::io_core::teardown::{dealloc_range};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::drop::BStackDrop;
+use crate::util::bytes::get_u64;
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackBinaryHeap`]: header, array-block pointer
 /// (`0` = none), capacity in slots, and element count. Non-generic.
@@ -385,7 +385,10 @@ impl<K: Pod + Ord, V: BStackBlock> BStackCast for BStackBinaryHeap<K, V> {
 }
 
 // Self-contained (no separate control block): may be `#[embed]`ded.
-impl<K: Pod + Ord, V: BStackBlock> crate::types::traits::embed::BStackEmbeddable for BStackBinaryHeap<K, V> {}
+impl<K: Pod + Ord, V: BStackBlock> crate::types::traits::embed::BStackEmbeddable
+    for BStackBinaryHeap<K, V>
+{
+}
 
 impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     type OnDisk = HeapOnDisk;
@@ -404,8 +407,8 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     /// Recursively free every value block and the array, **without** freeing the
     /// handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let handle = range.start();
         let (data, cap, len) = Self::read_meta(allocator.stack(), handle)?;

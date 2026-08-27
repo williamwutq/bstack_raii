@@ -12,6 +12,7 @@ use std::io;
 use bstack::{BStack, BStackAllocator, BStackOwnedSlice, BStackRange};
 
 use super::{BStackRaiiAllocator, SyncBStackRaiiAllocator};
+use crate::primitives::NonNullOffset;
 use crate::util::handback::impl_source_error;
 
 /// Error returned by [`BStackRaiiHost::realloc`] / [`BStackRaiiHost::dealloc`] when
@@ -138,7 +139,7 @@ pub trait BStackRaiiHost: Send + Sync {
 
     /// This file's WAL anchor slot, if it participates in crash reclamation
     /// ([`BStackRaiiAllocator::wal_anchor`]).
-    fn wal_anchor(&self) -> Option<u64>;
+    fn wal_anchor(&self) -> Option<NonNullOffset>;
 }
 
 impl<A: SyncBStackRaiiAllocator> BStackRaiiHost for A {
@@ -180,7 +181,7 @@ impl<A: SyncBStackRaiiAllocator> BStackRaiiHost for A {
         }
     }
 
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         <A as BStackRaiiAllocator>::wal_anchor(self)
     }
 }

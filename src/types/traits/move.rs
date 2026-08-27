@@ -3,9 +3,9 @@
 
 use std::io;
 
-use crate::BStackRaiiAllocator;
 use super::super::compiled::owned::BStackOwned;
 use super::block::BStackBlock;
+use crate::BStackRaiiAllocator;
 
 /// The per-block field destructure behind `bstack_move!`: read every field, then
 /// free only the parent *shell* (the children stay live on disk). Ownership is

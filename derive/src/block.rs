@@ -1039,8 +1039,8 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             #[doc(hidden)]
             #[allow(unused_imports)]
             fn __bstack_drop_children<__A: ::bstack_raii::BStackRaiiAllocator>(
-                __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
+                __range: ::bstack_raii::BStackRange,
             ) -> ::std::io::Result<()> {
                 use ::bstack_raii::BStackDrop as _;
                 // Bring the trait into scope so a child's (possibly generic) teardown

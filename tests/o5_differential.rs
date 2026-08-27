@@ -176,7 +176,7 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 fn wal_block_offset(a: &Recorder) -> Option<u64> {
     let mut b = [0u8; 8];
     a.stack()
-        .get_into(bstack_raii::STD_WAL_ANCHOR, &mut b)
+        .get_into(bstack_raii::STD_WAL_ANCHOR.as_u64(), &mut b)
         .ok()?;
     let off = u64::from_le_bytes(b);
     (off != 0).then_some(off)

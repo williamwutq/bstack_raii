@@ -14,11 +14,12 @@
 use core::ops::Deref;
 use std::io;
 
-use crate::BStackRaiiAllocator;
 use super::super::traits::block::BStackBlock;
+use super::super::traits::drop::{AutoDrop, BStackDrop, BlockShell, drop_block};
 use super::super::traits::r#move::{BStackMove, BStackMoveExpr};
-use crate::io_core::teardown::{wal_teardown};
-use super::super::traits::drop::{AutoDrop, BStackDrop, BlockShell};
+use super::super::traits::reference::BStackRef;
+use crate::BStackRaiiAllocator;
+use crate::io_core::teardown::{TeardownDepthGuard, wal_teardown};
 
 /// A uniquely-owned handle to a block: an ownership marker over an inner
 /// [`BStackDrop`] handle whose teardown recursively frees the block on disk.
@@ -96,5 +97,39 @@ impl<'a, X: BStackMove, A: BStackRaiiAllocator> BStackMoveExpr for AutoDrop<'a, 
     fn bstack_move(self) -> Self::Output {
         let (owned, allocator) = self.into_raw_parts();
         X::bstack_move(owned, allocator)
+    }
+}
+
+/// `#[bstack_owned]`: an exclusively-owned child — the without-allocator drop core
+/// a generated `__bstack_drop_children` mints for an owned field.
+///
+/// Not `Copy`/`Clone`, and its field is private: this is an *ownership* token whose
+/// [`BStackDrop`] frees unconditionally, so it must not be freely mintable or
+/// duplicable from a non-owning [`BStackRef`] — construct it with the `unsafe`
+/// [`new`](Self::new).
+pub struct OwnedRef<T>(BStackRef<T>);
+
+impl<T> OwnedRef<T> {
+    /// # Safety
+    ///
+    /// `inner` must reference a live block the caller exclusively owns (and
+    /// gives up by constructing this): the wrapper's `bstack_drop` frees the
+    /// block outright, ignoring any refcount.
+    pub unsafe fn new(inner: BStackRef<T>) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T: BStackBlock> BStackDrop for OwnedRef<T> {
+    fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
+        // Bound the in-file owned recursion (this is the chokepoint every
+        // generated `__bstack_drop_children` re-enters through): an owned cycle
+        // errors here instead of overflowing the native stack.
+        let _depth = TeardownDepthGuard::enter()?;
+        // An owned child is freed by running the block's own recursive teardown,
+        // which frees its children (post-order) and then deallocs the block.
+        // SAFETY: an `OwnedRef` is an ownership token minted (via the `unsafe`
+        // `new`) over a live block this token exclusively owns.
+        unsafe { drop_block::<T, A>(allocator, self.0.into_range()) }
     }
 }

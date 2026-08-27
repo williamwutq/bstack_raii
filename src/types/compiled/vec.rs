@@ -42,16 +42,17 @@ use bstack::{BStack, BStackByteVec, BStackOwnedSlice, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::super::traits::block::BStackBlock;
-use super::super::traits::rc::{BStackShared, BStackWeakable};
-use crate::clone::ClonePlan;
-use crate::handle::WeakRef;
-use crate::util::bytes::{get_u64, put_u64};
-use super::owned::BStackOwned;
-use super::super::traits::reference::BStackRef;
-use crate::replace::ReplaceError;
-use super::rc::{BStackRc, BStackWeak};
-use crate::io_core::teardown::{dealloc_range};
 use super::super::traits::drop::BStackDrop;
+use super::super::traits::rc::{BStackShared, BStackWeakable};
+use super::super::traits::reference::BStackRef;
+use super::owned::BStackOwned;
+use super::rc::WeakRef;
+use super::rc::{BStackRc, BStackWeak};
+use crate::clone::ClonePlan;
+use crate::io_core::teardown::dealloc_range;
+use crate::primitives::{NonNullOffset, Offset};
+use crate::replace::ReplaceError;
+use crate::util::bytes::{get_u64, put_u64};
 
 /// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,
 /// `cap: u64` @ 8, elements from offset 16. Fixed by bstack's ABI (stable across
@@ -63,7 +64,7 @@ pub(crate) const BYTEVEC_HEADER: u64 = 16;
 /// single place that on-disk shape is assembled, shared by a cloned vec
 /// ([`crate::ClonePlan::stage_bytevec`]) and a field-resident growth
 /// [`push`](BStackVec::push).
-// Note: suspecious pub(crate)
+// NOTE: suspecious pub(crate). This is because clone plan still use it, we will refactor later
 pub(crate) fn bytevec_image(len: u64, cap: u64, data: &[u8]) -> Vec<u8> {
     let mut img = vec![0u8; BYTEVEC_HEADER as usize + data.len()];
     put_u64(&mut img, 0, len);
@@ -90,38 +91,72 @@ fn build_offset_desc<A: BStackRaiiAllocator>(
 ///
 /// Stored **inline** in the owning struct's field — there is no separate
 /// descriptor block, since the struct uniquely owns the vector. `Pod`, so it
-/// embeds directly in a generated `XOnDisk`.
+/// embeds directly in a generated `XOnDisk` (`data_off` is an [`Offset`], which is
+/// itself `#[repr(transparent)]` over `u64`, so the wire layout is unchanged and
+/// `data_off == 0` stays the "no data block" / `Option<Vec>` niche).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct VecDesc {
-    pub data_off: u64,
+    /// Offset of the current data block, or [`Offset::NULL`] (`0`) when there is
+    /// no block yet (an empty / `None` vector).
+    pub data_off: Offset,
     pub data_size: u64,
 }
 
-/// Read a [`VecDesc`] from an absolute on-disk offset (its inline field location).
-fn read_vecdesc(stack: &BStack, loc: u64) -> io::Result<VecDesc> {
-    let mut buf = [0u8; size_of::<VecDesc>()];
-    stack.get_into(loc, &mut buf)?;
-    Ok(VecDesc {
-        data_off: get_u64(&buf[0..8]),
-        data_size: get_u64(&buf[8..16]),
-    })
+impl VecDesc {
+    /// Read a [`VecDesc`] from an absolute on-disk location (its inline field slot).
+    fn read(stack: &BStack, loc: u64) -> io::Result<VecDesc> {
+        let mut buf = [0u8; 16];
+        stack.get_into(loc, &mut buf)?;
+        Ok(VecDesc::from(buf))
+    }
 }
 
-/// The 16-byte little-endian on-disk image of a [`VecDesc`] (`data_off` then
-/// `data_size`) — the form [`write_vecdesc`] writes and the descriptor CAS in
-/// [`BStackVec::push`] compares against.
-fn vecdesc_bytes(desc: VecDesc) -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&desc.data_off.to_le_bytes());
-    buf[8..16].copy_from_slice(&desc.data_size.to_le_bytes());
-    buf
+impl From<[u8; 16]> for VecDesc {
+    /// Decode the 16-byte little-endian on-disk image (`data_off` @0, `data_size` @8).
+    #[inline]
+    fn from(buf: [u8; 16]) -> VecDesc {
+        VecDesc {
+            data_off: Offset::from_raw(get_u64(&buf[0..8])),
+            data_size: get_u64(&buf[8..16]),
+        }
+    }
 }
 
-/// Write a [`VecDesc`] to an absolute on-disk offset (its inline field location).
-fn write_vecdesc(stack: &BStack, loc: u64, desc: VecDesc) -> io::Result<()> {
-    stack.set(loc, vecdesc_bytes(desc))
+impl From<VecDesc> for [u8; 16] {
+    /// The 16-byte little-endian on-disk image — the form a field slot stores and
+    /// the descriptor CAS in [`BStackVec::push`] compares against.
+    #[inline]
+    fn from(desc: VecDesc) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&desc.data_off.get().to_le_bytes());
+        buf[8..16].copy_from_slice(&desc.data_size.to_le_bytes());
+        buf
+    }
 }
+
+impl From<BStackRange> for VecDesc {
+    /// A descriptor naming `range` as the data block.
+    #[inline]
+    fn from(range: BStackRange) -> VecDesc {
+        VecDesc {
+            data_off: Offset::from(range),
+            data_size: range.len(),
+        }
+    }
+}
+
+impl From<VecDesc> for BStackRange {
+    /// The data block range this descriptor names (`[data_off, data_off + data_size)`).
+    #[inline]
+    fn from(desc: VecDesc) -> BStackRange {
+        BStackRange::new(desc.data_off.get(), desc.data_size)
+    }
+}
+
+// No `Deref`/`AsRef`/`AsMut<BStackRange>`: `VecDesc` does not *contain* a
+// `BStackRange` (it is `Offset` + a `u64` size), so there is nothing to borrow —
+// the `From` conversions above are the value-level bridge instead.
 
 /// A persistent, growable vector of POD elements. Backs un-annotated `Vec<T>`
 /// (`T: Pod`) / `String` fields.
@@ -146,11 +181,11 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
     ///
     /// # Safety
     /// `loc` must be the offset of a live inline [`VecDesc`] written by this type.
-    pub unsafe fn from_field(loc: u64, allocator: &'a A) -> io::Result<Self> {
-        let desc = read_vecdesc(allocator.stack(), loc)?;
+    pub unsafe fn from_field(loc: NonNullOffset, allocator: &'a A) -> io::Result<Self> {
+        let desc = VecDesc::read(allocator.stack(), loc.as_u64())?;
         Ok(Self {
-            data: BStackRange::new(desc.data_off, desc.data_size),
-            writeback: Some(BStackRange::new(loc, size_of::<VecDesc>() as u64)),
+            data: BStackRange::from(desc),
+            writeback: Some(BStackRange::new(loc.as_u64(), size_of::<VecDesc>() as u64)),
             allocator,
             _marker: PhantomData,
         })
@@ -162,14 +197,14 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
     ///
     /// # Safety
     /// As [`from_field`](Self::from_field).
-    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
-        let desc = read_vecdesc(allocator.stack(), loc)?;
-        if desc.data_off == 0 {
+    pub unsafe fn from_field_opt(loc: NonNullOffset, allocator: &'a A) -> io::Result<Option<Self>> {
+        let desc = VecDesc::read(allocator.stack(), loc.as_u64())?;
+        if desc.data_off.is_null() {
             return Ok(None);
         }
         Ok(Some(Self {
-            data: BStackRange::new(desc.data_off, desc.data_size),
-            writeback: Some(BStackRange::new(loc, size_of::<VecDesc>() as u64)),
+            data: BStackRange::from(desc),
+            writeback: Some(BStackRange::new(loc.as_u64(), size_of::<VecDesc>() as u64)),
             allocator,
             _marker: PhantomData,
         }))
@@ -188,7 +223,7 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
     /// arbitrary range.
     pub unsafe fn from_desc(desc: VecDesc, allocator: &'a A) -> Self {
         Self {
-            data: BStackRange::new(desc.data_off, desc.data_size),
+            data: BStackRange::from(desc),
             writeback: None,
             allocator,
             _marker: PhantomData,
@@ -197,10 +232,7 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
 
     /// The current descriptor value — what a field stores inline.
     pub fn descriptor(&self) -> VecDesc {
-        VecDesc {
-            data_off: self.data.start(),
-            data_size: self.data.len(),
-        }
+        VecDesc::from(self.data)
     }
 
     /// The allocator this vector is bound to.
@@ -211,7 +243,9 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
     /// Persist the current descriptor to the inline field, if field-resident.
     fn persist(&self) -> io::Result<()> {
         if let Some(loc) = self.writeback {
-            write_vecdesc(self.allocator.stack(), loc.start(), self.descriptor())?;
+            self.allocator
+                .stack()
+                .set(loc.start(), <[u8; 16]>::from(self.descriptor()))?;
         }
         Ok(())
     }
@@ -305,8 +339,8 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
             let lock = crate::io_core::wal::wal_lock_for(self.allocator);
             let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             let loc = self.writeback.expect("field-resident vec has a writeback");
-            self.data = read_vecdesc(self.allocator.stack(), loc.start())
-                .map(|d| BStackRange::new(d.data_off, d.data_size))?;
+            self.data =
+                VecDesc::read(self.allocator.stack(), loc.start()).map(BStackRange::from)?;
             self.push_inner(value)
         } else {
             self.push_inner(value)
@@ -414,7 +448,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of data offsets to
     /// live `T` blocks this vector owns.
-    pub unsafe fn from_field(loc: u64, allocator: &'a A) -> io::Result<Self> {
+    pub unsafe fn from_field(loc: NonNullOffset, allocator: &'a A) -> io::Result<Self> {
         Ok(Self {
             offsets: unsafe { BStackVec::from_field(loc, allocator)? },
             _marker: PhantomData,
@@ -426,7 +460,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
     ///
     /// # Safety
     /// As [`from_field`](Self::from_field).
-    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+    pub unsafe fn from_field_opt(loc: NonNullOffset, allocator: &'a A) -> io::Result<Option<Self>> {
         Ok(
             unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
                 offsets,
@@ -551,7 +585,9 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackBlockVec<'a, T, A> {
         let allocator = self.offsets.allocator();
         for off in self.offsets.to_vec()? {
             // SAFETY: each stored offset names a live child this vec owns.
-            unsafe { crate::io_core::teardown::drop_block::<T, A>(Self::elem_range(off), allocator)? };
+            unsafe {
+                crate::types::traits::drop::drop_block::<T, A>(allocator, Self::elem_range(off))?
+            };
         }
         self.offsets.bstack_drop()
     }
@@ -590,7 +626,7 @@ impl<'a, T: BStackShared, A: BStackRaiiAllocator> BStackStrongVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of data offsets to
     /// live `T` blocks, each accounting for one strong reference this vector owns.
-    pub unsafe fn from_field(loc: u64, allocator: &'a A) -> io::Result<Self> {
+    pub unsafe fn from_field(loc: NonNullOffset, allocator: &'a A) -> io::Result<Self> {
         Ok(Self {
             offsets: unsafe { BStackVec::from_field(loc, allocator)? },
             _marker: PhantomData,
@@ -602,7 +638,7 @@ impl<'a, T: BStackShared, A: BStackRaiiAllocator> BStackStrongVec<'a, T, A> {
     ///
     /// # Safety
     /// As [`from_field`](Self::from_field).
-    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+    pub unsafe fn from_field_opt(loc: NonNullOffset, allocator: &'a A) -> io::Result<Option<Self>> {
         Ok(
             unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
                 offsets,
@@ -767,7 +803,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of control-block
     /// offsets, each accounting for one weak reference this vector owns.
-    pub unsafe fn from_field(loc: u64, allocator: &'a A) -> io::Result<Self> {
+    pub unsafe fn from_field(loc: NonNullOffset, allocator: &'a A) -> io::Result<Self> {
         Ok(Self {
             offsets: unsafe { BStackVec::from_field(loc, allocator)? },
             _marker: PhantomData,
@@ -779,7 +815,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeakVec<'a, T, A> {
     ///
     /// # Safety
     /// As [`from_field`](Self::from_field).
-    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+    pub unsafe fn from_field_opt(loc: NonNullOffset, allocator: &'a A) -> io::Result<Option<Self>> {
         Ok(
             unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
                 offsets,
@@ -927,7 +963,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRefVec<'a, T, A> {
     /// # Safety
     /// `loc` must be a live inline descriptor over an array of offsets to `T`
     /// blocks (which this vector does not own).
-    pub unsafe fn from_field(loc: u64, allocator: &'a A) -> io::Result<Self> {
+    pub unsafe fn from_field(loc: NonNullOffset, allocator: &'a A) -> io::Result<Self> {
         Ok(Self {
             offsets: unsafe { BStackVec::from_field(loc, allocator)? },
             _marker: PhantomData,
@@ -939,7 +975,7 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRefVec<'a, T, A> {
     ///
     /// # Safety
     /// As [`from_field`](Self::from_field).
-    pub unsafe fn from_field_opt(loc: u64, allocator: &'a A) -> io::Result<Option<Self>> {
+    pub unsafe fn from_field_opt(loc: NonNullOffset, allocator: &'a A) -> io::Result<Option<Self>> {
         Ok(
             unsafe { BStackVec::from_field_opt(loc, allocator)? }.map(|offsets| Self {
                 offsets,

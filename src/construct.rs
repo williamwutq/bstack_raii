@@ -1,6 +1,7 @@
 //! Block creation: allocate, stamp the header, and initialize refcounts /
-//! control blocks. The teardown side lives in [`crate::handle`]; this is the
-//! matching build side.
+//! control blocks. The teardown side lives with the drop cores in
+//! [`crate::types::compiled::owned`] / [`crate::types::compiled::rc`]; this is
+//! the matching build side.
 //!
 //! These are the low-level, type-agnostic primitives the `#[bstack_block]`
 //! macro's generated constructors (and the tests) build on. Writing the
@@ -16,16 +17,16 @@ use crate::BStackRaiiAllocator;
 use crate::util::handback::impl_source_error;
 use bstack::BStackRange;
 
-use crate::types::traits::rc::BStackWeakable;
-use crate::handle::WeakRef;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::types::compiled::rc::{CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET};
-use crate::util::bytes::{put_u64, read_u64_at};
-use crate::primitives::EightCC;
-use crate::types::traits::reference::BStackRef;
+use crate::primitives::{EightCC, NonNullOffset};
 use crate::replace::ReplaceError;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::rc::WeakRef;
 use crate::types::compiled::rc::{BStackRc, BStackWeak};
+use crate::types::compiled::rc::{CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET};
 use crate::types::traits::drop::BStackDrop;
+use crate::types::traits::rc::BStackWeakable;
+use crate::types::traits::reference::BStackRef;
+use crate::util::bytes::{put_u64, read_u64_at};
 
 /// The error a generated `new` constructor returns when a fallible construction
 /// step fails after it has already consumed the caller's owned/strong/embedded
@@ -204,7 +205,7 @@ pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u
 /// happens to hold.
 pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocator>(
     allocator: &'w A,
-    field_off: u64,
+    field_off: NonNullOffset,
     new_weak: BStackWeak<'w, T, A>,
 ) -> Result<(), ReplaceError<BStackWeak<'w, T, A>>> {
     // Serialize against a concurrent `upgrade_weak_field` on the same field: the
@@ -223,7 +224,7 @@ pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocato
     // field's.
     let ctrl = new_weak.into_raw();
     let ctrl_off = ctrl.into_range().start();
-    let old_bytes = match stack.swap(field_off, ctrl_off.to_le_bytes()) {
+    let old_bytes = match stack.swap(field_off.as_u64(), ctrl_off.to_le_bytes()) {
         Ok(b) => b,
         Err(e) => {
             // Commit failed: the field still points at the old target, and
@@ -281,7 +282,7 @@ pub(crate) unsafe fn set_weak_field<'w, T: BStackWeakable, A: BStackRaiiAllocato
 /// a wrong offset manufactures an owning `BStackRc` from arbitrary bytes.
 pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllocator>(
     allocator: &'a A,
-    field_off: u64,
+    field_off: NonNullOffset,
 ) -> io::Result<Option<BStackRc<'a, T, A>>> {
     // Hold the per-file lock across the read of the control offset and the pin
     // (`increment_if_nonzero`), so a concurrent `set_weak_field` can't free the old
@@ -289,7 +290,7 @@ pub(crate) unsafe fn upgrade_weak_field<'a, T: BStackWeakable, A: BStackRaiiAllo
     // owned here, so nothing else keeps that block alive.
     let lock = crate::io_core::wal::wal_lock_for(allocator);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let off = read_u64_at(allocator.stack(), field_off)?;
+    let off = read_u64_at(allocator.stack(), field_off.as_u64())?;
     if off == 0 {
         return Ok(None);
     }

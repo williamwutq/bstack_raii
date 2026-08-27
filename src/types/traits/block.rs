@@ -14,10 +14,10 @@ use std::io;
 use bstack::BStackRange;
 use bytemuck::Pod;
 
+use super::reference::BStackRef;
 use crate::BStackRaiiAllocator;
 use crate::clone::ClonePlan;
-use crate::primitives::EightCC;
-use super::reference::BStackRef;
+use crate::primitives::{EightCC, NonNullOffset};
 
 /// The downcast discriminant. The returned [`EightCC`] must match the tag in a
 /// block's [`crate::BlockHeader`] for a safe downcast to succeed.
@@ -53,7 +53,8 @@ pub trait BStackBlock: BStackCast + Sized {
     /// holding or duplicating one can never free anything. Ownership (and the
     /// obligation to free exactly once) lives only in the affine wrappers
     /// [`BStackOwned`](crate::BStackOwned) / [`crate::BStackRc`] / the
-    /// `handle::*Ref` teardown tokens, none of which are `Copy`.
+    /// `*Ref` teardown tokens (`OwnedRef`, `StrongRef`, `StrongWeakRef`,
+    /// `WeakRef`), none of which are `Copy`.
     ///
     /// # Safety
     /// The caller asserts `range` refers to a validly allocated block of type `T`
@@ -77,8 +78,8 @@ pub trait BStackBlock: BStackCast + Sized {
     /// so a generic parent can recurse into a type parameter. `#[doc(hidden)]`.
     #[doc(hidden)]
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let _ = (range, allocator);
         Ok(())
@@ -130,7 +131,10 @@ pub trait BStackBlock: BStackCast + Sized {
     /// `offset` names a live `Self` block, in the file `alloc` addresses, exclusively
     /// owned by this foreign pointer (freed exactly once).
     #[doc(hidden)]
-    unsafe fn foreign_drop<A: BStackRaiiAllocator>(alloc: &A, offset: u64) -> io::Result<()> {
+    unsafe fn foreign_drop<A: BStackRaiiAllocator>(
+        alloc: &A,
+        offset: NonNullOffset,
+    ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::foreign::foreign_drop_owned::<Self, A>(alloc, offset) }
     }
@@ -143,7 +147,10 @@ pub trait BStackBlock: BStackCast + Sized {
     /// `offset` names a live `Self` block, in the file `alloc` addresses, owned by
     /// this foreign pointer.
     #[doc(hidden)]
-    unsafe fn foreign_clone<A: BStackRaiiAllocator>(alloc: &A, offset: u64) -> io::Result<u64>
+    unsafe fn foreign_clone<A: BStackRaiiAllocator>(
+        alloc: &A,
+        offset: NonNullOffset,
+    ) -> io::Result<u64>
     where
         Self: crate::clone::TryCloneIn,
     {

@@ -35,22 +35,22 @@ use std::io;
 use bstack::{BStack, BStackAllocator, BStackRange, BStackSlice};
 
 use crate::BStackRaiiAllocator;
-use crate::types::traits::block::BStackBlock;
-use crate::types::traits::rc::{BStackShared, BStackWeakable};
 use crate::clone::TryCloneIn;
-use crate::handle::{OwnedRef, WeakRef};
-use crate::layout;
-use crate::types::compiled::owned::BStackOwned;
-use crate::primitives::{BrandedWidePtr, Offset, WidePtr};
 use crate::io_core::refcount;
-use crate::types::traits::reference::BStackRef;
+use crate::layout;
+use crate::primitives::{BrandedWidePtr, NonNullOffset, Offset, WidePtr};
 #[cfg(test)]
 use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
+use crate::types::compiled::owned::{BStackOwned, OwnedRef};
+use crate::types::compiled::rc::WeakRef;
 use crate::types::compiled::rc::{
     BStackRc, BStackWeak, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
+use crate::types::traits::block::BStackBlock;
 use crate::types::traits::drop::BStackDrop;
+use crate::types::traits::rc::{BStackShared, BStackWeakable};
+use crate::types::traits::reference::BStackRef;
 
 /// A typed cross-file pointer to a `T`. Either **explicit** (resolved through the
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or
@@ -343,11 +343,16 @@ macro_rules! foreign_dispatch_drop {
             Ok(())
         } else if repr.file_id() == 0 {
             // `SELF` ⇒ the home file.
-            unsafe { $drop($home, off) }
+            unsafe { $drop($home, $crate::primitives::NonNullOffset::from_field(off)?) }
         } else if let Some(id) = FileId::from_u64(repr.file_id()) {
             if let Some(host) = registry::host_arc(id) {
                 let adapter = registry::ForeignHostAllocator::new(host, id);
-                unsafe { $drop(&adapter, off) }
+                unsafe {
+                    $drop(
+                        &adapter,
+                        $crate::primitives::NonNullOffset::from_field(off)?,
+                    )
+                }
             } else {
                 Ok(()) // target file detached ⇒ leak (permitted)
             }
@@ -563,9 +568,9 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
 /// by this foreign pointer (freed exactly once).
 pub(crate) unsafe fn foreign_drop_owned<T: BStackBlock, A: BStackRaiiAllocator>(
     alloc: &A,
-    offset: u64,
+    offset: NonNullOffset,
 ) -> io::Result<()> {
-    let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
+    let range = BStackRange::new(offset.as_u64(), core::mem::size_of::<T::OnDisk>() as u64);
     // SAFETY: `range` is the caller-asserted live block of `T`.
     let child = unsafe { BStackRef::<T>::from_range(range) };
     // SAFETY: the caller (an owning foreign slot's teardown) owns `child`.
@@ -581,9 +586,9 @@ pub(crate) unsafe fn foreign_drop_owned<T: BStackBlock, A: BStackRaiiAllocator>(
 /// one strong reference on behalf of this foreign pointer.
 pub(crate) unsafe fn foreign_drop_strong<T: BStackShared, A: BStackRaiiAllocator>(
     alloc: &A,
-    offset: u64,
+    offset: NonNullOffset,
 ) -> io::Result<()> {
-    let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
+    let range = BStackRange::new(offset.as_u64(), core::mem::size_of::<T::OnDisk>() as u64);
     // SAFETY: `range` is the caller-asserted live data block of a shared `T`.
     let data = unsafe { BStackRef::<T>::from_range(range) };
     <T as BStackShared>::drop_strong_ref(data, alloc)
@@ -599,9 +604,12 @@ pub(crate) unsafe fn foreign_drop_strong<T: BStackShared, A: BStackRaiiAllocator
 /// holding one weak reference on behalf of this foreign pointer.
 pub(crate) unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     alloc: &A,
-    ctrl_offset: u64,
+    ctrl_offset: NonNullOffset,
 ) -> io::Result<()> {
-    let range = BStackRange::new(ctrl_offset, core::mem::size_of::<T::Control>() as u64);
+    let range = BStackRange::new(
+        ctrl_offset.as_u64(),
+        core::mem::size_of::<T::Control>() as u64,
+    );
     // SAFETY: `range` is the caller-asserted live control block of a weakable `T`.
     let ctrl = unsafe { BStackRef::<T::Control>::from_range(range) };
     // SAFETY: the weak foreign slot being torn down held this weak count.
@@ -637,9 +645,9 @@ pub(crate) unsafe fn foreign_drop_weak<T: BStackWeakable, A: BStackRaiiAllocator
 /// foreign pointer.
 pub(crate) unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackRaiiAllocator>(
     alloc: &A,
-    offset: u64,
+    offset: NonNullOffset,
 ) -> io::Result<u64> {
-    let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
+    let range = BStackRange::new(offset.as_u64(), core::mem::size_of::<T::OnDisk>() as u64);
     let src = unsafe { T::from_range(range) };
     let new = src.try_clone_in(alloc)?;
     Ok(new.handle().range().start())
@@ -653,9 +661,9 @@ pub(crate) unsafe fn foreign_clone_owned<T: TryCloneIn + BStackBlock, A: BStackR
 /// `offset` names a live shared `T` data block in the file `alloc` addresses.
 pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocator>(
     alloc: &A,
-    offset: u64,
+    offset: NonNullOffset,
 ) -> io::Result<()> {
-    let range = BStackRange::new(offset, core::mem::size_of::<T::OnDisk>() as u64);
+    let range = BStackRange::new(offset.as_u64(), core::mem::size_of::<T::OnDisk>() as u64);
     // SAFETY: `range` is the caller-asserted live data block of a shared `T`.
     let data = unsafe { BStackRef::<T>::from_range(range) };
     let (data_ref, ctrl) = <T as BStackShared>::strong_parts(data, alloc)?;
@@ -663,7 +671,7 @@ pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocato
         None => layout::checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
         Some(c) => layout::checked_off(c.start(), CTRL_STRONG_OFFSET)?,
     };
-    refcount::fetch_add(alloc.stack(), off, 1)?;
+    refcount::fetch_add(alloc.stack(), NonNullOffset::from_field(off)?, 1)?;
     Ok(())
 }
 
@@ -679,12 +687,8 @@ pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocato
 #[allow(clippy::extra_unused_type_parameters)]
 pub(crate) unsafe fn foreign_clone_weak<T: BStackWeakable, A: BStackRaiiAllocator>(
     alloc: &A,
-    ctrl_offset: u64,
+    ctrl_offset: NonNullOffset,
 ) -> io::Result<()> {
-    refcount::fetch_add(
-        alloc.stack(),
-        layout::checked_off(ctrl_offset, CTRL_WEAK_OFFSET)?,
-        1,
-    )?;
+    refcount::fetch_add(alloc.stack(), ctrl_offset.checked_add(CTRL_WEAK_OFFSET)?, 1)?;
     Ok(())
 }

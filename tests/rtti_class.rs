@@ -8,10 +8,10 @@
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::registry;
-use bstack_raii::rtti::{self, AnyRef, OwnershipKind, ForeignPtr, Moved, RttiBody, Shape, Value};
+use bstack_raii::rtti::{self, AnyRef, ForeignPtr, Moved, OwnershipKind, RttiBody, Shape, Value};
 use bstack_raii::{
-    BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, WidePtr,
-    TryClone, bstack_class, rtti_path,
+    BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, TryClone, WidePtr,
+    bstack_class, rtti_path,
 };
 
 #[bstack_class]

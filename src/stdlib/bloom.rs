@@ -43,13 +43,13 @@ use bytemuck::{Pod, Zeroable};
 
 use super::hash::double_hash;
 use super::util::{alloc_image, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::io_core::teardown::dealloc_range;
+use crate::primitives::EightCC;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::block::{BStackBlock, BStackCast};
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackCountingBloomFilter`]: header, counter-array
 /// pointer (`0` = none), counter count `m`, hash count `k`, and inserted-item
@@ -372,8 +372,8 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
 
     /// Free the counter block, **without** freeing the handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let [data, m] = read_fields::<2>(allocator.stack(), range.start() + DATA_OFF)?;
         if data != 0 {

@@ -67,20 +67,16 @@ use bstack::{BStack, BStackRange};
 use linkme::distributed_slice;
 
 use crate::BStackRaiiAllocator;
-use crate::types::traits::block::{BStackBlock, BStackCast};
-use crate::primitives::{EightCC, WidePtr};
-use crate::types::compiled::rc::{
-    CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET,
-    RC_REFCOUNT_OFFSET,
-};
-use crate::util::bytes::{get_u64, read_u64_at};
 use crate::io_core::refcount;
+use crate::io_core::wal::WalTxn;
+use crate::primitives::{EightCC, NonNullOffset, WidePtr};
 use crate::registry::{self, FileId, ForeignHostAllocator};
-use crate::util::small_map::SmallStringMap;
-use crate::io_core::wal::{
-    HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
-    wal_capacity_of, wal_set_idle,
+use crate::types::compiled::rc::{
+    CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
+use crate::types::traits::block::{BStackBlock, BStackCast};
+use crate::util::bytes::{get_u64, read_u64_at};
+use crate::util::small_map::SmallStringMap;
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
 /// `linkme` without the downstream crate depending on it directly. The generated
@@ -1355,21 +1351,7 @@ struct CloneState {
     /// used, so a **crash** mid-clone is reclaimed by [`wal::finish`](crate::io_core::wal::finish)
     /// on the next open (the in-process error path already frees `allocated`). `None`
     /// when the allocator opts out of reclamation or nothing has been allocated yet.
-    wal: Option<CloneWal>,
-}
-
-/// The in-flight intention-first WAL transaction of a `clone_value` walk — the file's
-/// WAL lock held for the descent, plus the persistent block's offset, entry-slot
-/// capacity, and how many entries have been published. Mirrors `clone::CloneWal`.
-struct CloneWal {
-    /// Holds the file's WAL lock until the clone completes / errors.
-    _held: HeldLock,
-    /// Offset of the persistent WAL block (moves if a grow reallocates it).
-    block_off: u64,
-    /// Entry slots the block currently has.
-    capacity: u64,
-    /// Entries published so far (== `CloneState::allocated.len()`).
-    logged: u64,
+    wal: Option<WalTxn>,
 }
 
 /// Bytes of a `VecDesc` (`data_off:u64` @0, `data_size:u64` @8) — the inline
@@ -1988,7 +1970,7 @@ impl RttiRegistry {
         // rather than leaking permanently.
         // SAFETY: every range in `to_free` was collected by the walk from
         // owned slots of the structure being torn down, in this file.
-        unsafe { crate::io_core::teardown::commit_home_frees(alloc, to_free) }
+        unsafe { crate::io_core::wal::commit_home_frees(alloc, to_free) }
     }
 
     /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown)):
@@ -2006,16 +1988,31 @@ impl RttiRegistry {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         if self.load_type(ord)?.weak {
             let ctrl_off = read_u64_at(data, add_off(data_off, CTRL_BACKPTR_OFFSET)?)?;
-            if refcount::fetch_sub(data, add_off(ctrl_off, CTRL_STRONG_OFFSET)?, 1)? == 1 {
+            if refcount::fetch_sub(
+                data,
+                NonNullOffset::from_field(add_off(ctrl_off, CTRL_STRONG_OFFSET)?)?,
+                1,
+            )? == 1
+            {
                 // SAFETY: this caller was the last strong owner (the fetch_sub hit
                 // zero), and `data_off` came from the owning slot being released.
                 unsafe { self.teardown(alloc, ord, data_off)? };
-                if refcount::fetch_sub(data, add_off(ctrl_off, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+                if refcount::fetch_sub(
+                    data,
+                    NonNullOffset::from_field(add_off(ctrl_off, CTRL_WEAK_OFFSET)?)?,
+                    1,
+                )? == 1
+                {
                     // SAFETY: last weak released — the control block is unreferenced.
                     unsafe { alloc.free_many([BStackRange::new(ctrl_off, CONTROL_SIZE)])? };
                 }
             }
-        } else if refcount::fetch_sub(data, add_off(data_off, RC_REFCOUNT_OFFSET)?, 1)? == 1 {
+        } else if refcount::fetch_sub(
+            data,
+            NonNullOffset::from_field(add_off(data_off, RC_REFCOUNT_OFFSET)?)?,
+            1,
+        )? == 1
+        {
             // SAFETY: as above — sole owner, slot-derived offset.
             unsafe { self.teardown(alloc, ord, data_off)? };
         }
@@ -2076,15 +2073,30 @@ impl RttiRegistry {
             OwnershipKind::Strong => {
                 if self.load_type(ord)?.weak {
                     let ctrl = read_u64_at(data, add_off(offset, CTRL_BACKPTR_OFFSET)?)?;
-                    if refcount::fetch_sub(data, add_off(ctrl, CTRL_STRONG_OFFSET)?, 1)? == 1 {
+                    if refcount::fetch_sub(
+                        data,
+                        NonNullOffset::from_field(add_off(ctrl, CTRL_STRONG_OFFSET)?)?,
+                        1,
+                    )? == 1
+                    {
                         // SAFETY: last strong owner; slot-derived offset.
                         unsafe { self.teardown(target, ord, offset)? };
-                        if refcount::fetch_sub(data, add_off(ctrl, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+                        if refcount::fetch_sub(
+                            data,
+                            NonNullOffset::from_field(add_off(ctrl, CTRL_WEAK_OFFSET)?)?,
+                            1,
+                        )? == 1
+                        {
                             // SAFETY: last weak released — control block unreferenced.
                             unsafe { target.free_many([BStackRange::new(ctrl, CONTROL_SIZE)])? };
                         }
                     }
-                } else if refcount::fetch_sub(data, add_off(offset, RC_REFCOUNT_OFFSET)?, 1)? == 1 {
+                } else if refcount::fetch_sub(
+                    data,
+                    NonNullOffset::from_field(add_off(offset, RC_REFCOUNT_OFFSET)?)?,
+                    1,
+                )? == 1
+                {
                     // SAFETY: last strong owner; slot-derived offset.
                     unsafe { self.teardown(target, ord, offset)? };
                 }
@@ -2092,7 +2104,12 @@ impl RttiRegistry {
             }
             OwnershipKind::Weak => {
                 // A weak foreign's offset is the control offset.
-                if refcount::fetch_sub(data, add_off(offset, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+                if refcount::fetch_sub(
+                    data,
+                    NonNullOffset::from_field(add_off(offset, CTRL_WEAK_OFFSET)?)?,
+                    1,
+                )? == 1
+                {
                     // SAFETY: last weak released — control block unreferenced.
                     unsafe { target.free_many([BStackRange::new(offset, CONTROL_SIZE)])? };
                 }
@@ -2174,11 +2191,15 @@ impl RttiRegistry {
                 } else {
                     add_off(src_target, RC_REFCOUNT_OFFSET)?
                 };
-                refcount::fetch_add(tstack, off, 1)?;
+                refcount::fetch_add(tstack, NonNullOffset::from_field(off)?, 1)?;
                 Ok(())
             }
             OwnershipKind::Weak => {
-                refcount::fetch_add(tstack, add_off(src_target, CTRL_WEAK_OFFSET)?, 1)?;
+                refcount::fetch_add(
+                    tstack,
+                    NonNullOffset::from_field(add_off(src_target, CTRL_WEAK_OFFSET)?)?,
+                    1,
+                )?;
                 Ok(())
             }
         }
@@ -2631,7 +2652,7 @@ impl RttiRegistry {
                 // ownership by CAS `strong: 1 -> 0`, so a concurrent clone/upgrade
                 // either beats the move (the CAS fails cleanly) or is refused by
                 // the zero count for the whole field walk — never both succeeding.
-                if !refcount::cas(data, strong_slot, 1, 0)? {
+                if !refcount::cas(data, NonNullOffset::from_field(strong_slot)?, 1, 0)? {
                     let strong = read_u64_at(data, strong_slot)?;
                     return Err(corrupt(format!(
                         "[BSTACK0819] RTTI move_out of a shared reference-counted block \
@@ -2657,7 +2678,9 @@ impl RttiRegistry {
                 // Object untouched; only orphaned embed copies (if any) are reclaimed.
                 // Restore the strong count the CAS took, so the still-intact object
                 // keeps its sole owner.
-                if let Some(slot) = strong_slot {
+                if let Some(slot) = strong_slot
+                    && let Ok(slot) = NonNullOffset::from_field(slot)
+                {
                     let _ = refcount::fetch_add(data, slot, 1);
                 }
                 // SAFETY: `materialized` are this call's own embed copies.
@@ -2673,7 +2696,11 @@ impl RttiRegistry {
         // strong == 0 refusing any upgrade).
         let mut to_free = vec![BStackRange::new(block_off, cache[&ordinal].ondisk_size)];
         if let Some(ctrl_off) = ctrl_off
-            && refcount::fetch_sub(data, add_off(ctrl_off, CTRL_WEAK_OFFSET)?, 1)? == 1
+            && refcount::fetch_sub(
+                data,
+                NonNullOffset::from_field(add_off(ctrl_off, CTRL_WEAK_OFFSET)?)?,
+                1,
+            )? == 1
         {
             to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
         }
@@ -2684,7 +2711,7 @@ impl RttiRegistry {
         // SAFETY: the shell is the caller-owned root (its fields already moved out);
         // the control block, if included, has no remaining references; both live in
         // this file.
-        if let Err(e) = unsafe { crate::io_core::teardown::commit_home_frees(alloc, to_free) } {
+        if let Err(e) = unsafe { crate::io_core::wal::commit_home_frees(alloc, to_free) } {
             // SAFETY: `materialized` are this call's own embed copies.
             let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
             return Err(e);
@@ -2843,8 +2870,10 @@ impl RttiRegistry {
                     // in the shell; hand every cross-file pointer back to the caller.
                     let mut list = Vec::new(); // no capacity hint: `n` is untrusted
                     for i in 0..*n as u64 {
-                        let __wp =
-                            WidePtr::read_from_stack(data, add_off(off, mul_off(i, FOREIGN_REPR_LEN)?)?)?;
+                        let __wp = WidePtr::read_from_stack(
+                            data,
+                            add_off(off, mul_off(i, FOREIGN_REPR_LEN)?)?,
+                        )?;
                         let (file_id, offset) = (__wp.file_id(), __wp.offset().get());
                         list.push(ForeignPtr {
                             tag,
@@ -2987,7 +3016,7 @@ impl RttiRegistry {
                 // are real"). A crash before this leaves them `Pending` and reclaimable
                 // — correct, since `clone_value` has not returned the tree yet.
                 if let Some(w) = st.wal.as_ref() {
-                    wal_set_idle(alloc, w.block_off)?;
+                    w.set_idle(alloc)?;
                 }
                 Ok(new_root)
             }
@@ -2996,8 +3025,8 @@ impl RttiRegistry {
                 // transaction in flight, abandon it — `finish_at_locked` frees exactly
                 // the still-`Pending` `Alloc`s (== `st.allocated`) and marks the block
                 // idle, the same path a crash takes. Otherwise free the ranges directly.
-                if st.wal.is_some() {
-                    let _ = finish_at_locked(alloc);
+                if let Some(w) = &st.wal {
+                    let _ = w.finish(alloc);
                 } else {
                     // SAFETY: `st.allocated` are this clone's own partial allocations.
                     let _ = unsafe { alloc.free_many(std::mem::take(&mut st.allocated)) };
@@ -3290,7 +3319,7 @@ impl RttiRegistry {
         }
         // Then bump every shared target's refcount (over-count-safe, never under).
         for &off in &st.bumps {
-            refcount::fetch_add(data, off, 1)?;
+            refcount::fetch_add(data, NonNullOffset::from_field(off)?, 1)?;
         }
 
         st.map
@@ -3337,37 +3366,14 @@ impl RttiRegistry {
         range: BStackRange,
     ) -> io::Result<()> {
         match &mut st.wal {
+            // First allocation: begin the transaction (taking the file's WAL lock).
             None => {
-                let held = HeldLock::acquire(alloc)?;
-                let mut log = WalLog::with_capacity(1);
-                log.append(WalEntry::alloc(WalStatus::Pending, range));
-                let block = persist_at(alloc, &log, WalStatus::Pending)?;
-                st.wal = Some(CloneWal {
-                    _held: held,
-                    block_off: block.start(),
-                    capacity: wal_capacity_of(block),
-                    logged: 1,
-                });
+                st.wal = Some(WalTxn::begin(alloc, range)?);
                 Ok(())
             }
-            Some(w) if w.logged < w.capacity => {
-                wal_append_alloc(alloc, w.block_off, w.logged, range)?;
-                w.logged += 1;
-                Ok(())
-            }
-            Some(_) => {
-                let mut log = WalLog::with_capacity(st.allocated.len() + 1);
-                for &r in &st.allocated {
-                    log.append(WalEntry::alloc(WalStatus::Pending, r));
-                }
-                log.append(WalEntry::alloc(WalStatus::Pending, range));
-                let block = persist_at(alloc, &log, WalStatus::Pending)?;
-                let w = st.wal.as_mut().unwrap();
-                w.block_off = block.start();
-                w.capacity = wal_capacity_of(block);
-                w.logged = st.allocated.len() as u64 + 1;
-                Ok(())
-            }
+            // `st.allocated` is exactly what is already logged (the caller pushes
+            // `range` only after this succeeds) — the grow-path re-log set.
+            Some(w) => w.append(alloc, &st.allocated, range),
         }
     }
 
@@ -3685,7 +3691,12 @@ fn clone_unsupported() -> io::Error {
 /// control block's weak count and free the control block if this was the last handle.
 fn commit_weak_release<A: BStackRaiiAllocator>(alloc: &A, ctrl_off: u64) -> io::Result<()> {
     let data = alloc.stack();
-    if refcount::fetch_sub(data, add_off(ctrl_off, CTRL_WEAK_OFFSET)?, 1)? == 1 {
+    if refcount::fetch_sub(
+        data,
+        NonNullOffset::from_field(add_off(ctrl_off, CTRL_WEAK_OFFSET)?)?,
+        1,
+    )? == 1
+    {
         // SAFETY: last weak released — the control block is unreferenced.
         unsafe { alloc.free_many([BStackRange::new(ctrl_off, CONTROL_SIZE)])? };
     }

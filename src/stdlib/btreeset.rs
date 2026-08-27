@@ -29,15 +29,15 @@ use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::util::{Scratch, alloc_image, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::util::bytes::get_u64;
+use crate::io_core::teardown::dealloc_range;
 use crate::primitives::EightCC;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::types::compiled::owned::BStackOwned;
-use crate::io_core::teardown::{dealloc_range};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::drop::BStackDrop;
+use crate::util::bytes::get_u64;
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackBTreeSet`]: header, root node pointer (`0` =
 /// empty), key count, and the embedded Bloom filter's handle offset.
@@ -912,8 +912,8 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     /// Recursively free every node and the embedded Bloom filter, **without**
     /// freeing the handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let handle = range.start();
         let [root, _len, bloom_off] = read_fields::<3>(allocator.stack(), handle + ROOT_OFF)?;

@@ -13,6 +13,7 @@ use std::io;
 use bstack::{BStackOwnedSliceAllocator, BStackRange};
 
 use crate::io_core::wal::STD_WAL_ANCHOR;
+use crate::primitives::NonNullOffset;
 use crate::registry::FileId;
 
 /// The allocator every `bstack_raii` operation is bound on: a
@@ -53,7 +54,7 @@ use crate::registry::FileId;
 ///    open/close. `bstack_raii` stores the current WAL block's offset there
 ///    (`0` = none). Returning `None` asserts nothing beyond (1).
 pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         None
     }
 
@@ -105,10 +106,7 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     /// whose obligation this method carries range-by-range). `BStackRange::new` is a
     /// safe constructor, so nothing gates the argument but this contract; the safe
     /// ways to free remain [`BStackDrop`](crate::BStackDrop) / [`AutoDrop`](crate::AutoDrop).
-    unsafe fn free_many(
-        &self,
-        ranges: impl IntoIterator<Item = BStackRange>,
-    ) -> io::Result<()> {
+    unsafe fn free_many(&self, ranges: impl IntoIterator<Item = BStackRange>) -> io::Result<()> {
         crate::io_core::bulk::seq_free_many(self, ranges)
     }
 
@@ -182,12 +180,12 @@ macro_rules! bulk_raii_methods {
 // offset 0 (≥ 16 bytes) that it never allocates from and never writes to; the
 // `[8, 16)` slot sits inside it and persists across open/close.
 unsafe impl BStackRaiiAllocator for bstack::FirstFitBStackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
     }
 }
 unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
     }
     // GhostTree implements `BStackBulkAllocator` — route the multi-block helpers
@@ -195,12 +193,12 @@ unsafe impl BStackRaiiAllocator for bstack::GhostTreeBstackAllocator {
     bulk_raii_methods!();
 }
 unsafe impl BStackRaiiAllocator for bstack::SlabBStackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
     }
 }
 unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
     }
 }
@@ -212,7 +210,7 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
 unsafe impl BStackRaiiAllocator
     for bstack::DebugCheckingAllocator<bstack::FirstFitBStackAllocator>
 {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
     }
 }

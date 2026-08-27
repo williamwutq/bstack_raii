@@ -22,9 +22,8 @@
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
 //! | `bulk`         | Sequential fallbacks for [`BStackRaiiAllocator::alloc_many`] / [`free_many`](BStackRaiiAllocator::free_many); bulk allocators override those trait methods. |
 //! | [`clone`]      | [`TryClone`] / [`TryCloneIn`]: fallible clone for handles that touch disk. |
-//! | [`handle`]     | Without-allocator inner handles: [`OwnedRef`], [`StrongRef`], [`StrongWeakRef`], [`WeakRef`]. |
-//! | [`owned`]      | [`BStackOwned`]: the without-allocator, uniquely-owned block handle. |
-//! | [`shared`]     | [`BStackRc`] + [`BStackWeak`]: with-allocator shared handles.|
+//! | [`owned`]      | [`BStackOwned`] + the [`OwnedRef`] without-allocator drop core. |
+//! | [`shared`]     | [`BStackRc`] / [`BStackWeak`] + the [`StrongRef`] / [`StrongWeakRef`] / [`WeakRef`] drop cores. |
 //! | `cast`         | Typed ↔ untyped handle conversion — the runtime behind `bstack_cast!`. |
 //! | `vec`          | [`VecDesc`]-backed growable vectors reached through a fixed-size field. |
 //! | [`replace`]    | [`ReplaceError`]: the error a generated `replace_<field>` mutator returns. |
@@ -60,10 +59,9 @@ extern crate self as bstack_raii;
 mod clone;
 mod construct;
 mod foreign;
-mod handle;
+mod io_core;
 mod layout;
 mod primitives;
-mod io_core;
 /// Cross-file `Foreign<T>` support: the process-wide path↔id file registry.
 mod replace;
 /// Runtime Type Information: a persisted, self-describing schema stack for
@@ -76,40 +74,29 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-pub use types::traits::block::{BStackBlock, BStackCast};
-pub use types::traits::r#move::{BStackMove, BStackMoveExpr};
-pub use types::traits::rc::{BStackShared, BStackWeakable};
-pub use io_core::bulk::FreeManyError;
-pub use types::traits::cast::CastError;
-pub use types::traits::cast::{BStackCastAs, BStackCastInto};
 /// Codegen plumbing, re-exported for `#[bstack_block]`-generated code only. It is
 /// named in [`BStackBlock`]'s (hidden) trait-method signatures, so the type must
 /// stay `pub`; the supported way to clone is [`TryClone`] / [`TryCloneIn`].
 #[doc(hidden)]
 pub use clone::ClonePlan;
 pub use clone::TryCloneIn;
-pub use primitives::TryClone;
 pub use construct::ConstructError;
 pub use foreign::{Foreign, ForeignOwned, ForeignRc, ForeignWeak};
+pub use io_core::bulk::FreeManyError;
 /// The inert on-disk **wire** form of a [`Foreign`] pointer — the composed
 /// [wide pointer](crate::primitives). Not part of the public API — generated
 /// `#[bstack_block]` code names it through `::bstack_raii::WidePtr`; user code should
 /// never use it directly.
 #[doc(hidden)]
 pub use io_core::registry;
-pub use primitives::WidePtr;
-pub use types::alloc::BStackRaiiAllocator;
-pub use util::handback::HandBack;
-pub use handle::{OwnedRef, StrongRef, StrongWeakRef, WeakRef};
-pub use types::compiled::block::BlockHeader;
-pub use util::bytes::get_u64;
-pub use primitives::EightCC;
-pub use types::compiled::owned::BStackOwned;
-pub use types::traits::reference::BStackRef;
 pub use io_core::registry::ForeignHostAllocator;
+pub use io_core::teardown::{dealloc_range, wal_teardown};
+pub use io_core::wal::{STD_WAL_ANCHOR, finish};
+pub use primitives::EightCC;
+pub use primitives::TryClone;
+pub use primitives::WidePtr;
+pub use primitives::{NonNullOffset, Offset};
 pub use replace::ReplaceError;
-pub use types::compiled::rc::{BStackRc, BStackWeak};
-pub use util::small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
     BStackCow, BStackDeque, BStackHashMap, BStackHashSet, BStackLinkedList, BStackString,
@@ -117,12 +104,25 @@ pub use stdlib::{
     HashSetIter, HashSetOnDisk, HeapOnDisk, ListIter, ListOnDisk, MapOnDisk, NodeOnDisk,
     StringOnDisk, TreeOnDisk, TreeSetOnDisk,
 };
-pub use io_core::teardown::{dealloc_range, wal_teardown};
-pub use types::traits::drop::{AutoDrop, BStackDrop};
+pub use types::alloc::BStackRaiiAllocator;
+pub use types::compiled::block::BlockHeader;
+pub use types::compiled::owned::BStackOwned;
+pub use types::compiled::owned::OwnedRef;
+pub use types::compiled::rc::{BStackRc, BStackWeak};
+pub use types::compiled::rc::{StrongRef, StrongWeakRef, WeakRef};
 pub use types::compiled::vec::{
     BStackBlockVec, BStackRefVec, BStackStrongVec, BStackVec, BStackWeakVec, VecDesc,
 };
-pub use io_core::wal::{STD_WAL_ANCHOR, finish};
+pub use types::traits::block::{BStackBlock, BStackCast};
+pub use types::traits::cast::CastError;
+pub use types::traits::cast::{BStackCastAs, BStackCastInto};
+pub use types::traits::drop::{AutoDrop, BStackDrop};
+pub use types::traits::r#move::{BStackMove, BStackMoveExpr};
+pub use types::traits::rc::{BStackShared, BStackWeakable};
+pub use types::traits::reference::BStackRef;
+pub use util::bytes::get_u64;
+pub use util::handback::HandBack;
+pub use util::small_map::{Entry, OccupiedEntry, SmallStringMap, VacantEntry};
 
 // Re-exports for use by `#[bstack_block]`-generated code (and callers), so that
 // generated code can name everything through `::bstack_raii::…` and downstream
@@ -145,13 +145,11 @@ pub mod __private {
     // Only `#[bstack_block]`/`#[bstack_enum]`-generated code (and the stdlib) implement
     // it; no downstream code names it, so it lives here rather than in the prelude — the
     // `on_unimplemented` message fires regardless of visibility.
-    pub use crate::types::traits::embed::BStackEmbeddable;
     /// Control-block image builder for `(rc, weak)` lowerings — plumbing kept out of
     /// the prelude. (The `#[bstack_weak]` field operations and the cross-file
     /// teardown / clone helpers are now methods on the capability traits
     /// [`BStackBlock`] / [`BStackShared`] / [`BStackWeakable`].)
     pub use crate::construct::build_control_payload;
-    pub use crate::registry::{home_relative_repr, resolve_self_repr};
     /// Add a compile-time field-offset constant to a block's base offset,
     /// rejecting overflow. Generated accessors call this instead of a bare
     /// `+`: the base (`self.0.start()` or similar) can originate from an
@@ -159,10 +157,12 @@ pub mod __private {
     /// either panic under `overflow-checks` or silently wrap to an unrelated
     /// in-bounds offset that the accessor would then read or write.
     pub use crate::layout::checked_off as checked_field_offset;
+    pub use crate::registry::{home_relative_repr, resolve_self_repr};
     /// Narrow a layout quantity to the `u32` the RTTI wire format uses,
     /// panicking with a clear diagnostic on overflow rather than silently
     /// wrapping. Called from `#[bstack_class]`-generated schema builders.
     pub use crate::rtti::rtti_narrow_u32;
+    pub use crate::types::traits::embed::BStackEmbeddable;
 }
 
 /// `compile_fail` residual for the **trait-bound** illegal inputs — where the error

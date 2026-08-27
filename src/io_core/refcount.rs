@@ -18,6 +18,7 @@ use std::io;
 
 use bstack::BStack;
 
+use crate::primitives::NonNullOffset;
 use crate::util::bytes::get_u64;
 use crate::util::io_errorfn;
 
@@ -33,22 +34,23 @@ io_errorfn!(corrupt_offset_err, InvalidData, "refcount offset overflow");
 /// equals `expected`. Returns whether the swap happened. The atomic "try-unwrap"
 /// primitive behind [`crate::BStackRc::try_move`].
 #[inline(always)]
-pub fn cas(stack: &BStack, offset: u64, expected: u64, new: u64) -> io::Result<bool> {
-    stack.cas(offset, expected.to_le_bytes(), new.to_le_bytes())
+pub fn cas(stack: &BStack, offset: NonNullOffset, expected: u64, new: u64) -> io::Result<bool> {
+    stack.cas(offset.as_u64(), expected.to_le_bytes(), new.to_le_bytes())
 }
 
 /// Load the current value of the counter at `offset` (little-endian). Read-only,
 /// so it takes only `get_into` (no lock upgrade, no write-back).
 #[inline(always)]
-pub fn load(stack: &BStack, offset: u64) -> io::Result<u64> {
+pub fn load(stack: &BStack, offset: NonNullOffset) -> io::Result<u64> {
     let mut bytes = [0u8; 8];
-    stack.get_into(offset, &mut bytes)?;
+    stack.get_into(offset.as_u64(), &mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
 /// Atomically add `delta`, returning the previous value. Errors on overflow
 /// rather than wrapping (leaving the counter unchanged in that case).
-pub fn fetch_add(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
+pub fn fetch_add(stack: &BStack, offset: NonNullOffset, delta: u64) -> io::Result<u64> {
+    let offset = offset.as_u64();
     let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut prev = 0u64;
     let mut overflow = false;
@@ -68,7 +70,8 @@ pub fn fetch_add(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
 
 /// Atomically subtract `delta`, returning the previous value. Errors on
 /// underflow rather than wrapping (leaving the counter unchanged in that case).
-pub fn fetch_sub(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
+pub fn fetch_sub(stack: &BStack, offset: NonNullOffset, delta: u64) -> io::Result<u64> {
+    let offset = offset.as_u64();
     let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut prev = 0u64;
     let mut underflow = false;
@@ -96,10 +99,11 @@ pub fn fetch_sub(stack: &BStack, offset: u64, delta: u64) -> io::Result<u64> {
 /// so that observation is authoritative. When the fast path sees non-zero, the
 /// `process` closure re-checks under the lock — the value may have raced to zero
 /// in between — before committing the increment.
-pub fn increment_if_nonzero(stack: &BStack, offset: u64) -> io::Result<Option<u64>> {
+pub fn increment_if_nonzero(stack: &BStack, offset: NonNullOffset) -> io::Result<Option<u64>> {
     if load(stack, offset)? == 0 {
         return Ok(None);
     }
+    let offset = offset.as_u64();
     let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut result = None;
     let mut overflow = false;

@@ -43,7 +43,7 @@ use std::sync::{Arc, OnceLock};
 use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice};
 use parking_lot::RwLock;
 
-use crate::primitives::WidePtr;
+use crate::primitives::{NonNullOffset, WidePtr};
 use crate::{BStackRaiiAllocator, get_u64};
 
 /// The allocator capability's cross-file projection, defined among the
@@ -141,7 +141,7 @@ impl BStackAllocator for ForeignHostAllocator {
 // upholds it. (2) `wal_anchor` mirrors the host's; `wal_file_id` names the foreign
 // file so its frees are reclaimed there.
 unsafe impl BStackRaiiAllocator for ForeignHostAllocator {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         self.host.wal_anchor()
     }
     fn wal_file_id(&self) -> FileId {
@@ -318,7 +318,9 @@ impl<'h> FileRegistry<'h> {
         let stack_key = core::ptr::from_ref(host.stack()) as usize;
         let mut g = self.inner.write();
         // `register_path` returns a concrete, 1-based id, so it always has a table slot.
-        let idx = id.table_index().expect("register_path returns a concrete 1-based id");
+        let idx = id
+            .table_index()
+            .expect("register_path returns a concrete 1-based id");
         // One host may be live under only one id: attaching the same host under a
         // second path would alias it (`live[]` holding it twice while `by_stack`
         // can name only one id), leaving the reverse map inconsistent with the

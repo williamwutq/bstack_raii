@@ -51,18 +51,16 @@ use std::io;
 use bstack::{BStackGenOp, BStackRange};
 
 use crate::BStackRaiiAllocator;
+use crate::io_core::teardown::dealloc_range;
+use crate::io_core::wal::{WalStatus, WalTxn};
+use crate::layout;
+use crate::primitives::Offset;
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
+use crate::types::compiled::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::types::traits::block::BStackBlock;
 use crate::types::traits::rc::BStackShared;
-use crate::layout;
-use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
-use crate::types::compiled::owned::BStackOwned;
 use crate::types::traits::reference::BStackRef;
-use crate::io_core::teardown::dealloc_range;
-use crate::types::compiled::vec::{BYTEVEC_HEADER, VecDesc};
-use crate::io_core::wal::{
-    HeldLock, WalEntry, WalLog, WalStatus, finish_at_locked, persist_at, wal_append_alloc,
-    wal_capacity_of, wal_set_idle,
-};
 
 /// Deep-clone a whole block into a fresh, independent [`BStackOwned`] copy,
 /// allocating the copy with the supplied allocator.
@@ -119,7 +117,7 @@ pub struct ClonePlan {
     /// through commit; its logged `Pending` `Alloc` entries are *exactly*
     /// [`allocated`](Self::allocated), so [`finish`](crate::io_core::wal::finish) reclaims
     /// precisely those on abandon.
-    wal: Option<CloneWal>,
+    wal: Option<WalTxn>,
 }
 
 /// How a [`ClonePlan`] turns the descent's allocation requests into real blocks.
@@ -139,17 +137,6 @@ enum Mode {
 /// The in-flight intention-first WAL transaction of a [`ClonePlan`]: the file's
 /// WAL lock held for the descent, plus the persistent block's offset, entry-slot
 /// capacity, and how many entries have been published so far.
-struct CloneWal {
-    /// Holds the file's WAL lock until the plan is committed / rolled back.
-    _held: HeldLock,
-    /// Offset of the persistent WAL block (moves if a grow reallocates it).
-    block_off: u64,
-    /// Entry slots the block currently has.
-    capacity: u64,
-    /// Entries published so far (== `ClonePlan::allocated.len()`).
-    logged: u64,
-}
-
 impl Default for ClonePlan {
     fn default() -> Self {
         Self::new()
@@ -277,41 +264,15 @@ impl ClonePlan {
         range: BStackRange,
     ) -> io::Result<()> {
         match &mut self.wal {
+            // First allocation: begin the transaction (taking the file's WAL lock for
+            // the whole descent) with this one entry.
             None => {
-                // First allocation: take the file's WAL lock for the whole descent
-                // and stage a `Pending` block holding this one entry.
-                let held = HeldLock::acquire(allocator)?;
-                let mut log = WalLog::with_capacity(1);
-                log.append(WalEntry::alloc(WalStatus::Pending, range));
-                let block = persist_at(allocator, &log, WalStatus::Pending)?;
-                self.wal = Some(CloneWal {
-                    _held: held,
-                    block_off: block.start(),
-                    capacity: wal_capacity_of(block),
-                    logged: 1,
-                });
+                self.wal = Some(WalTxn::begin(allocator, range)?);
                 Ok(())
             }
-            Some(w) if w.logged < w.capacity => {
-                // The WAL has capacity to write, so we write
-                wal_append_alloc(allocator, w.block_off, w.logged, range)?;
-                w.logged += 1;
-                Ok(())
-            }
-            Some(w) => {
-                // Block full: re-persist the whole log (all of `allocated` plus this
-                // new entry), which grows the block to the next power of two.
-                let mut log = WalLog::with_capacity(self.allocated.len() + 1);
-                for &r in &self.allocated {
-                    log.append(WalEntry::alloc(WalStatus::Pending, r));
-                }
-                log.append(WalEntry::alloc(WalStatus::Pending, range));
-                let block = persist_at(allocator, &log, WalStatus::Pending)?;
-                w.block_off = block.start();
-                w.capacity = wal_capacity_of(block);
-                w.logged = self.allocated.len() as u64 + 1;
-                Ok(())
-            }
+            // `self.allocated` holds exactly what is already logged (the caller pushes
+            // `range` only after this succeeds), so it is the grow-path re-log set.
+            Some(w) => w.append(allocator, &self.allocated, range),
         }
     }
 
@@ -352,10 +313,13 @@ impl ClonePlan {
         // cap == len: a fresh clone carries no spare capacity. Skip building the
         // image in the measure phase (the write would be discarded anyway).
         if self.mode != Mode::Measure {
-            self.write(range.start(), crate::types::compiled::vec::bytevec_image(len, len, data));
+            self.write(
+                range.start(),
+                crate::types::compiled::vec::bytevec_image(len, len, data),
+            );
         }
         Ok(VecDesc {
-            data_off: range.start(),
+            data_off: Offset::from_raw(range.start()),
             data_size: size,
         })
     }
@@ -457,25 +421,12 @@ impl ClonePlan {
     fn allocate<A: BStackRaiiAllocator>(&mut self, allocator: &A) -> io::Result<()> {
         let ranges = allocator.alloc_many(&self.sizes)?;
         if allocator.wal_anchor().is_some() && !ranges.is_empty() {
-            let held = HeldLock::acquire(allocator)?;
-            let mut log = WalLog::with_capacity(ranges.len());
-            for &r in &ranges {
-                log.append(WalEntry::alloc(WalStatus::Pending, r));
-            }
-            match persist_at(allocator, &log, WalStatus::Pending) {
-                Ok(block) => {
-                    self.wal = Some(CloneWal {
-                        _held: held,
-                        block_off: block.start(),
-                        capacity: wal_capacity_of(block),
-                        logged: ranges.len() as u64,
-                    });
-                }
+            match WalTxn::begin_many(allocator, &ranges) {
+                Ok(txn) => self.wal = Some(txn),
                 Err(e) => {
-                    // Couldn't stage the WAL: free the fresh blocks and abort. Release
-                    // the lock first — `free_many` does no WAL work.
-                    drop(held);
-                    // SAFETY: `ranges` are this plan's own staged allocations.
+                    // Couldn't take the lock / stage the WAL (the lock is already
+                    // released inside `begin_many` on failure): free the fresh blocks
+                    // and abort. SAFETY: `ranges` are this plan's own staged allocations.
                     let _ = unsafe { allocator.free_many(ranges) };
                     return Err(e);
                 }
@@ -495,10 +446,10 @@ impl ClonePlan {
     /// persistent block idle), the same path a real crash takes; the WAL lock is held
     /// by `self` and released as it drops. Without a WAL the ranges are freed directly.
     pub fn rollback<A: BStackRaiiAllocator>(self, allocator: &A) {
-        if self.wal.is_some() {
+        if let Some(w) = &self.wal {
             // Abandon the still-`Pending` transaction; `self` (and its held WAL lock)
             // drops at the end of this call, after the reclamation has run.
-            let _ = finish_at_locked(allocator);
+            let _ = w.finish(allocator);
         } else {
             Self::free_all(self.allocated, allocator);
         }
@@ -560,7 +511,7 @@ impl ClonePlan {
         // The WAL commit marker (`WalHeader.txn_status`, the byte after the u64
         // magic). Written last, so it lands in the same atomic batch as the clone.
         let flip = [WalStatus::Complete as u8];
-        let flip_off = wal.as_ref().map(|w| w.block_off + 8);
+        let flip_off = wal.as_ref().map(|w| w.commit_marker_off());
         let mut flipped = flip_off.is_none();
 
         let mut read_i = 0usize;
@@ -647,7 +598,7 @@ impl ClonePlan {
                 // reuse (a crash before this is harmlessly finished on the next open,
                 // freeing nothing). The block itself is never freed.
                 if let Some(w) = &wal {
-                    let _ = wal_set_idle(allocator, w.block_off);
+                    let _ = w.set_idle(allocator);
                 }
                 Ok(())
             }
@@ -669,15 +620,15 @@ impl ClonePlan {
     /// is used.
     // NOTE: is this not just rollback?
     fn reclaim<A: BStackRaiiAllocator>(
-        wal: &Option<CloneWal>,
+        wal: &Option<WalTxn>,
         allocated: Vec<BStackRange>,
         allocator: &A,
     ) {
         match wal {
             // A WAL transaction is in flight: abandon it via the allocator's own
             // anchor (same as a real crash's `finish`); it frees the logged allocs.
-            Some(_) => {
-                let _ = finish_at_locked(allocator);
+            Some(w) => {
+                let _ = w.finish(allocator);
             }
             None => Self::free_all(allocated, allocator),
         }

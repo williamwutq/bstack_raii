@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::io;
 
 use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, BStackRange};
-use bstack_raii::{BStackRaiiAllocator, STD_WAL_ANCHOR};
+use bstack_raii::{BStackRaiiAllocator, NonNullOffset, STD_WAL_ANCHOR};
 
 pub struct Recorder {
     inner: bstack::FirstFitBStackAllocator,
@@ -170,7 +170,7 @@ impl BStackAllocator for Recorder {
 // null niche at payload offset 0 and reserves the `[8, 16)` WAL anchor slot; this
 // wrapper only observes the ranges passing through.
 unsafe impl BStackRaiiAllocator for Recorder {
-    fn wal_anchor(&self) -> Option<u64> {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
     }
 }

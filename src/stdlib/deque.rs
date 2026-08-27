@@ -41,15 +41,15 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::io_core::teardown::dealloc_range;
 use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::replace::ReplaceError;
-use crate::io_core::teardown::{dealloc_range};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::drop::BStackDrop;
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackDeque`]: the block header, a pointer to the
 /// ring data block (`0` = none), its capacity in slots, and the circular
@@ -581,8 +581,8 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     /// Recursively free every element block and the ring, **without** freeing the
     /// handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let (head, len, cap, data) = Self::read_meta(allocator.stack(), range.start())?;
         for i in 0..len {

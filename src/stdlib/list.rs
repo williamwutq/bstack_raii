@@ -38,16 +38,16 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
+use crate::io_core::teardown::dealloc_range;
 use crate::layout::checked_off;
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::replace::ReplaceError;
-use crate::io_core::teardown::{dealloc_range};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::drop::BStackDrop;
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackLinkedList`]: the block header followed by the
 /// `head`/`tail` node offsets (`0` = empty) and the element count. `#[repr(C)]`
@@ -499,8 +499,8 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
     /// block itself (its embedding parent, or [`bstack_drop`](BStackDrop), does
     /// that).
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let mut cur = read_u64(allocator.stack(), range.start() + HEAD_OFF)?;
         // Bound the free-as-you-go walk by the stored `len`: on a corrupt cyclic

@@ -21,7 +21,7 @@ pub(crate) fn vec_drop_stmt(fname: &Ident, elem: &TokenStream, nullable: bool) -
             .bstack_drop()?;
     };
     if nullable {
-        quote! { { if __on_disk.#fname.data_off != 0 { #free } } }
+        quote! { { if !__on_disk.#fname.data_off.is_null() { #free } } }
     } else {
         quote! { { #free } }
     }
@@ -50,7 +50,7 @@ pub(crate) fn vec_accessor(
             ) -> ::std::io::Result<
                 ::core::option::Option<::bstack_raii::BStackVec<'__v, #elem, __A>>
             > {
-                unsafe { ::bstack_raii::BStackVec::from_field_opt(#field, allocator) }
+                unsafe { ::bstack_raii::BStackVec::from_field_opt(::bstack_raii::NonNullOffset::from_field(#field)?, allocator) }
             }
         }
     } else {
@@ -59,7 +59,7 @@ pub(crate) fn vec_accessor(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<::bstack_raii::BStackVec<'__v, #elem, __A>> {
-                unsafe { ::bstack_raii::BStackVec::from_field(#field, allocator) }
+                unsafe { ::bstack_raii::BStackVec::from_field(::bstack_raii::NonNullOffset::from_field(#field)?, allocator) }
             }
         }
     }
@@ -169,7 +169,7 @@ pub(crate) fn vec_clone_stmt(fname: &Ident, kind: Kind, elem: &TokenStream) -> T
     quote! {
         {
             let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
-            if __srcdesc.data_off != 0 {
+            if !__srcdesc.data_off.is_null() {
                 let __newdesc: ::bstack_raii::VecDesc = #clone_expr;
                 __od.#fname = __newdesc;
             }
@@ -196,7 +196,7 @@ pub(crate) fn wrap_vec_move(
         (
             quote!(::core::option::Option<#ty>),
             quote! {
-                if #cap.data_off != 0 {
+                if !#cap.data_off.is_null() {
                     ::core::option::Option::Some(#build)
                 } else {
                     ::core::option::Option::None
@@ -224,7 +224,7 @@ pub(crate) fn block_vec_drop_stmt(
             .bstack_drop()?;
     };
     if nullable {
-        quote! { { if __on_disk.#fname.data_off != 0 { #free } } }
+        quote! { { if !__on_disk.#fname.data_off.is_null() { #free } } }
     } else {
         quote! { { #free } }
     }
@@ -253,7 +253,7 @@ pub(crate) fn block_vec_accessor(
             ) -> ::std::io::Result<
                 ::core::option::Option<::bstack_raii::#vec_ty<'__v, #elem, __A>>
             > {
-                unsafe { ::bstack_raii::#vec_ty::from_field_opt(#field, allocator) }
+                unsafe { ::bstack_raii::#vec_ty::from_field_opt(::bstack_raii::NonNullOffset::from_field(#field)?, allocator) }
             }
         }
     } else {
@@ -262,7 +262,7 @@ pub(crate) fn block_vec_accessor(
                 &self,
                 allocator: &'__v __A,
             ) -> ::std::io::Result<::bstack_raii::#vec_ty<'__v, #elem, __A>> {
-                unsafe { ::bstack_raii::#vec_ty::from_field(#field, allocator) }
+                unsafe { ::bstack_raii::#vec_ty::from_field(::bstack_raii::NonNullOffset::from_field(#field)?, allocator) }
             }
         }
     }
@@ -364,7 +364,7 @@ pub(crate) fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
         if __off != 0 {
             let __fid = __fp.file_id();
             if __fid == 0 {
-                unsafe { #helper::<_>(allocator, __off)?; }
+                unsafe { #helper::<_>(allocator, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
             } else if let ::core::option::Option::Some(__id) =
                 ::bstack_raii::registry::FileId::from_u64(__fid)
             {
@@ -372,7 +372,7 @@ pub(crate) fn foreign_elem_drop(kind: Kind, ftarget: &Type) -> TokenStream {
                     ::bstack_raii::registry::host_arc(__id)
                 {
                     let __adapter = ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                    unsafe { #helper::<_>(&__adapter, __off)?; }
+                    unsafe { #helper::<_>(&__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
                 }
             }
         }
@@ -426,7 +426,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                             let __new_off = unsafe {
-                                <#ftarget as ::bstack_raii::BStackBlock>::foreign_clone::<_>(&__adapter, __off)? };
+                                <#ftarget as ::bstack_raii::BStackBlock>::foreign_clone::<_>(&__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?)? };
                             ::bstack_raii::WidePtr::from_raw(__fid, __fp.type_index(), __new_off)
                         } else {
                             #malformed
@@ -455,7 +455,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 .ok_or_else(|| #err)?;
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { <#ftarget as ::bstack_raii::BStackShared>::foreign_clone_strong::<_>(&__adapter, __off)?; }
+                            unsafe { <#ftarget as ::bstack_raii::BStackShared>::foreign_clone_strong::<_>(&__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
                         } else {
                             #malformed
                         }
@@ -482,7 +482,7 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
                                 .ok_or_else(|| #err)?;
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { <#ftarget as ::bstack_raii::BStackWeakable>::foreign_clone_weak::<_>(&__adapter, __off)?; }
+                            unsafe { <#ftarget as ::bstack_raii::BStackWeakable>::foreign_clone_weak::<_>(&__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
                         } else {
                             #malformed
                         }
@@ -517,7 +517,7 @@ pub(crate) fn accessor(
             > {
                 let __field = ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
                 // SAFETY (emitted): `__field` is this block's own weak-field slot.
-                unsafe { ::bstack_raii::BStackWeakable::upgrade_weak_field(allocator, __field) }
+                unsafe { ::bstack_raii::BStackWeakable::upgrade_weak_field(allocator, ::bstack_raii::NonNullOffset::from_field(__field)?) }
             }
         };
     }
@@ -1800,7 +1800,7 @@ pub(crate) fn weak_setter(
             let __field = match ::bstack_raii::__private::checked_field_offset(
                 self.0.start(),
                 ::core::mem::offset_of!(#on_disk, #fname) as u64,
-            ) {
+            ).and_then(::bstack_raii::NonNullOffset::from_field) {
                 ::core::result::Result::Ok(__f) => __f,
                 ::core::result::Result::Err(__e) => {
                     return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, weak));
@@ -2393,9 +2393,7 @@ pub(crate) fn foreign_field(
         Kind::Strong => {
             Some(quote!(<#ftarget as ::bstack_raii::BStackShared>::foreign_drop_strong))
         }
-        Kind::Weak => {
-            Some(quote!(<#ftarget as ::bstack_raii::BStackWeakable>::foreign_drop_weak))
-        }
+        Kind::Weak => Some(quote!(<#ftarget as ::bstack_raii::BStackWeakable>::foreign_drop_weak)),
         // Ref: non-owning. Pod / Embed: already rejected above.
         Kind::Ref | Kind::Pod | Kind::Embed => None,
     };
@@ -2410,7 +2408,7 @@ pub(crate) fn foreign_field(
                     let __fid = __fp.file_id();
                     if __fid == 0 {
                         // `SELF`: the target is in this same file.
-                        unsafe { #helper::<_>(allocator, __off)?; }
+                        unsafe { #helper::<_>(allocator, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
                     } else if let ::core::option::Option::Some(__id) =
                         ::bstack_raii::registry::FileId::from_u64(__fid)
                     {
@@ -2423,7 +2421,7 @@ pub(crate) fn foreign_field(
                         {
                             let __adapter =
                                 ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { #helper::<_>(&__adapter, __off)?; }
+                            unsafe { #helper::<_>(&__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
                         }
                     }
                     // A malformed id (does not fit the `FileId` space) is
@@ -2474,7 +2472,7 @@ pub(crate) fn foreign_field(
                             ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                         let __new_off = unsafe {
                             <#ftarget as ::bstack_raii::BStackBlock>::foreign_clone::<_>(
-                                &__adapter, __off,
+                                &__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?,
                             )?
                         };
                         __od.#fname = ::bstack_raii::WidePtr::from_raw(__fid, __fp.type_index(), __new_off);
@@ -2517,7 +2515,7 @@ pub(crate) fn foreign_field(
                             ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                         unsafe {
                             <#ftarget as ::bstack_raii::BStackShared>::foreign_clone_strong::<_>(
-                                &__adapter, __off,
+                                &__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?,
                             )?;
                         }
                         // The pointer is unchanged (shares the same target).
@@ -2556,7 +2554,7 @@ pub(crate) fn foreign_field(
                             ::bstack_raii::ForeignHostAllocator::new(__host, __id);
                         unsafe {
                             <#ftarget as ::bstack_raii::BStackWeakable>::foreign_clone_weak::<_>(
-                                &__adapter, __off,
+                                &__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?,
                             )?;
                         }
                     } else {
@@ -2705,7 +2703,7 @@ pub(crate) fn vec_field(
         let (acc_ret, acc_body) = if nullable {
             (
                 quote!(::core::option::Option<::std::vec::Vec<#acc_elem_ty>>),
-                quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
+                quote!(match unsafe { #store::from_field_opt(::bstack_raii::NonNullOffset::from_field(#field_loc)?, allocator) }? {
                     ::core::option::Option::Some(__v) => ::core::option::Option::Some(
                         __v.to_vec()?
                             .into_iter()
@@ -2717,7 +2715,7 @@ pub(crate) fn vec_field(
         } else {
             (
                 quote!(::std::vec::Vec<#acc_elem_ty>),
-                quote!(unsafe { #store::from_field(#field_loc, allocator)? }
+                quote!(unsafe { #store::from_field(::bstack_raii::NonNullOffset::from_field(#field_loc)?, allocator)? }
                             .to_vec()?
                             .into_iter()
                             .map(#from_ptr)
@@ -2774,7 +2772,7 @@ pub(crate) fn vec_field(
         parts.drop_stmts.push(quote! {
             {
                 let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
-                if __desc.data_off != 0 {
+                if !__desc.data_off.is_null() {
                     #drop_loop
                     unsafe { #store::from_desc(__desc, allocator) }.bstack_drop()?;
                 }
@@ -2786,7 +2784,7 @@ pub(crate) fn vec_field(
         parts.clone_stmts.push(quote! {
             {
                 let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
-                if __srcdesc.data_off != 0 {
+                if !__srcdesc.data_off.is_null() {
                     let __src = unsafe { #store::from_desc(__srcdesc, allocator) }.to_vec()?;
                     let mut __new: ::std::vec::Vec<::bstack_raii::WidePtr> =
                         ::std::vec::Vec::with_capacity(__src.len());
@@ -2962,7 +2960,7 @@ pub(crate) fn vec_field(
         let (acc_ret, acc_map): (TokenStream, TokenStream) = if nullable {
             (
                 quote!(::core::option::Option<::std::vec::Vec<#view_ret>>),
-                quote!(match unsafe { #store::from_field_opt(#field_loc, allocator) }? {
+                quote!(match unsafe { #store::from_field_opt(::bstack_raii::NonNullOffset::from_field(#field_loc)?, allocator) }? {
                     ::core::option::Option::Some(__v) => {
                         let __flat = __v.to_vec()?;
                         ::core::option::Option::Some({ #reshape })
@@ -2974,7 +2972,7 @@ pub(crate) fn vec_field(
             (
                 quote!(::std::vec::Vec<#view_ret>),
                 quote!({
-                    let __flat = unsafe { #store::from_field(#field_loc, allocator)? }.to_vec()?;
+                    let __flat = unsafe { #store::from_field(::bstack_raii::NonNullOffset::from_field(#field_loc)?, allocator)? }.to_vec()?;
                     #reshape
                 }),
             )
@@ -3092,7 +3090,7 @@ pub(crate) fn vec_field(
         parts.drop_stmts.push(quote! {
             {
                 let __desc: ::bstack_raii::VecDesc = __on_disk.#fname;
-                if __desc.data_off != 0 {
+                if !__desc.data_off.is_null() {
                     #free_children
                     unsafe { #store::from_desc(__desc, allocator) }.bstack_drop()?;
                 }
@@ -3147,7 +3145,7 @@ pub(crate) fn vec_field(
         parts.clone_stmts.push(quote! {
             {
                 let __srcdesc: ::bstack_raii::VecDesc = __od.#fname;
-                if __srcdesc.data_off != 0 {
+                if !__srcdesc.data_off.is_null() {
                     #clone_body
                 }
             }
@@ -3367,9 +3365,9 @@ pub(crate) fn vec_array_field(
             let slot = quote!(
                         __base + (#k as u64) * (::core::mem::size_of::<::bstack_raii::VecDesc>() as u64));
             if leaf_nullable {
-                quote!(unsafe { ::bstack_raii::#vec_ty::from_field_opt(#slot, allocator) }?)
+                quote!(unsafe { ::bstack_raii::#vec_ty::from_field_opt(::bstack_raii::NonNullOffset::from_field(#slot)?, allocator) }?)
             } else {
-                quote!(unsafe { ::bstack_raii::#vec_ty::from_field(#slot, allocator) }?)
+                quote!(unsafe { ::bstack_raii::#vec_ty::from_field(::bstack_raii::NonNullOffset::from_field(#slot)?, allocator) }?)
             }
         };
         let acc_body = nested_build(&dims, &acc_leaf, &acc_read);
@@ -3468,7 +3466,7 @@ pub(crate) fn vec_array_field(
             {
                 let __descs: [::bstack_raii::VecDesc; #total] = __on_disk.#fname;
                 for __k in 0usize..(#total) {
-                    if __descs[__k].data_off != 0 {
+                    if !__descs[__k].data_off.is_null() {
                         unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_desc(
                             __descs[__k], allocator) }.bstack_drop()?;
                     }
@@ -3501,7 +3499,7 @@ pub(crate) fn vec_array_field(
                 let mut __descs: [::bstack_raii::VecDesc; #total] = __od.#fname;
                 for __k in 0usize..(#total) {
                     let __sd: ::bstack_raii::VecDesc = __descs[__k];
-                    if __sd.data_off != 0 {
+                    if !__sd.data_off.is_null() {
                         __descs[__k] = #clone_expr;
                     }
                 }
@@ -3523,7 +3521,7 @@ pub(crate) fn vec_array_field(
             if leaf_nullable {
                 quote!({
                     let __d = #cap[#k];
-                    if __d.data_off != 0 {
+                    if !__d.data_off.is_null() {
                         ::core::option::Option::Some(
                             unsafe { ::bstack_raii::#vec_ty::from_desc(__d, __alloc) })
                     } else {
@@ -3826,7 +3824,7 @@ pub(crate) fn block_array_field(
                 for __k in 0usize..(#total) {
                     let __embed = ::bstack_raii::BStackRange::new(
                         __base + (__k as u64) * __step, __step);
-                    <#child>::__bstack_drop_children(__embed, allocator)?;
+                    <#child>::__bstack_drop_children(allocator, __embed)?;
                 }
             }
         });
@@ -3994,9 +3992,16 @@ pub(crate) fn block_array_field(
                         weak,
                     ));
                 }
-                let __field = self.0.start()
-                    + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
-                    + (index as u64) * 8;
+                let __field = match ::bstack_raii::NonNullOffset::from_field(
+                    self.0.start()
+                        + ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
+                        + (index as u64) * 8,
+                ) {
+                    ::core::result::Result::Ok(__f) => __f,
+                    ::core::result::Result::Err(__e) => {
+                        return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, weak));
+                    }
+                };
                 // SAFETY (emitted): `__field` indexes this block's own weak array.
                 unsafe { ::bstack_raii::BStackWeakable::set_weak_field(allocator, __field, weak) }
             }
@@ -4007,7 +4012,7 @@ pub(crate) fn block_array_field(
         let acc_read = |k: &Ident| {
             // SAFETY (emitted): `__base + k*8` indexes this block's own weak array.
             quote!(unsafe { ::bstack_raii::BStackWeakable::upgrade_weak_field(
-                        allocator, __base + (#k as u64) * 8)? })
+                        allocator, ::bstack_raii::NonNullOffset::from_field(__base + (#k as u64) * 8)?)? })
         };
         let acc_body = nested_build(&dims, &leaf_ty, &acc_read);
         parts.accessors.push(quote! {
@@ -4752,7 +4757,7 @@ pub(crate) fn embed_field(
                 ::bstack_raii::__private::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                 ::core::mem::size_of::<#child_od>() as u64,
             );
-            <#child>::__bstack_drop_children(__embed, allocator)?;
+            <#child>::__bstack_drop_children(allocator, __embed)?;
         }
     });
 
@@ -5407,7 +5412,7 @@ pub(crate) fn single_block_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<V
                             + ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64,
                         ::core::mem::size_of::<#co>() as u64,
                     );
-                    <#ty>::__bstack_drop_children(__embed, allocator)?;
+                    <#ty>::__bstack_drop_children(allocator, __embed)?;
                 }
             });
             parts.clone_arms.push(quote! {
@@ -5972,7 +5977,7 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
                 for __k in 0usize..(#total) {
                     let __embed = ::bstack_raii::BStackRange::new(
                         __base + (__k as u64) * __step, __step);
-                    <#child>::__bstack_drop_children(__embed, allocator)?;
+                    <#child>::__bstack_drop_children(allocator, __embed)?;
                 }
             }
         });
@@ -6485,8 +6490,7 @@ pub(crate) fn vec_variant(
             #disc => #view::#vname(
                 // Field-bound (not detached) so a realloc-on-`push` persists the moved
                 // descriptor into the enum's inline slot.
-                unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_field(
-                    #payload_loc, allocator) }?),
+                unsafe { ::bstack_raii::BStackVec::<#elem, __A>::from_field(::bstack_raii::NonNullOffset::from_field(#payload_loc)?, allocator) }?),
         });
         parts.move_arms.push(quote! {
             #disc => #data::#vname(
@@ -6608,8 +6612,7 @@ pub(crate) fn vec_variant(
                 // so a realloc-on-`push` persists the moved descriptor into the live
                 // enum block. A detached `from_desc` view would leave the enum's slot
                 // pointing at freed space after a growth.
-                unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_field(
-                    #payload_loc, allocator) }?),
+                unsafe { ::bstack_raii::#vec_ty::<#elem, __A>::from_field(::bstack_raii::NonNullOffset::from_field(#payload_loc)?, allocator) }?),
         });
         parts.move_arms.push(quote! {
             #disc => #data::#vname(

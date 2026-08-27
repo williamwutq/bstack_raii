@@ -54,7 +54,11 @@ mod clonediff {
         v.push(("c (strong)", h.get_c(stack).unwrap().range().start(), true));
         v.push(("d (ref)", h.get_d(stack).unwrap().range().start(), true));
         let many = h.get_many(alloc).unwrap();
-        v.push(("many.data (owned vec)", many.descriptor().data_off, false));
+        v.push((
+            "many.data (owned vec)",
+            many.descriptor().data_off.get(),
+            false,
+        ));
         v.push((
             "many[0] (owned elem)",
             many.get(0).unwrap().unwrap().range().start(),
@@ -62,22 +66,40 @@ mod clonediff {
         ));
         v.push((
             "bytes.data (pod vec)",
-            h.get_bytes(alloc).unwrap().descriptor().data_off,
+            h.get_bytes(alloc).unwrap().descriptor().data_off.get(),
             false,
         ));
         v.push((
             "optvec.data (Option<Vec>)",
-            h.get_optvec(alloc).unwrap().unwrap().descriptor().data_off,
+            h.get_optvec(alloc)
+                .unwrap()
+                .unwrap()
+                .descriptor()
+                .data_off
+                .get(),
             false,
         ));
         v.push((
             "optstr.data (Option<String>)",
-            h.get_optstr(alloc).unwrap().unwrap().descriptor().data_off,
+            h.get_optstr(alloc)
+                .unwrap()
+                .unwrap()
+                .descriptor()
+                .data_off
+                .get(),
             false,
         ));
         let arr = h.get_arr(alloc).unwrap();
-        v.push(("arr[0].data ([Vec;2])", arr[0].descriptor().data_off, false));
-        v.push(("arr[1].data ([Vec;2])", arr[1].descriptor().data_off, false));
+        v.push((
+            "arr[0].data ([Vec;2])",
+            arr[0].descriptor().data_off.get(),
+            false,
+        ));
+        v.push((
+            "arr[1].data ([Vec;2])",
+            arr[1].descriptor().data_off.get(),
+            false,
+        ));
         v
     }
 
@@ -262,9 +284,9 @@ mod tddiff {
             .unwrap()
             .unwrap()
             .descriptor();
-        rec.push(("many.data", many_d.data_off, many_d.data_size));
-        rec.push(("bytes.data", bytes_d.data_off, bytes_d.data_size));
-        rec.push(("optvec.data", optvec_d.data_off, optvec_d.data_size));
+        rec.push(("many.data", many_d.data_off.get(), many_d.data_size));
+        rec.push(("bytes.data", bytes_d.data_off.get(), bytes_d.data_size));
+        rec.push(("optvec.data", optvec_d.data_off.get(), optvec_d.data_size));
         // Control: a `#[bstack_ref]` target owns nothing, so teardown must NOT free it.
         // It should come back as "still allocated".
         rec.push((

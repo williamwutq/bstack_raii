@@ -3,8 +3,9 @@
 //! internal [`BlockShell`] teardown token.
 //!
 //! These are semantic types — the ownership vocabulary — so they live under
-//! [`crate::types`]. The teardown *mechanism* they drive (`drop_block`,
-//! `dealloc_range`, `wal_teardown`) is in [`crate::io_core::teardown`].
+//! [`crate::types`]. The block-teardown primitive [`drop_block`] lives here too,
+//! beside the [`BlockShell`] token it drives; the rest of the teardown
+//! *mechanism* (`dealloc_range`, `wal_teardown`) is in [`crate::io_core::teardown`].
 
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -13,9 +14,9 @@ use std::io;
 
 use bstack::BStackRange;
 
-use crate::BStackRaiiAllocator;
 use super::block::BStackBlock;
-use crate::io_core::teardown::drop_block;
+use crate::BStackRaiiAllocator;
+use crate::io_core::teardown::dealloc_range;
 use crate::replace::ReplaceError;
 
 /// The safe teardown protocol for an affine (non-`Copy`) owning handle: consume
@@ -52,8 +53,29 @@ impl<T: BStackBlock> BStackDrop for BlockShell<T> {
     fn bstack_drop<A: BStackRaiiAllocator>(self, allocator: &A) -> io::Result<()> {
         // SAFETY: a `BlockShell` is minted only by `BStackOwned::bstack_drop` from
         // a handle that asserted sole ownership at construction.
-        unsafe { drop_block::<T, A>(self.range, allocator) }
+        unsafe { drop_block::<T, A>(allocator, self.range) }
     }
+}
+
+/// Free a block by range: recurse into its owned children, then dealloc the shell.
+///
+/// The single implementation of "tear down a `T` block", shared by every affine
+/// owner ([`BStackOwned`](crate::BStackOwned), the `*Ref` drop-core tokens, the
+/// block-element vectors). It replaces the per-type `impl BStackDrop for <handle>`
+/// bodies that used to live on each `Copy` block handle — the handle is now a pure
+/// view, so this is reachable only through a non-`Copy` owner. It lives here beside
+/// [`BlockShell`], its trait-side caller, rather than with the free-leaf
+/// [`dealloc_range`](crate::io_core::teardown::dealloc_range) it bottoms out in.
+///
+/// # Safety
+/// `range` must be a live `T` block owned by `allocator` that no other live owner
+/// will also free.
+pub(crate) unsafe fn drop_block<T: BStackBlock, A: BStackRaiiAllocator>(
+    allocator: &A,
+    range: BStackRange,
+) -> io::Result<()> {
+    T::__bstack_drop_children(allocator, range)?;
+    unsafe { dealloc_range(allocator, range) }
 }
 
 /// A guard that runs [`BStackDrop::bstack_drop`] on its inner handle when it goes
@@ -121,10 +143,7 @@ impl<'a, T: BStackDrop, A: BStackRaiiAllocator> AutoDrop<'a, T, A> {
     ///   re-home, or free at their discretion — the contract `bstack`'s allocator
     ///   mandates.
     #[inline]
-    pub(crate) fn finish_handback<R>(
-        self,
-        outcome: io::Result<R>,
-    ) -> Result<R, ReplaceError<T>> {
+    pub(crate) fn finish_handback<R>(self, outcome: io::Result<R>) -> Result<R, ReplaceError<T>> {
         match outcome {
             Ok(r) => {
                 let _ = self.into_raw_parts();

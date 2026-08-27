@@ -29,7 +29,7 @@ use crate::util::io_errorfn;
 ///
 /// `#[repr(transparent)]` over `u64`, so it composes into the fat-pointer record with
 /// no encoding change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Pod, Zeroable)]
 #[repr(transparent)]
 pub struct Offset(u64);
 
@@ -153,6 +153,17 @@ impl NonNullOffset {
     pub fn from_slice(slice: BStackSlice<'_>) -> Option<NonNullOffset> {
         Self::new(slice.into())
     }
+
+    /// Refine a raw byte offset that is **non-null by construction** — an on-disk
+    /// field address past the block header (a refcount / control counter, a live
+    /// child slot) — erroring rather than panicking on the `0` that only a corrupt
+    /// or forged base could produce. The bridge from the `u64` that offset
+    /// arithmetic ([`checked_off`](crate::layout::checked_off), `add_off`) yields to
+    /// the [`NonNullOffset`] the counter ops ([`crate::io_core::refcount`]) require.
+    #[inline]
+    pub fn from_field(off: u64) -> io::Result<NonNullOffset> {
+        Self::new(Offset::from_raw(off)).ok_or_else(null_field_offset)
+    }
 }
 
 impl From<NonNullOffset> for Offset {
@@ -210,4 +221,13 @@ impl From<BStackSlice<'_>> for Offset {
     }
 }
 
-io_errorfn!(offset_overflow, InvalidData, "on-disk offset arithmetic overflow");
+io_errorfn!(
+    offset_overflow,
+    InvalidData,
+    "on-disk offset arithmetic overflow"
+);
+io_errorfn!(
+    null_field_offset,
+    InvalidData,
+    "field offset resolved to null"
+);

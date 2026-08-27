@@ -28,12 +28,12 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::util::{alloc_image, read_fields, read_u64};
-use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::io_core::teardown::dealloc_range;
+use crate::primitives::EightCC;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::block::{BStackBlock, BStackCast};
 
 /// The on-disk image of a [`BStackString`]: header, a pointer to the UTF-8 bytes
 /// block (`0` = empty), and the byte length. `#[repr(C)]`, `u64` fields only —
@@ -271,8 +271,8 @@ impl BStackBlock for BStackString {
 
     /// Free the bytes block, **without** freeing the handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let [data, len] = read_fields::<2>(allocator.stack(), range.start() + DATA_OFF)?;
         if data != 0 {

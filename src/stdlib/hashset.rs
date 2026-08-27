@@ -39,16 +39,18 @@ use bytemuck::{Pod, Zeroable};
 
 use super::bloom::{BStackCountingBloomFilter, BloomOnDisk};
 use super::hash::fnv1a;
-use super::util::{Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
+use super::util::{
+    Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8,
+};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::util::bytes::get_u64;
+use crate::io_core::teardown::dealloc_range;
 use crate::primitives::EightCC;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
 use crate::types::compiled::owned::BStackOwned;
-use crate::io_core::teardown::{dealloc_range};
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::drop::BStackDrop;
+use crate::util::bytes::get_u64;
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackHashSet`]: header, bucket-block pointer,
 /// bucket count `cap`, key count `len`, `used` (occupied + tombstone), and the
@@ -442,8 +444,8 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
     /// Free the bucket block and the embedded Bloom filter, **without** freeing
     /// the handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let handle = range.start();
         let [table, cap, _len, _used, bloom_off] =

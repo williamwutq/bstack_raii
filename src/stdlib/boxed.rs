@@ -24,14 +24,14 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
+use crate::clone::{ClonePlan, TryCloneIn};
+use crate::io_core::teardown::dealloc_range;
+use crate::primitives::EightCC;
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
 use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::r#move::BStackMove;
-use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::types::traits::reference::BStackRef;
-use crate::io_core::teardown::dealloc_range;
 
 /// The on-disk image of a [`BStackBox<T>`]: the standard [`BlockHeader`] followed
 /// by the boxed value. `#[repr(C, packed)]` (like every generated `XOnDisk`) so

@@ -7,12 +7,12 @@ use std::io;
 use bstack::BStackRange;
 use bytemuck::Pod;
 
-use crate::BStackRaiiAllocator;
-use crate::primitives::EightCC;
-use super::reference::BStackRef;
-use crate::replace::ReplaceError;
 use super::super::compiled::rc::{BStackRc, BStackWeak};
 use super::block::BStackBlock;
+use super::reference::BStackRef;
+use crate::BStackRaiiAllocator;
+use crate::primitives::{EightCC, NonNullOffset};
+use crate::replace::ReplaceError;
 
 /// Implemented by refcounted blocks (`#[bstack_block(rc)]` and
 /// `#[bstack_block(rc, weak)]`), i.e. any block that can be the target of a
@@ -57,7 +57,7 @@ pub trait BStackShared: BStackBlock {
     #[doc(hidden)]
     unsafe fn foreign_drop_strong<A: BStackRaiiAllocator>(
         alloc: &A,
-        offset: u64,
+        offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::foreign::foreign_drop_strong::<Self, A>(alloc, offset) }
@@ -71,7 +71,7 @@ pub trait BStackShared: BStackBlock {
     #[doc(hidden)]
     unsafe fn foreign_clone_strong<A: BStackRaiiAllocator>(
         alloc: &A,
-        offset: u64,
+        offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::foreign::foreign_clone_strong::<Self, A>(alloc, offset) }
@@ -110,7 +110,7 @@ pub trait BStackWeakable: BStackBlock {
     #[doc(hidden)]
     unsafe fn foreign_drop_weak<A: BStackRaiiAllocator>(
         alloc: &A,
-        ctrl_offset: u64,
+        ctrl_offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::foreign::foreign_drop_weak::<Self, A>(alloc, ctrl_offset) }
@@ -125,7 +125,7 @@ pub trait BStackWeakable: BStackBlock {
     #[doc(hidden)]
     unsafe fn foreign_clone_weak<A: BStackRaiiAllocator>(
         alloc: &A,
-        ctrl_offset: u64,
+        ctrl_offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::foreign::foreign_clone_weak::<Self, A>(alloc, ctrl_offset) }
@@ -140,7 +140,7 @@ pub trait BStackWeakable: BStackBlock {
     #[doc(hidden)]
     unsafe fn set_weak_field<'w, A: BStackRaiiAllocator>(
         allocator: &'w A,
-        field_off: u64,
+        field_off: NonNullOffset,
         new_weak: BStackWeak<'w, Self, A>,
     ) -> Result<(), ReplaceError<BStackWeak<'w, Self, A>>> {
         // SAFETY: forwarded to the caller's contract above.
@@ -157,7 +157,7 @@ pub trait BStackWeakable: BStackBlock {
     #[doc(hidden)]
     unsafe fn upgrade_weak_field<'a, A: BStackRaiiAllocator>(
         allocator: &'a A,
-        field_off: u64,
+        field_off: NonNullOffset,
     ) -> io::Result<Option<BStackRc<'a, Self, A>>> {
         // SAFETY: forwarded to the caller's contract above.
         unsafe { crate::construct::upgrade_weak_field::<Self, A>(allocator, field_off) }

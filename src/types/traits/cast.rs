@@ -12,10 +12,10 @@ use std::io;
 use crate::BStackRaiiAllocator;
 use bstack::{BStackOwnedSlice, BStackSlice};
 
-use super::block::BStackBlock;
-use crate::primitives::EightCC;
 use super::super::compiled::owned::BStackOwned;
+use super::block::BStackBlock;
 use super::drop::AutoDrop;
+use crate::primitives::EightCC;
 
 /// Byte offset of the `tag` within a [`crate::BlockHeader`] (`size: u64` first).
 const TAG_OFFSET: u64 = 8;

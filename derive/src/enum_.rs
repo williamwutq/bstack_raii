@@ -1024,8 +1024,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             #[doc(hidden)]
             #[allow(unused_imports)]
             fn __bstack_drop_children<__A: ::bstack_raii::BStackRaiiAllocator>(
-                __range: ::bstack_raii::BStackRange,
                 allocator: &__A,
+                __range: ::bstack_raii::BStackRange,
             ) -> ::std::io::Result<()> {
                 use ::bstack_raii::BStackDrop as _;
                 use ::bstack_raii::BStackBlock as _;

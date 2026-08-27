@@ -42,17 +42,19 @@ use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
 use super::hash::fnv1a;
-use super::util::{Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8};
-use crate::util::small_buf::SmallBuf;
-use crate::types::traits::block::{BStackBlock, BStackCast};
+use super::util::{
+    Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, read_u64, w8,
+};
 use crate::clone::{ClonePlan, TryCloneIn};
-use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
-use crate::util::bytes::get_u64;
+use crate::io_core::teardown::dealloc_range;
 use crate::primitives::EightCC;
-use crate::types::compiled::owned::BStackOwned;
 use crate::replace::ReplaceError;
-use crate::io_core::teardown::{dealloc_range};
+use crate::types::compiled::block::{BlockHeader, HEADER_SIZE};
+use crate::types::compiled::owned::BStackOwned;
+use crate::types::traits::block::{BStackBlock, BStackCast};
 use crate::types::traits::drop::BStackDrop;
+use crate::util::bytes::get_u64;
+use crate::util::small_buf::SmallBuf;
 
 /// The on-disk image of a [`BStackHashMap`]: header, bucket-block pointer (`0` =
 /// none), bucket count `cap`, live-entry count `len`, and `used` (occupied +
@@ -519,8 +521,8 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     /// Recursively free every value block and the bucket block, **without**
     /// freeing the handle block itself.
     fn __bstack_drop_children<A: BStackRaiiAllocator>(
-        range: BStackRange,
         allocator: &A,
+        range: BStackRange,
     ) -> io::Result<()> {
         let stride = Self::stride();
         let ksz = Self::ksize();
