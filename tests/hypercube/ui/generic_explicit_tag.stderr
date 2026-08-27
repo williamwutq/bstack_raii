@@ -1,0 +1,5 @@
+error: [BSTACK0005] an explicit 8-byte tag override on a generic block leaves no hash bytes to distinguish instantiations — every instantiation would share one tag; shorten the tag (at most 4 bytes recommended)
+ --> tests/hypercube/ui/generic_explicit_tag.rs:5:8
+  |
+5 | struct Pinned<T: bstack_raii::Pod> {
+  |        ^^^^^^

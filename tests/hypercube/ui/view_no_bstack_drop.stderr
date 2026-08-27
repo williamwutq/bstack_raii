@@ -1,0 +1,12 @@
+error[E0599]: no method named `bstack_drop` found for struct `Cell` in the current scope
+  --> tests/hypercube/ui/view_no_bstack_drop.rs:10:18
+   |
+ 4 | #[bstack_block]
+   | --------------- method `bstack_drop` not found for this struct
+...
+10 |     let _ = view.bstack_drop(a); // no `bstack_drop` on a bare handle
+   |                  ^^^^^^^^^^^ method not found in `Cell`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+   = note: the following trait defines an item `bstack_drop`, perhaps you need to implement it:
+           candidate #1: `BStackDrop`

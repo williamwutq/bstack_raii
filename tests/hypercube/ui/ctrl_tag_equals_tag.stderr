@@ -1,0 +1,5 @@
+error: [BSTACK0006] the explicit `ctrl_tag` equals the data tag — a control block would then pass every data-block identity check; choose a distinct `ctrl_tag` (or omit it to auto-derive one)
+ --> tests/hypercube/ui/ctrl_tag_equals_tag.rs:5:8
+  |
+5 | struct Dup {
+  |        ^^^

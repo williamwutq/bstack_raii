@@ -1,0 +1,5 @@
+error: [BSTACK0004] `#[cfg]` / `#[cfg_attr]` on a bstack block field or variant is unsupported: the generated on-disk layout, constructor, and accessors cannot be made conditional, so the attribute would be silently ignored rather than honoured
+ --> tests/hypercube/ui/cfg_on_field.rs:7:5
+  |
+7 |     #[cfg(feature = "nope")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^

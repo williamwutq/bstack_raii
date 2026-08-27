@@ -1,0 +1,106 @@
+error[E0277]: `u32` is not a `#[bstack_block]` / `#[bstack_enum]` type
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a bstack block
+  |
+  = help: the trait `BStackBlock` is not implemented for `u32`
+  = note: `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields (and generic parameters used as them) require a block type. Primitives, `Vec`, `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple needs its own named `#[bstack_block]` wrapper.
+  = help: the following other types implement trait `BStackBlock`:
+            BStackBTreeMap<K, V>
+            BStackBTreeSet<K>
+            BStackBinaryHeap<K, V>
+            BStackBox<T>
+            BStackCountingBloomFilter<K>
+            BStackDeque<T>
+            BStackHashMap<K, V>
+            BStackHashSet<K>
+          and $N others
+note: required by a bound in `BStackRc`
+ --> src/types/compiled/rc.rs
+  |
+  | pub struct BStackRc<'a, T: BStackBlock, A: BStackRaiiAllocator> {
+  |                            ^^^^^^^^^^^ required by this bound in `BStackRc`
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `u32` is not a weak-observable block (`#[bstack_block(rc, weak)]`)
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a weakable block
+  |
+  = help: the trait `BStackWeakable` is not implemented for `u32`
+  = note: `#[bstack_weak]` fields (and generic parameters used as them) require an `#[bstack_block(rc, weak)]` type; a plain `#[bstack_block(rc)]` is not weak-observable.
+note: required by a bound in `BStackWeak`
+ --> src/types/compiled/rc.rs
+  |
+  | pub struct BStackWeak<'a, T: BStackWeakable, A: BStackRaiiAllocator> {
+  |                              ^^^^^^^^^^^^^^ required by this bound in `BStackWeak`
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `u32` is not a weak-observable block (`#[bstack_block(rc, weak)]`)
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:6:8
+  |
+6 |     f: u32,
+  |        ^^^ not a weakable block
+  |
+  = help: the trait `BStackWeakable` is not implemented for `u32`
+  = note: `#[bstack_weak]` fields (and generic parameters used as them) require an `#[bstack_block(rc, weak)]` type; a plain `#[bstack_block(rc)]` is not weak-observable.
+
+error[E0277]: `u32` is not a weak-observable block (`#[bstack_block(rc, weak)]`)
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a weakable block
+  |
+  = help: the trait `BStackWeakable` is not implemented for `u32`
+  = note: `#[bstack_weak]` fields (and generic parameters used as them) require an `#[bstack_block(rc, weak)]` type; a plain `#[bstack_block(rc)]` is not weak-observable.
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: the associated function or constant `new` exists for struct `WeakRef<u32>`, but its trait bounds were not satisfied
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ associated function or constant cannot be called on `WeakRef<u32>` due to unsatisfied trait bounds
+  |
+  = note: the following trait bounds were not satisfied:
+          `u32: BStackWeakable`
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `u32` is not a `#[bstack_block]` / `#[bstack_enum]` type
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a bstack block
+  |
+  = help: the trait `BStackBlock` is not implemented for `u32`
+  = note: `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields (and generic parameters used as them) require a block type. Primitives, `Vec`, `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple needs its own named `#[bstack_block]` wrapper.
+  = help: the following other types implement trait `BStackBlock`:
+            BStackBTreeMap<K, V>
+            BStackBTreeSet<K>
+            BStackBinaryHeap<K, V>
+            BStackBox<T>
+            BStackCountingBloomFilter<K>
+            BStackDeque<T>
+            BStackHashMap<K, V>
+            BStackHashSet<K>
+          and $N others
+note: required by a bound in `BStackRc`
+ --> src/types/compiled/rc.rs
+  |
+  | pub struct BStackRc<'a, T: BStackBlock, A: BStackRaiiAllocator> {
+  |                            ^^^^^^^^^^^ required by this bound in `BStackRc`
+
+error[E0277]: `u32` is not a weak-observable block (`#[bstack_block(rc, weak)]`)
+ --> tests/hypercube/ui/weak_field_non_weakable.rs:3:1
+  |
+3 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a weakable block
+  |
+  = help: the trait `BStackWeakable` is not implemented for `u32`
+  = note: `#[bstack_weak]` fields (and generic parameters used as them) require an `#[bstack_block(rc, weak)]` type; a plain `#[bstack_block(rc)]` is not weak-observable.
+note: required by a bound in `BStackWeak`
+ --> src/types/compiled/rc.rs
+  |
+  | pub struct BStackWeak<'a, T: BStackWeakable, A: BStackRaiiAllocator> {
+  |                              ^^^^^^^^^^^^^^ required by this bound in `BStackWeak`

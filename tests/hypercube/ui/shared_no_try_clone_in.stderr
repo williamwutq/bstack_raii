@@ -1,0 +1,9 @@
+error[E0599]: no method named `try_clone_in` found for reference `&S` in the current scope
+ --> tests/hypercube/ui/shared_no_try_clone_in.rs:9:15
+  |
+9 |     let _ = s.try_clone_in(a); // no such method on a shared block
+  |               ^^^^^^^^^^^^ method not found in `&S`
+  |
+  = help: items from traits can only be used if the trait is implemented and in scope
+  = note: the following trait defines an item `try_clone_in`, perhaps you need to implement it:
+          candidate #1: `TryCloneIn`

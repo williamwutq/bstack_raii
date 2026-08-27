@@ -1,0 +1,111 @@
+error[E0277]: `Wrapping<u32>` is not a `#[bstack_block]` / `#[bstack_enum]` type
+ --> tests/hypercube/ui/owned_on_non_block.rs:4:1
+  |
+4 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a bstack block
+  |
+  = help: the trait `BStackBlock` is not implemented for `Wrapping<u32>`
+  = note: `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields (and generic parameters used as them) require a block type. Primitives, `Vec`, `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple needs its own named `#[bstack_block]` wrapper.
+  = help: the following other types implement trait `BStackBlock`:
+            BStackBTreeMap<K, V>
+            BStackBTreeSet<K>
+            BStackBinaryHeap<K, V>
+            BStackBox<T>
+            BStackCountingBloomFilter<K>
+            BStackDeque<T>
+            BStackHashMap<K, V>
+            BStackHashSet<K>
+          and $N others
+note: required by a bound in `BStackOwned`
+ --> src/types/compiled/owned.rs
+  |
+  | pub struct BStackOwned<T: BStackBlock>(T);
+  |                           ^^^^^^^^^^^ required by this bound in `BStackOwned`
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Wrapping<u32>` is not a `#[bstack_block]` / `#[bstack_enum]` type
+ --> tests/hypercube/ui/owned_on_non_block.rs:7:8
+  |
+7 |     f: core::num::Wrapping<u32>,
+  |        ^^^^^^^^^^^^^^^^^^^^^^^^ not a bstack block
+  |
+  = help: the trait `BStackBlock` is not implemented for `Wrapping<u32>`
+  = note: `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields (and generic parameters used as them) require a block type. Primitives, `Vec`, `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple needs its own named `#[bstack_block]` wrapper.
+  = help: the following other types implement trait `BStackBlock`:
+            BStackBTreeMap<K, V>
+            BStackBTreeSet<K>
+            BStackBinaryHeap<K, V>
+            BStackBox<T>
+            BStackCountingBloomFilter<K>
+            BStackDeque<T>
+            BStackHashMap<K, V>
+            BStackHashSet<K>
+          and $N others
+
+error[E0599]: no method named `__bstack_clone_into` found for struct `Wrapping<T>` in the current scope
+ --> tests/hypercube/ui/owned_on_non_block.rs:4:1
+  |
+4 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: the method `bstack_drop` exists for struct `OwnedRef<Wrapping<u32>>`, but its trait bounds were not satisfied
+ --> tests/hypercube/ui/owned_on_non_block.rs:4:1
+  |
+4 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ method cannot be called on `OwnedRef<Wrapping<u32>>` due to unsatisfied trait bounds
+  |
+ ::: src/types/compiled/owned.rs
+  |
+  | pub struct OwnedRef<T>(BStackRef<T>);
+  | ---------------------- doesn't satisfy `OwnedRef<Wrapping<u32>>: BStackDrop`
+  |
+ ::: $RUST/core/src/num/wrapping.rs
+  |
+  | pub struct Wrapping<T>(#[stable(feature = "rust1", since = "1.0.0")] pub T);
+  | ---------------------- doesn't satisfy `Wrapping<u32>: BStackBlock`
+  |
+  = note: the following trait bounds were not satisfied:
+          `Wrapping<u32>: BStackBlock`
+          which is required by `OwnedRef<Wrapping<u32>>: BStackDrop`
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: the method `into_inner` exists for struct `BStackOwned<Wrapping<u32>>`, but its trait bounds were not satisfied
+ --> tests/hypercube/ui/owned_on_non_block.rs:4:1
+  |
+4 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ method cannot be called on `BStackOwned<Wrapping<u32>>` due to unsatisfied trait bounds
+  |
+ ::: $RUST/core/src/num/wrapping.rs
+  |
+  | pub struct Wrapping<T>(#[stable(feature = "rust1", since = "1.0.0")] pub T);
+  | ---------------------- doesn't satisfy `Wrapping<u32>: BStackBlock`
+  |
+  = note: the following trait bounds were not satisfied:
+          `Wrapping<u32>: BStackBlock`
+  = note: this error originates in the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Wrapping<u32>` is not a `#[bstack_block]` / `#[bstack_enum]` type
+ --> tests/hypercube/ui/owned_on_non_block.rs:4:1
+  |
+4 | #[bstack_block]
+  | ^^^^^^^^^^^^^^^ not a bstack block
+  |
+  = help: the trait `BStackBlock` is not implemented for `Wrapping<u32>`
+  = note: `#[bstack_owned]` / `#[bstack_strong]` / `#[bstack_weak]` / `#[bstack_ref]` fields (and generic parameters used as them) require a block type. Primitives, `Vec`, `String`, tuples and `Option` are not blocks — a nested `Vec`/`Option` or a tuple needs its own named `#[bstack_block]` wrapper.
+  = help: the following other types implement trait `BStackBlock`:
+            BStackBTreeMap<K, V>
+            BStackBTreeSet<K>
+            BStackBinaryHeap<K, V>
+            BStackBox<T>
+            BStackCountingBloomFilter<K>
+            BStackDeque<T>
+            BStackHashMap<K, V>
+            BStackHashSet<K>
+          and $N others
+note: required by a bound in `BStackOwned`
+ --> src/types/compiled/owned.rs
+  |
+  | pub struct BStackOwned<T: BStackBlock>(T);
+  |                           ^^^^^^^^^^^ required by this bound in `BStackOwned`

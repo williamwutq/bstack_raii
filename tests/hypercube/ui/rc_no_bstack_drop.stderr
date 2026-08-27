@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `A: BStackRaiiAllocator` is not satisfied
+ --> tests/hypercube/ui/rc_no_bstack_drop.rs:8:40
+  |
+8 | fn f<A: BStackOwnedSliceAllocator>(rc: bstack_raii::BStackRc<'_, S, A>, a: &A) {
+  |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `BStackRaiiAllocator` is not implemented for `A`
+  |
+note: required by a bound in `BStackRc`
+ --> src/types/compiled/rc.rs
+  |
+  | pub struct BStackRc<'a, T: BStackBlock, A: BStackRaiiAllocator> {
+  |                                            ^^^^^^^^^^^^^^^^^^^ required by this bound in `BStackRc`
+help: consider further restricting type parameter `A` with trait `BStackRaiiAllocator`
+  |
+8 | fn f<A: BStackOwnedSliceAllocator + bstack_raii::BStackRaiiAllocator>(rc: bstack_raii::BStackRc<'_, S, A>, a: &A) {
+  |                                   ++++++++++++++++++++++++++++++++++
+
+error[E0599]: no method named `bstack_drop` found for struct `BStackRc<'a, T, A>` in the current scope
+ --> tests/hypercube/ui/rc_no_bstack_drop.rs:9:16
+  |
+9 |     let _ = rc.bstack_drop(a); // gone: use `drop(rc)` for a refcount release
+  |                ^^^^^^^^^^^ method not found in `BStackRc<'_, S, A>`
