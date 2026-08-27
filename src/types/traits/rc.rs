@@ -59,7 +59,7 @@ pub trait BStackShared: BStackBlock {
         offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::foreign::foreign_drop_strong::<Self, A>(alloc, offset) }
+        unsafe { crate::io_core::foreign::foreign_drop_strong::<Self, A>(alloc, offset) }
     }
 
     /// Cross-file **clone** of an `#[bstack_strong] Foreign<Self>` reference: bump the
@@ -73,7 +73,7 @@ pub trait BStackShared: BStackBlock {
         offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::foreign::foreign_clone_strong::<Self, A>(alloc, offset) }
+        unsafe { crate::io_core::foreign::foreign_clone_strong::<Self, A>(alloc, offset) }
     }
 }
 
@@ -112,7 +112,7 @@ pub trait BStackWeakable: BStackBlock {
         ctrl_offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::foreign::foreign_drop_weak::<Self, A>(alloc, ctrl_offset) }
+        unsafe { crate::io_core::foreign::foreign_drop_weak::<Self, A>(alloc, ctrl_offset) }
     }
 
     /// Cross-file **clone** of a `#[bstack_weak] Foreign<Self>` reference: bump the
@@ -127,7 +127,7 @@ pub trait BStackWeakable: BStackBlock {
         ctrl_offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::foreign::foreign_clone_weak::<Self, A>(alloc, ctrl_offset) }
+        unsafe { crate::io_core::foreign::foreign_clone_weak::<Self, A>(alloc, ctrl_offset) }
     }
 
     /// Install `new_weak` into the `#[bstack_weak]` field at `field_off`, releasing

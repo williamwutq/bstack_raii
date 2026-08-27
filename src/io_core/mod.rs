@@ -17,6 +17,7 @@
 
 pub(crate) mod bulk;
 pub(crate) mod clone;
+pub(crate) mod foreign;
 pub(crate) mod refcount;
 pub mod registry;
 pub(crate) mod teardown;

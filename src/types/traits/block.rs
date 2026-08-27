@@ -136,7 +136,7 @@ pub trait BStackBlock: BStackCast + Sized {
         offset: NonNullOffset,
     ) -> io::Result<()> {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::foreign::foreign_drop_owned::<Self, A>(alloc, offset) }
+        unsafe { crate::io_core::foreign::foreign_drop_owned::<Self, A>(alloc, offset) }
     }
 
     /// Cross-file **deep-clone** of an `#[bstack_owned] Foreign<Self>` target at
@@ -155,6 +155,6 @@ pub trait BStackBlock: BStackCast + Sized {
         Self: crate::io_core::TryCloneIn,
     {
         // SAFETY: forwarded to the caller's contract above.
-        unsafe { crate::foreign::foreign_clone_owned::<Self, A>(alloc, offset) }
+        unsafe { crate::io_core::foreign::foreign_clone_owned::<Self, A>(alloc, offset) }
     }
 }
