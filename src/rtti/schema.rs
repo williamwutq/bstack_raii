@@ -39,7 +39,7 @@ mod shape_tag {
 /// Map a byte-cursor underrun (a `None` from [`Reader::take`](crate::util::Reader::take))
 /// to the RTTI truncation error.
 fn need<T>(v: Option<T>) -> io::Result<T> {
-    v.ok_or_else(|| io_error!(InvalidData, "[BSTACK0804] truncated RTTI record"))
+    v.ok_or_else(|| io_error!("[BSTACK0804] truncated RTTI record"))
 }
 
 #[inline(always)]
@@ -75,7 +75,7 @@ fn eightcc(r: &mut Reader) -> io::Result<EightCC> {
 /// Read an `n`-byte UTF-8 string, RTTI-framing both a short read and invalid UTF-8.
 fn string(r: &mut Reader, n: usize) -> io::Result<String> {
     String::from_utf8(need(r.take(n))?.to_vec())
-        .map_err(|_| io_error!(InvalidData, "[BSTACK0802] RTTI name is not valid UTF-8"))
+        .map_err(|_| io_error!("[BSTACK0802] RTTI name is not valid UTF-8"))
 }
 
 /// Advance `r` past zero-padding to the next `a`-byte boundary, RTTI-framing a boundary
@@ -237,10 +237,7 @@ impl Shape {
                 let tag = eightcc(r)?;
                 let kb = u8(r)?;
                 let kind = OwnershipKind::from_u8(kb).ok_or_else(|| {
-                    io_error!(
-                        InvalidData,
-                        format!("[BSTACK0803] unknown RTTI foreign kind {kb:#04x}")
-                    )
+                    io_error!("[BSTACK0803] unknown RTTI foreign kind {:#04x}", kb)
                 })?;
                 Shape::Foreign { tag, kind }
             }
@@ -274,7 +271,8 @@ impl Shape {
             other => {
                 return Err(io_error!(
                     InvalidData,
-                    format!("[BSTACK0803] unknown RTTI shape tag {other:#04x}")
+                    "[BSTACK0803] unknown RTTI shape tag {:#04x}",
+                    other
                 ));
             }
         })

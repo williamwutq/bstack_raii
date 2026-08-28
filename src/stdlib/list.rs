@@ -43,7 +43,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::{EightCC, checked_off};
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
-use crate::util::{SmallBuf, read_u64};
+use crate::util::{SmallBuf, io_error, read_u64};
 
 /// The on-disk image of a [`BStackLinkedList`]: the block header followed by the
 /// `head`/`tail` node offsets (`0` = empty) and the element count. `#[repr(C)]`
@@ -429,14 +429,13 @@ impl<T: BStackBlock> BStackLinkedList<T> {
         let mut out = Vec::new();
         let mut cur = read_u64(stack, self.range.start() + HEAD_OFF)?;
         // Bound the walk by the stored `len` (as the deque bounds by its own
-        // header): a corrupt cyclic `next` must fail as `InvalidData`, not
+        // header): a corrupt cyclic `next` must fail as invalid data, not
         // yield elements forever.
         let mut remaining = self.len(stack)?;
         while cur != 0 {
             if remaining == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "linked list chain longer than its stored len (a next-pointer cycle?)",
+                return Err(io_error!(
+                    "linked list chain longer than its stored len (a next-pointer cycle?)"
                 ));
             }
             remaining -= 1;
@@ -505,9 +504,8 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
         let mut remaining = read_u64(allocator.stack(), range.start() + LEN_OFF)?;
         while cur != 0 {
             if remaining == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "linked list chain longer than its stored len (a next-pointer cycle?)",
+                return Err(io_error!(
+                    "linked list chain longer than its stored len (a next-pointer cycle?)"
                 ));
             }
             remaining -= 1;
@@ -544,9 +542,8 @@ impl<T: BStackBlock> BStackBlock for BStackLinkedList<T> {
         let mut remaining = read_u64(allocator.stack(), src + LEN_OFF)?;
         while cur != 0 {
             if remaining == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "linked list chain longer than its stored len (a next-pointer cycle?)",
+                return Err(io_error!(
+                    "linked list chain longer than its stored len (a next-pointer cycle?)"
                 ));
             }
             remaining -= 1;
@@ -644,10 +641,9 @@ impl<'a, T: BStackBlock> Iterator for ListIter<'a, T> {
             Ok(len) if len == self.len0 => {}
             Ok(_) => {
                 self.cur = 0;
-                return Some(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Some(Err(io_error!(
                     "BStackLinkedList was mutated during iteration (its length changed); \
-                     the iterator is invalidated",
+                     the iterator is invalidated"
                 )));
             }
             Err(e) => {
@@ -657,9 +653,8 @@ impl<'a, T: BStackBlock> Iterator for ListIter<'a, T> {
         }
         if self.remaining == 0 {
             self.cur = 0;
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "linked list chain longer than its stored len (a next-pointer cycle?)",
+            return Some(Err(io_error!(
+                "linked list chain longer than its stored len (a next-pointer cycle?)"
             )));
         }
         self.remaining -= 1;

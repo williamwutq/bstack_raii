@@ -15,6 +15,7 @@ use bstack::{BStack, BStackOwnedSlice, BStackRange};
 use crate::BStackRaiiAllocator;
 use crate::registry::FileId;
 use crate::types::traits::BStackDrop;
+use crate::util::io_error;
 
 /// A collected teardown transaction: a raw pointer to the installing allocator's
 /// [`BStack`] (its identity, scoping the sink to that file — compared via `BStack`'s
@@ -181,9 +182,8 @@ impl TeardownDepthGuard {
         });
         if depth > MAX_TEARDOWN_DEPTH {
             TEARDOWN_DEPTH.with(|c| c.set(c.get() - 1)); // undo: no guard returned
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "teardown recursion too deep (an owned-reference cycle?)",
+            return Err(io_error!(
+                "teardown recursion too deep (an owned-reference cycle?)"
             ));
         }
         Ok(TeardownDepthGuard)

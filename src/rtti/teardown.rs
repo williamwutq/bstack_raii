@@ -138,9 +138,8 @@ impl RttiRegistry {
                                 .ok_or_else(|| {
                                     io_error!(
                                         InvalidData,
-                                        format!(
-                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                        )
+                                        "[BSTACK0808] no RTTI variant for discriminant {}",
+                                        raw
                                     )
                                 })?;
                             let payload_base = add_off(block_off, e.payload_off as u64)?;
@@ -208,9 +207,7 @@ impl RttiRegistry {
                         // Charge for all elements up front — `n` is untrusted and
                         // the ops are materialized eagerly (see the read walk).
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            io_error!(InvalidData, 
-                                "[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)",
-                            )
+                            io_error!("[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)")
                         })?;
                         let stride = self.shape_stride(&inner, &mut cache)?;
                         for i in 0..n as u64 {

@@ -16,8 +16,7 @@ use crate::types::compiled::rc::{
 use crate::util::{SmallStringMap, io_error, read_u64};
 
 use super::walk::{
-    disc_mask, element_ref_tag, foreign_leaf, move_unsupported, read_disc, shape_has_reference,
-    weak_element_tag,
+    disc_mask, element_ref_tag, foreign_leaf, read_disc, shape_has_reference, weak_element_tag,
 };
 use super::{
     AnyRef, CONTROL_SIZE, FOREIGN_REPR_LEN, ForeignPtr, Moved, RttiBody, RttiField, RttiOrdinal,
@@ -97,10 +96,9 @@ impl RttiRegistry {
                     let strong = read_u64(data, strong_slot)?;
                     return Err(io_error!(
                         InvalidData,
-                        format!(
-                            "[BSTACK0819] RTTI move_out of a shared reference-counted block \
-                         (strong count {strong}); only the sole owner may disassemble it"
-                        )
+                        "[BSTACK0819] RTTI move_out of a shared reference-counted block \
+                         (strong count {}); only the sole owner may disassemble it",
+                        strong
                     ));
                 }
                 (Some(strong_slot), ctrl)
@@ -194,7 +192,8 @@ impl RttiRegistry {
                         .ok_or_else(|| {
                             io_error!(
                                 InvalidData,
-                                format!("[BSTACK0808] no RTTI variant for discriminant {raw}")
+                                "[BSTACK0808] no RTTI variant for discriminant {}",
+                                raw
                             )
                         })?;
                     (
@@ -226,7 +225,8 @@ impl RttiRegistry {
             if map.insert(f.name.clone(), moved).is_some() {
                 return Err(io_error!(
                     InvalidData,
-                    format!("[BSTACK0800] RTTI record has two fields named '{}'", f.name)
+                    "[BSTACK0800] RTTI record has two fields named '{}'",
+                    f.name
                 ));
             }
         }
@@ -385,7 +385,12 @@ impl RttiRegistry {
                     Moved::Array(parts.into())
                 } else if shape_has_reference(inner) {
                     // Any other reference-bearing element we can't flatten one-per-`u64`.
-                    return Err(move_unsupported());
+                    return Err(io_error!(
+                        Unsupported,
+                        "[BSTACK0811] RTTI move_out of an array whose element is a vector (or \
+                         other reference-bearing container that is neither a flat reference, \
+                         an `#[embed]`, nor a nested array) is not yet supported"
+                    ));
                 } else {
                     // A POD array (nested or not): the whole inline run of bytes.
                     let total = mul_off(*n as u64, self.shape_stride(inner, cache)?)?;

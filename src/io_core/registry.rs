@@ -44,6 +44,7 @@ use bstack::{BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice};
 use parking_lot::RwLock;
 
 use crate::primitives::{NonNullOffset, WidePtr};
+use crate::util::io_error;
 use crate::{BStackRaiiAllocator, get_u64};
 
 /// The allocator capability's cross-file projection, defined among the
@@ -293,9 +294,9 @@ impl<'h> FileRegistry<'h> {
         }
         let next = g.paths.len() as u32 + 1; // ids are 1-based; 0 is reserved for SELF
         if next >= FileId::SPECIAL_FLOOR {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "file registry exhausted the ordinary id space",
+            return Err(io_error!(
+                OutOfMemory,
+                "file registry exhausted the ordinary id space"
             ));
         }
         let id = FileId::from_raw(next);
@@ -330,9 +331,9 @@ impl<'h> FileRegistry<'h> {
             && prev != id
             && prev.table_index().is_some_and(|p| g.live[p].is_some())
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "attach: this host is already attached under a different FileId",
+            return Err(io_error!(
+                InvalidInput,
+                "attach: this host is already attached under a different FileId"
             ));
         }
         // Re-attaching an id that is already live (e.g. the same path with a different
@@ -439,12 +440,9 @@ static REGISTRY: OnceLock<FileRegistry<'static>> = OnceLock::new();
 /// once, before any [`attach`]/[`register_path`]. Errors if already initialized.
 pub fn init(registry_path: impl AsRef<Path>) -> io::Result<()> {
     let reg = FileRegistry::open(registry_path.as_ref())?;
-    REGISTRY.set(reg).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "file registry already initialized",
-        )
-    })
+    REGISTRY
+        .set(reg)
+        .map_err(|_| io_error!(AlreadyExists, "file registry already initialized"))
 }
 
 /// The initialized registry, or `None` if [`init`] has not run. `Foreign`
@@ -455,9 +453,9 @@ pub fn get() -> Option<&'static FileRegistry<'static>> {
 
 fn require() -> io::Result<&'static FileRegistry<'static>> {
     REGISTRY.get().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "file registry not initialized, init with `bstack_raii::registry::init` first",
+        io_error!(
+            NotFound,
+            "file registry not initialized, init with `bstack_raii::registry::init` first"
         )
     })
 }

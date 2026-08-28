@@ -18,8 +18,7 @@ use crate::types::compiled::rc::{
 use crate::util::{io_error, read_u64};
 
 use super::walk::{
-    DepthGuard, checked_vec_len, clone_unsupported, disc_mask, foreign_leaf, option_present,
-    read_disc,
+    DepthGuard, checked_vec_len, disc_mask, foreign_leaf, option_present, read_disc,
 };
 use super::{
     BYTEVEC_HEADER, FOREIGN_REPR_LEN, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape,
@@ -98,7 +97,12 @@ impl RttiRegistry {
         if __wp.is_self() {
             self.clone_foreign_in(home, home_data, tag, kind, src_target, new_off)
         } else {
-            let fid = FileId::from_u64(__wp.file_id()).ok_or_else(clone_unsupported)?;
+            let fid = FileId::from_u64(__wp.file_id()).ok_or_else(|| {
+                io_error!(
+                    NotFound,
+                    "[BSTACK080F] RTTI clone: the foreign target names an invalid file id"
+                )
+            })?;
             let host = crate::registry::host_arc(fid).ok_or_else(|| {
                 io_error!(
                     NotFound,
@@ -236,16 +240,14 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                io_error!(
-                    InvalidData,
-                    "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)"
-                )
+                io_error!("[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)")
             })?;
             match op {
                 CloneOp::Block { src_off, ord } => {
                     self.ensure_type(ord, st)?;
                     let size = st.cache[&ord].ondisk_size;
-                    let new_off = self.alloc_copy(alloc, data, src_off, size, st)?;
+                    let new_off =
+                        self.alloc_copy(alloc, NonNullOffset::from_field(src_off)?, size, st)?;
                     st.map.insert(src_off, new_off);
                     // Walk the fields at matching source / destination offsets.
                     let ty = &st.cache[&ord];
@@ -272,10 +274,8 @@ impl RttiRegistry {
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
                                     io_error!(
-                                        InvalidData,
-                                        format!(
-                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                        )
+                                        "[BSTACK0808] no RTTI variant for discriminant {}",
+                                        raw
                                     )
                                 })?;
                             let sp = add_off(src_off, e.payload_off as u64)?;
@@ -321,10 +321,8 @@ impl RttiRegistry {
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
                                     io_error!(
-                                        InvalidData,
-                                        format!(
-                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                        )
+                                        "[BSTACK0808] no RTTI variant for discriminant {}",
+                                        raw
                                     )
                                 })?;
                             let sp = add_off(src_base, e.payload_off as u64)?;
@@ -400,8 +398,8 @@ impl RttiRegistry {
                         // Charge for all elements up front — `n` is untrusted and
                         // the ops are materialized eagerly (see the read walk).
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            io_error!(InvalidData, 
-                                "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)",
+                            io_error!(
+                                "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)"
                             )
                         })?;
                         let stride = self.shape_stride(&inner, &mut st.cache)?;
@@ -432,7 +430,12 @@ impl RttiRegistry {
                         let src_data = read_u64(data, src_off)?; // VecDesc.data_off
                         if src_data != 0 {
                             let data_size = read_u64(data, add_off(src_off, 8)?)?;
-                            let new_data = self.alloc_copy(alloc, data, src_data, data_size, st)?;
+                            let new_data = self.alloc_copy(
+                                alloc,
+                                NonNullOffset::from_field(src_data)?,
+                                data_size,
+                                st,
+                            )?;
                             // Repoint the (freshly-copied) descriptor's data pointer;
                             // its size word was copied verbatim.
                             data.set(new_off, new_data.to_le_bytes())?;
@@ -499,10 +502,7 @@ impl RttiRegistry {
         // Every block is cloned and in `map`; repoint owned child pointers.
         for &(new_slot, src_child) in &st.patches {
             let new_child = *st.map.get(&src_child).ok_or_else(|| {
-                io_error!(
-                    InvalidData,
-                    "[BSTACK080E] RTTI clone: an owned child was not cloned"
-                )
+                io_error!("[BSTACK080E] RTTI clone: an owned child was not cloned")
             })?;
             data.set(new_slot, new_child.to_le_bytes())?;
         }
@@ -511,24 +511,28 @@ impl RttiRegistry {
             refcount::fetch_add(data, NonNullOffset::from_field(off)?, 1)?;
         }
 
-        st.map.get(&root_src).copied().ok_or_else(|| {
-            io_error!(
-                InvalidData,
-                "[BSTACK080E] RTTI clone: the root was not cloned"
-            )
-        })
+        st.map
+            .get(&root_src)
+            .copied()
+            .ok_or_else(|| io_error!("[BSTACK080E] RTTI clone: the root was not cloned"))
     }
 
     /// Allocate a `size`-byte block and byte-copy `[src_off, src_off+size)` into it,
-    /// recording it in `st.allocated`. Returns the new block's start offset.
+    /// recording it in `st.allocated`. Returns the new block's start offset. Source and
+    /// destination are both in `alloc`'s own stack (`alloc.stack()`): the returned range
+    /// is an offset in that file, so the copy must land there — the coupling is derived
+    /// here rather than threaded, so a mismatched `(alloc, data)` pair can't be formed.
+    ///
+    /// `src_off` is a **block start**, taken [`NonNullOffset`] so a `0` (a misread or
+    /// forged source) is rejected up front rather than silently copying the file header.
     fn alloc_copy<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
-        data: &BStack,
-        src_off: u64,
+        src_off: NonNullOffset,
         size: u64,
         st: &mut CloneState,
     ) -> io::Result<u64> {
+        let data = alloc.stack();
         let slice = alloc.alloc(size)?;
         let range = slice.as_range();
         // Log the allocation intention-first so a crash mid-clone leaves it
@@ -541,7 +545,7 @@ impl RttiRegistry {
             return Err(e);
         }
         st.allocated.push(range);
-        data.copy(src_off, range.start(), size)?;
+        data.copy(src_off.as_u64(), range.start(), size)?;
         Ok(range.start())
     }
 

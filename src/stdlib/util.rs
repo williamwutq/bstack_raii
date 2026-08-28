@@ -14,7 +14,7 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 use super::hash::fnv1a;
 use crate::io_core::dealloc_range;
 use crate::types::compiled::HEADER_SIZE;
-use crate::util::{SmallBuf, get_u64, read_u64};
+use crate::util::{SmallBuf, get_u64, io_error, read_u64};
 
 /// Build a `(offset, value)` write-tuple for a `u64` field: little-endian into
 /// an inline [`SmallBuf::Buf8`], no allocation. Replaces the repeated
@@ -375,10 +375,7 @@ where
                 {
                     Some(off) => off,
                     None => {
-                        probe_err = Some(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "corrupt bucket table offset",
-                        ));
+                        probe_err = Some(io_error!("corrupt bucket table offset"));
                         return None; // abort: commit nothing
                     }
                 };
@@ -439,8 +436,7 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
     } else {
         cap0.saturating_mul(2)
     };
-    let overflow_err =
-        || io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table capacity");
+    let overflow_err = || io_error!("corrupt bucket table capacity");
     // Allocate the new bucket block up front (an orphan until the swap).
     let new_size = newcap.checked_mul(stride).ok_or_else(overflow_err)?;
     let newtable = allocator.alloc(new_size)?.as_range().start();
@@ -505,19 +501,13 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
                 // before this generator started) — either a concurrent grow
                 // the abort check above didn't catch, or a corrupted `cap`;
                 // either way `old_buf` (sized for `cap0`) can't hold slot `i`.
-                grow_err = Some(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "bucket table capacity changed during grow",
-                ));
+                grow_err = Some(io_error!("bucket table capacity changed during grow"));
                 return None;
             }
             let off = match i.checked_mul(stride).and_then(|d| m.table.checked_add(d)) {
                 Some(off) => off,
                 None => {
-                    grow_err = Some(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "corrupt bucket table offset",
-                    ));
+                    grow_err = Some(io_error!("corrupt bucket table offset"));
                     return None; // abort: commit nothing
                 }
             };

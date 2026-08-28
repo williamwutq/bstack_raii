@@ -6,6 +6,7 @@ use std::io;
 use bstack::{BStack, BStackRange, BStackSlice};
 
 use super::BStackBlock;
+use crate::util::io_error;
 
 /// A typed reference to a block of type `T`.
 ///
@@ -80,9 +81,10 @@ impl<T: BStackBlock> BStackRef<T> {
     pub fn read_on_disk<'b>(self, stack: &BStack, buf: &'b mut [u8]) -> io::Result<&'b T::OnDisk> {
         let size = core::mem::size_of::<T::OnDisk>();
         if buf.len() < size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("read_on_disk: buffer of {} < OnDisk size {size}", buf.len()),
+            return Err(io_error!(
+                InvalidInput,
+                "read_on_disk: buffer of {} < OnDisk size {size}",
+                buf.len()
             ));
         }
         let dst = &mut buf[..size];
@@ -97,12 +99,10 @@ impl<T: BStackBlock> BStackRef<T> {
             .align_offset(core::mem::align_of::<T::OnDisk>())
             != 0
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "read_on_disk: buffer not aligned to {} for T::OnDisk",
-                    core::mem::align_of::<T::OnDisk>()
-                ),
+            return Err(io_error!(
+                InvalidInput,
+                "read_on_disk: buffer not aligned to {} for T::OnDisk",
+                core::mem::align_of::<T::OnDisk>()
             ));
         }
         // `read_into` fills `min(dst.len(), block.len())`; for a fixed-size block

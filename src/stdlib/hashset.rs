@@ -46,7 +46,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
-use crate::util::{SmallBuf, get_u64, read_u64};
+use crate::util::{SmallBuf, get_u64, io_error, read_u64};
 
 /// The on-disk image of a [`BStackHashSet`]: header, bucket-block pointer,
 /// bucket count `cap`, key count `len`, `used` (occupied + tombstone), and the
@@ -102,7 +102,7 @@ fn place_writes(
     let off = target
         .checked_mul(stride)
         .and_then(|d| m.table.checked_add(d))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table offset"))?;
+        .ok_or_else(|| io_error!("corrupt bucket table offset"))?;
     let mut w = vec![
         (off, SmallBuf::Heap(img.into_boxed_slice())),
         w8(handle + LEN_OFF, m.len + 1),
@@ -347,12 +347,7 @@ impl<K: Pod> BStackHashSet<K> {
                     let step = idx
                         .checked_mul(stride)
                         .and_then(|d| m.table.checked_add(d))
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "corrupt bucket table offset",
-                            )
-                        })
+                        .ok_or_else(|| io_error!("corrupt bucket table offset"))
                         .map(|off| vec![w8(off, TOMBSTONE), w8(handle + LEN_OFF, m.len - 1)]);
                     ProbeStep::Stop(step)
                 } else {
@@ -381,9 +376,7 @@ impl<K: Pod> BStackHashSet<K> {
             let bucket = idx
                 .checked_mul(stride)
                 .and_then(|d| table.checked_add(d))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "corrupt bucket table offset")
-                })?;
+                .ok_or_else(|| io_error!("corrupt bucket table offset"))?;
             let buf = scratch.buf(stride as usize);
             stack.get_into(bucket, buf)?;
             let state = get_u64(&buf[0..8]);
@@ -476,14 +469,11 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
 
         let new_table = if cap != 0 {
             // Untrusted `cap`: checked math + stack bound before allocating.
-            let table_size = cap.checked_mul(stride).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "hash set capacity overflow")
-            })?;
+            let table_size = cap
+                .checked_mul(stride)
+                .ok_or_else(|| io_error!("hash set capacity overflow"))?;
             if table_size > allocator.stack().len()? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "hash set bucket block larger than the stack",
-                ));
+                return Err(io_error!("hash set bucket block larger than the stack"));
             }
             let mut image = vec![0u8; table_size as usize];
             allocator.stack().get_into(table, &mut image)?;
@@ -566,10 +556,9 @@ impl<'a, K: Pod> Iterator for HashSetIter<'a, K> {
                     if table == self.table && cap == self.cap && len == self.len => {}
                 Ok(_) => {
                     self.idx = self.cap;
-                    return Some(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Some(Err(io_error!(
                         "BStackHashSet was mutated during iteration (its table/len \
-                         changed); the iterator is invalidated",
+                         changed); the iterator is invalidated"
                     )));
                 }
                 Err(e) => {

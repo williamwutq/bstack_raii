@@ -46,7 +46,7 @@ use super::{BStackOwned, BStackRc, BStackWeak, WeakRef};
 use crate::handback::ReplaceError;
 use crate::io_core::{ClonePlan, dealloc_range};
 use crate::primitives::{NonNullOffset, Offset};
-use crate::util::{get_u64, put_u64};
+use crate::util::{get_u64, io_error, put_u64};
 
 /// The on-disk header length of a `BStackByteVec` block: `len: u64` @ 0,
 /// `cap: u64` @ 8, elements from offset 16. Fixed by bstack's ABI (stable across
@@ -354,7 +354,7 @@ impl<'a, T: Pod, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
         // original, huge `len` into it below).
         let new_len = len
             .checked_add(elem)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "vector length overflow"))?;
+            .ok_or_else(|| io_error!("vector length overflow"))?;
 
         if new_len <= cap || self.writeback.is_none() {
             let mut bytevec = bytevec;

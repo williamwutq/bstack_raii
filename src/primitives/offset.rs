@@ -8,7 +8,7 @@ use std::{fmt, io};
 use bstack::{BStackRange, BStackSlice};
 use bytemuck::{Pod, Zeroable};
 
-use crate::util::io_errorfn;
+use crate::util::{io_error, io_errorfn};
 
 /// A byte address into a bstack file's stack — the target half of a wide pointer,
 /// and the currency of every on-disk read/write.
@@ -161,7 +161,7 @@ impl NonNullOffset {
     /// the [`NonNullOffset`] the counter ops ([`crate::io_core::refcount`]) require.
     #[inline]
     pub fn from_field(off: u64) -> io::Result<NonNullOffset> {
-        Self::new(Offset::from_raw(off)).ok_or_else(null_field_offset)
+        Self::new(Offset::from_raw(off)).ok_or_else(|| io_error!("field offset resolved to null"))
     }
 }
 
@@ -225,13 +225,6 @@ io_errorfn!(
     InvalidData,
     "on-disk offset arithmetic overflow"
 );
-io_errorfn!(
-    null_field_offset,
-    InvalidData,
-    "field offset resolved to null"
-);
-
-io_errorfn!(block_offset_overflow, InvalidData, "block offset overflow");
 
 /// Add a small field-offset constant to a base offset, rejecting overflow.
 /// The base routinely originates from an on-disk pointer that can be corrupted
@@ -244,5 +237,6 @@ io_errorfn!(block_offset_overflow, InvalidData, "block offset overflow");
 /// compile-time constant delta.
 #[inline(always)]
 pub fn checked_off(base: u64, delta: u64) -> io::Result<u64> {
-    base.checked_add(delta).ok_or_else(block_offset_overflow)
+    base.checked_add(delta)
+        .ok_or_else(|| io_error!("block offset overflow"))
 }

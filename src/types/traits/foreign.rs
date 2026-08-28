@@ -40,6 +40,7 @@ use crate::primitives::{BrandedWidePtr, Offset, WidePtr};
 #[cfg(test)]
 use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
+use crate::util::io_error;
 
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or
 /// [`SELF`](FileId::SELF) (an address in the file it was read from, bound to that file's
@@ -174,9 +175,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         } else {
             let id = self.inner.file();
             registry::with_host(id, |host| f(t, host.stack()))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
-                })
+                .ok_or_else(|| io_error!(NotFound, "Foreign: target file not attached"))
                 .map(Some)
         }
     }
@@ -221,9 +220,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
             let id = self.inner.file();
             registry
                 .with_host(id, |host| f(t, host.stack()))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "Foreign: target file not attached")
-                })
+                .ok_or_else(|| io_error!(NotFound, "Foreign: target file not attached"))
                 .map(Some)
         }
     }

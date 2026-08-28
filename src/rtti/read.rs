@@ -11,9 +11,7 @@ use bstack::BStack;
 use crate::primitives::{EightCC, WidePtr};
 use crate::util::{io_error, read_u64};
 
-use super::walk::{
-    budget_exceeded, checked_vec_len, disc_mask, option_present, pop_n, pop_named, read_disc,
-};
+use super::walk::{checked_vec_len, disc_mask, option_present, pop_n, pop_named, read_disc};
 use super::{
     AnyRef, BYTEVEC_HEADER, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, Value, add_off,
     mul_off, unknown_tag,
@@ -133,9 +131,8 @@ impl RttiRegistry {
                                 .ok_or_else(|| {
                                     io_error!(
                                         InvalidData,
-                                        format!(
-                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                        )
+                                        "[BSTACK0808] no RTTI variant for discriminant {}",
+                                        raw
                                     )
                                 })?;
                             let names = variant.fields.iter().map(|f| f.name.clone()).collect();
@@ -235,7 +232,12 @@ impl RttiRegistry {
                         // arm does — `n` comes off an untrusted record, and the ops
                         // are materialized eagerly, so an absurd count must fail
                         // cleanly rather than pre-allocate past the budget.
-                        budget = budget.checked_sub(n as u64).ok_or_else(budget_exceeded)?;
+                        budget = budget.checked_sub(n as u64).ok_or_else(|| {
+                            io_error!(
+                                InvalidData,
+                                "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+                            )
+                        })?;
                         let stride = self.shape_stride(&inner, &mut cache)?;
                         let elem_ops: Vec<Op> = (0..n as u64)
                             .map(|i| -> io::Result<Op> {
@@ -264,7 +266,12 @@ impl RttiRegistry {
                             // Charge the budget for all elements up front — the ops are
                             // materialized eagerly, so a huge (but in-block) length must
                             // fail cleanly rather than pre-allocate past the budget.
-                            budget = budget.checked_sub(len).ok_or_else(budget_exceeded)?;
+                            budget = budget.checked_sub(len).ok_or_else(|| {
+                                io_error!(
+                                    InvalidData,
+                                    "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+                                )
+                            })?;
                             let elem_ops: Vec<Op> = (0..len)
                                 .map(|i| -> io::Result<Op> {
                                     Ok(Op::Shape {
@@ -324,9 +331,9 @@ impl RttiRegistry {
                     results.push(Value::Tuple(v.into()));
                 }
                 Op::MakeSome => {
-                    let inner = results.pop().ok_or_else(|| {
-                        io_error!(InvalidData, "[BSTACK0809] RTTI interpret stack underflow")
-                    })?;
+                    let inner = results
+                        .pop()
+                        .ok_or_else(|| io_error!("[BSTACK0809] RTTI interpret stack underflow"))?;
                     results.push(Value::Some(Box::new(inner)));
                 }
             }
@@ -336,7 +343,8 @@ impl RttiRegistry {
             1 => Ok(results.pop().unwrap()),
             n => Err(io_error!(
                 InvalidData,
-                format!("[BSTACK0809] RTTI interpret produced {n} values (expected 1)")
+                "[BSTACK0809] RTTI interpret produced {} values (expected 1)",
+                n
             )),
         }
     }

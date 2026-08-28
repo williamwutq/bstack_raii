@@ -58,6 +58,7 @@ use crate::types::compiled::owned::BStackOwned;
 use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
 use crate::types::compiled::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::types::traits::{BStackBlock, BStackRef, BStackShared};
+use crate::util::io_error;
 
 /// Deep-clone a whole block into a fresh, independent [`BStackOwned`] copy,
 /// allocating the copy with the supplied allocator.
@@ -201,8 +202,12 @@ impl ClonePlan {
             Mode::Measure => {
                 self.sizes.push(size);
                 let off = self.fake_next;
-                // NOTE: in theory, saturating_add will make some fake)next return the same thing
-                // for very large numbers. This could be a concern but could not
+                // `saturating_add` (not `+`) on purpose. A real object graph can never
+                // sum to 2^64 bytes, but if it somehow did, saturating pins `fake_next`
+                // at `u64::MAX` — still non-zero, the one invariant these throwaway
+                // offsets hold — whereas wrapping could land it back on `0`, the null
+                // niche. Distinctness is lost at that unreachable ceiling, but a measured
+                // offset is never committed or dereferenced, so a collision is harmless.
                 self.fake_next = self.fake_next.saturating_add(size.max(1));
                 Ok(BStackRange::new(off, size))
             }
@@ -576,10 +581,7 @@ impl ClonePlan {
         match result {
             Ok(()) if overflow => {
                 Self::reclaim(&wal, allocated, allocator);
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "refcount overflow while committing clone",
-                ))
+                Err(io_error!("refcount overflow while committing clone"))
             }
             Ok(()) => {
                 // Committed — the WAL was flipped `Complete` in the same batch. A

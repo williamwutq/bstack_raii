@@ -64,7 +64,7 @@ use crate::io_core::dealloc_range;
 use crate::primitives::{NonNullOffset, Offset};
 use crate::registry::{self, FileId};
 use crate::util::bytes::read_u64;
-use crate::util::io_errorfn;
+use crate::util::{io_error, io_errorfn};
 
 // --- On-disk constants ------------------------------------------------------
 
@@ -465,11 +465,11 @@ impl HeldLock {
     pub(crate) fn acquire<A: BStackRaiiAllocator>(allocator: &A) -> io::Result<Self> {
         let key = core::ptr::from_ref(allocator.stack()) as usize;
         if HELD_CLONE_LOCKS.with(|h| h.borrow().contains(&key)) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
+            return Err(io_error!(
+                WouldBlock,
                 "clone re-entered a file already being cloned on this thread (an owned \
                  cross-file cycle, or a `Foreign` that resolves to the home file); this \
-                 would deadlock on the per-file WAL lock",
+                 would deadlock on the per-file WAL lock"
             ));
         }
         let arc = wal_lock_for(allocator);

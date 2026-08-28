@@ -110,7 +110,6 @@ impl RttiRegistry {
         let ordinal = self.records.len() as RttiOrdinal;
         if self.by_tag.insert(tag, ordinal).is_some() {
             return Err(io_error!(
-                InvalidData,
                 "[BSTACK0800] duplicate RTTI eightcc — two types share one tag",
             ));
         }
@@ -158,11 +157,10 @@ impl RttiRegistry {
                 if prev.name != ty.name {
                     return Err(io_error!(
                         InvalidData,
-                        format!(
-                            "[BSTACK0806] RTTI eightcc collision: '{}' and '{}' \
+                        "[BSTACK0806] RTTI eightcc collision: '{}' and '{}' \
                          hash to one tag",
-                            prev.name, ty.name
-                        )
+                        prev.name,
+                        ty.name
                     ));
                 }
                 // Same tag AND same name is still a collision when the layouts
@@ -172,12 +170,10 @@ impl RttiRegistry {
                 if !layouts_match(prev, &ty) {
                     return Err(io_error!(
                         InvalidData,
-                        format!(
-                            "[BSTACK0806] RTTI eightcc collision: two distinct types \
+                        "[BSTACK0806] RTTI eightcc collision: two distinct types \
                          both named '{}' (same-named types in different modules?) \
                          share one tag",
-                            ty.name
-                        )
+                        ty.name
                     ));
                 }
                 continue; // same type registered twice — nothing to do
@@ -192,11 +188,10 @@ impl RttiRegistry {
                         // Different type, same tag — an eightcc collision.
                         return Err(io_error!(
                             InvalidData,
-                            format!(
-                                "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
+                            "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
                              compiled '{}' share one tag",
-                                existing.name, ty.name
-                            )
+                            existing.name,
+                            ty.name
                         ));
                     }
                     if !layouts_match(&existing, &ty) {
@@ -211,13 +206,11 @@ impl RttiRegistry {
                         // type. Reject rather than silently keep the stale descriptor.
                         return Err(io_error!(
                             InvalidData,
-                            format!(
-                                "[BSTACK0814] RTTI schema mismatch for '{}': the persisted \
+                            "[BSTACK0814] RTTI schema mismatch for '{}': the persisted \
                              layout differs from the compiled type (a field was added, \
                              removed, reordered, or resized). The on-disk data was \
                              written against the old layout.",
-                                ty.name
-                            )
+                            ty.name
                         ));
                     }
                 }

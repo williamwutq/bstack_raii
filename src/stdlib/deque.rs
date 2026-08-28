@@ -46,7 +46,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
-use crate::util::{SmallBuf, read_u64};
+use crate::util::{SmallBuf, io_error, read_u64};
 
 /// The on-disk image of a [`BStackDeque`]: the block header, a pointer to the
 /// ring data block (`0` = none), its capacity in slots, and the circular
@@ -76,10 +76,6 @@ const LEN_OFF: u64 = HEADER_SIZE + 24; // 40
 const DEQUE_SIZE: u64 = size_of::<DequeOnDisk>() as u64;
 /// The capacity a freshly grown empty ring starts at.
 const MIN_CAP: u64 = 4;
-
-fn overflow_err() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "deque offset overflow")
-}
 
 /// An owned double-ended queue of `T` blocks.
 ///
@@ -121,9 +117,8 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// used for an address.
     fn ring_index(head: u64, x: u64, cap: u64) -> io::Result<u64> {
         if cap == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt deque: zero capacity with a nonzero length",
+            return Err(io_error!(
+                "corrupt deque: zero capacity with a nonzero length"
             ));
         }
         Ok(head.wrapping_add(x) % cap)
@@ -135,9 +130,9 @@ impl<T: BStackBlock> BStackDeque<T> {
     fn slot_addr(data: u64, idx: u64) -> io::Result<u64> {
         let delta = idx
             .checked_mul(8)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque offset overflow"))?;
+            .ok_or_else(|| io_error!("deque offset overflow"))?;
         data.checked_add(delta)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque offset overflow"))
+            .ok_or_else(|| io_error!("deque offset overflow"))
     }
 
     /// Allocate an empty deque (no ring is allocated until the first push).
@@ -414,7 +409,7 @@ impl<T: BStackBlock> BStackDeque<T> {
         // Allocate the new ring up front (an orphan until the commit swaps to it).
         let new_size = newcap
             .checked_mul(8)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque capacity overflow"))?;
+            .ok_or_else(|| io_error!("deque capacity overflow"))?;
         let newring = allocator.alloc(new_size)?.as_range().start();
 
         let grown = Cell::new(false);
@@ -455,8 +450,12 @@ impl<T: BStackBlock> BStackDeque<T> {
                     // Copy every live element to the front of the new ring.
                     for (i, &r) in v2.iter().enumerate() {
                         let off = newring
-                            .checked_add((i as u64).checked_mul(8).ok_or_else(overflow_err)?)
-                            .ok_or_else(overflow_err)?;
+                            .checked_add(
+                                (i as u64)
+                                    .checked_mul(8)
+                                    .ok_or_else(|| io_error!("deque offset overflow"))?,
+                            )
+                            .ok_or_else(|| io_error!("deque offset overflow"))?;
                         w.push(w8(off, r));
                     }
                     // Swap the descriptor to the new ring, re-based at head 0.
@@ -516,12 +515,9 @@ impl<T: BStackBlock> BStackDeque<T> {
         // stack before sizing an allocation with it (as `string.rs` does).
         let ring_bytes = len
             .checked_mul(8)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque length overflow"))?;
+            .ok_or_else(|| io_error!("deque length overflow"))?;
         if ring_bytes > stack.len()? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "deque length larger than the stack",
-            ));
+            return Err(io_error!("deque length larger than the stack"));
         }
         let mut out = Vec::with_capacity(len as usize);
         for i in 0..len {
@@ -592,9 +588,9 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
             }
         }
         if data != 0 {
-            let size = cap.checked_mul(8).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "deque capacity overflow")
-            })?;
+            let size = cap
+                .checked_mul(8)
+                .ok_or_else(|| io_error!("deque capacity overflow"))?;
             // SAFETY: the deque solely owns its ring block.
             unsafe { dealloc_range(allocator, BStackRange::new(data, size))? };
         }
@@ -616,12 +612,9 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
         // (see `to_vec`); `ring_bytes` is also the fresh ring's size below.
         let ring_bytes = len
             .checked_mul(8)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "deque length overflow"))?;
+            .ok_or_else(|| io_error!("deque length overflow"))?;
         if ring_bytes > allocator.stack().len()? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "deque length larger than the stack",
-            ));
+            return Err(io_error!("deque length larger than the stack"));
         }
         // Deep-clone each element (in logical order) into the plan.
         let mut dsts = Vec::with_capacity(len as usize);
@@ -713,17 +706,16 @@ impl<'a, T: BStackBlock> Iterator for DequeIter<'a, T> {
         // checking `data`/`cap` alone would miss it and later read a stale offset a
         // `T` handle could then free (use-after-free). Compare all four snapshot
         // fields — pure iteration never touches them, so any change is a mutation —
-        // and turn it into a clean `InvalidData` error.
+        // and turn it into a clean error.
         match BStackDeque::<T>::read_meta(self.stack, self.block_off) {
             Ok((head, len, cap, data))
                 if data == self.data && cap == self.cap && head == self.head && len == self.len => {
             }
             Ok(_) => {
                 self.pos = self.len;
-                return Some(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                return Some(Err(io_error!(
                     "BStackDeque was mutated during iteration (its head/len/ring \
-                     changed); the iterator is invalidated",
+                     changed); the iterator is invalidated"
                 )));
             }
             Err(e) => {

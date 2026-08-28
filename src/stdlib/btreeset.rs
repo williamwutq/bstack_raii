@@ -33,7 +33,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
-use crate::util::{SmallBuf, get_u64, read_u64};
+use crate::util::{SmallBuf, get_u64, io_error, io_errorfn, read_u64};
 
 /// The on-disk image of a [`BStackBTreeSet`]: header, root node pointer (`0` =
 /// empty), key count, and the embedded Bloom filter's handle offset.
@@ -66,12 +66,11 @@ const MAXKEYS: usize = 2 * T - 1; // 15
 /// walks.
 const MAX_TREE_DEPTH: u32 = 64;
 
-fn depth_exceeded() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "B-tree deeper than the structural bound (corrupt child pointer or a cycle?)",
-    )
-}
+io_errorfn!(
+    depth_exceeded,
+    InvalidData,
+    "B-tree deeper than the structural bound (corrupt child pointer or a cycle?)"
+);
 const MAXCHILDREN: usize = 2 * T; // 16
 
 const NKEYS_OFF: usize = HEADER_SIZE as usize; // 16
@@ -211,10 +210,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         // `node_size()`-byte buffer) past its end, panicking on a plain
         // `contains` read. No real node ever exceeds `MAXKEYS`.
         if nkeys > MAXKEYS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt B-tree node: key count exceeds capacity",
-            ));
+            return Err(io_error!("corrupt B-tree node: key count exceeds capacity"));
         }
         let leaf = get_u64(&b[LEAF_OFF..]) != 0;
         let ksize = Self::ksize();
@@ -413,10 +409,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             stack.get_into(off, buf)?;
             let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
             if nkeys > MAXKEYS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "corrupt B-tree node: key count exceeds capacity",
-                ));
+                return Err(io_error!("corrupt B-tree node: key count exceeds capacity"));
             }
             let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
             let mut i = nkeys;
@@ -442,17 +435,14 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     /// The number of keys in the node at `off`. `off` comes from a parent
     /// node's on-disk `children` array — untrusted.
     fn child_nkeys(stack: &BStack, off: u64) -> io::Result<usize> {
-        let pos = off.checked_add(NKEYS_OFF as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "corrupt B-tree child offset")
-        })?;
+        let pos = off
+            .checked_add(NKEYS_OFF as u64)
+            .ok_or_else(|| io_error!("corrupt B-tree child offset"))?;
         let mut b = [0u8; 8];
         stack.get_into(pos, &mut b)?;
         let nkeys = get_u64(&b) as usize;
         if nkeys > MAXKEYS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt B-tree node: key count exceeds capacity",
-            ));
+            return Err(io_error!("corrupt B-tree node: key count exceeds capacity"));
         }
         Ok(nkeys)
     }
@@ -859,10 +849,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         stack.get_into(off, &mut buf)?;
         let nkeys = get_u64(&buf[NKEYS_OFF..]) as usize;
         if nkeys > MAXKEYS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt B-tree node: key count exceeds capacity",
-            ));
+            return Err(io_error!("corrupt B-tree node: key count exceeds capacity"));
         }
         let leaf = get_u64(&buf[LEAF_OFF..]) != 0;
         let children_off = Self::children_off();
@@ -1001,10 +988,9 @@ impl<'a, K: Pod + Ord> Iterator for BTreeSetIter<'a, K> {
                 Ok([root, len]) if root == self.root0 && len == self.len0 => {}
                 Ok(_) => {
                     self.frames.clear();
-                    return Some(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Some(Err(io_error!(
                         "BStackBTreeSet was mutated during iteration (its root changed); \
-                         the iterator is invalidated",
+                         the iterator is invalidated"
                     )));
                 }
                 Err(e) => {

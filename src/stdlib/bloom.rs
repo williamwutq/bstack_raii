@@ -47,7 +47,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast};
-use crate::util::{SmallBuf, read_u64};
+use crate::util::{SmallBuf, io_error, read_u64};
 
 /// The on-disk image of a [`BStackCountingBloomFilter`]: header, counter-array
 /// pointer (`0` = none), counter count `m`, hash count `k`, and inserted-item
@@ -94,10 +94,7 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     /// embedded filter.
     fn indices(m: u64, k: u64, key_bytes: &[u8]) -> io::Result<Vec<u64>> {
         if m == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt bloom filter: zero counter count",
-            ));
+            return Err(io_error!("corrupt bloom filter: zero counter count"));
         }
         let (h1, h2) = double_hash(key_bytes);
         Ok((0..k)
@@ -214,9 +211,9 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
         let key_bytes = bytemuck::bytes_of(key);
         for idx in Self::indices(m, k, key_bytes)? {
             let mut b = [0u8; 1];
-            let off = data.checked_add(idx).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "bloom filter offset overflow")
-            })?;
+            let off = data
+                .checked_add(idx)
+                .ok_or_else(|| io_error!("bloom filter offset overflow"))?;
             stack.get_into(off, &mut b)?;
             if b[0] == 0 {
                 return Ok(false);
@@ -251,9 +248,8 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
         let offs: Vec<u64> = agg
             .iter()
             .map(|&(idx, _)| {
-                data.checked_add(idx).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "bloom filter offset overflow")
-                })
+                data.checked_add(idx)
+                    .ok_or_else(|| io_error!("bloom filter offset overflow"))
             })
             .collect::<io::Result<Vec<u64>>>()?;
 

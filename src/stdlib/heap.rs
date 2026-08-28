@@ -40,7 +40,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
-use crate::util::{SmallBuf, get_u64, read_u64};
+use crate::util::{SmallBuf, get_u64, io_error, read_u64};
 
 /// The on-disk image of a [`BStackBinaryHeap`]: header, array-block pointer
 /// (`0` = none), capacity in slots, and element count. Non-generic.
@@ -85,9 +85,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
     fn slot_off(data: u64, i: u64) -> io::Result<u64> {
         let delta = i
             .checked_mul(Self::stride())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap slot overflow"))?;
+            .ok_or_else(|| io_error!("heap slot overflow"))?;
         data.checked_add(delta)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap slot overflow"))
+            .ok_or_else(|| io_error!("heap slot overflow"))
     }
 
     fn value_size() -> u64 {
@@ -333,21 +333,18 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         // still reflects the old count) or panic under overflow-checks; reject
         // it instead of ever installing a smaller-or-equal capacity.
         if newcap <= cap {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt heap capacity",
-            ));
+            return Err(io_error!("corrupt heap capacity"));
         }
         let new_size = newcap
             .checked_mul(stride)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "heap capacity overflow"))?;
+            .ok_or_else(|| io_error!("heap capacity overflow"))?;
         let newdata = allocator.alloc(new_size)?.as_range().start();
 
         // Copy the live elements into the new (orphan) array.
         if len > 0 {
-            let len_size = len.checked_mul(stride).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "heap length overflow")
-            })?;
+            let len_size = len
+                .checked_mul(stride)
+                .ok_or_else(|| io_error!("heap length overflow"))?;
             let mut buf = vec![0u8; len_size as usize];
             allocator.stack().get_into(data, &mut buf)?;
             allocator.stack().set(newdata, buf)?;
@@ -418,9 +415,9 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
             }
         }
         if data != 0 {
-            let size = cap.checked_mul(Self::stride()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "heap capacity overflow")
-            })?;
+            let size = cap
+                .checked_mul(Self::stride())
+                .ok_or_else(|| io_error!("heap capacity overflow"))?;
             // SAFETY: the heap solely owns its array block.
             unsafe { dealloc_range(allocator, BStackRange::new(data, size))? };
         }
@@ -442,14 +439,11 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
         let (new_data, new_cap) = if len > 0 {
             // Untrusted `len`: checked math + stack bound, matching the grow
             // path's `checked_mul` guards.
-            let arr_size = len.checked_mul(stride).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "heap length overflow")
-            })?;
+            let arr_size = len
+                .checked_mul(stride)
+                .ok_or_else(|| io_error!("heap length overflow"))?;
             if arr_size > allocator.stack().len()? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "heap element array larger than the stack",
-                ));
+                return Err(io_error!("heap element array larger than the stack"));
             }
             let mut image = vec![0u8; arr_size as usize];
             allocator.stack().get_into(data, &mut image)?;

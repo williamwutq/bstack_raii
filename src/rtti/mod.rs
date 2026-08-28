@@ -63,7 +63,7 @@ use std::io;
 
 use crate::primitives::WidePtr;
 use crate::types::compiled::rc::CTRL_DATA_OFFSET;
-use crate::util::io_error;
+use crate::util::{io_error, io_errorfn};
 
 mod clone;
 mod field;
@@ -116,14 +116,14 @@ pub(in crate::rtti) const RECORD_HEADER_LEN: u64 = 16;
 /// release build. Reject cleanly instead.
 pub(in crate::rtti) fn add_off(a: u64, b: u64) -> io::Result<u64> {
     a.checked_add(b)
-        .ok_or_else(|| io_error!(InvalidData, "[BSTACK081A] RTTI offset arithmetic overflow"))
+        .ok_or_else(|| io_error!("[BSTACK081A] RTTI offset arithmetic overflow"))
 }
 
 /// Multiply an on-disk element stride by an index, rejecting overflow — the
 /// `mul` counterpart of [`add_off`] for `Array`/`Vec` element offsets.
 pub(in crate::rtti) fn mul_off(a: u64, b: u64) -> io::Result<u64> {
     a.checked_mul(b)
-        .ok_or_else(|| io_error!(InvalidData, "[BSTACK081A] RTTI offset arithmetic overflow"))
+        .ok_or_else(|| io_error!("[BSTACK081A] RTTI offset arithmetic overflow"))
 }
 
 /// Narrow a compile-time-fixed layout quantity (a field's `offset_of!`, a POD
@@ -142,17 +142,19 @@ pub fn rtti_narrow_u32(x: usize, what: &str) -> u32 {
     })
 }
 
-/// Error for an RTTI record component whose length overflows its fixed on-disk field
-/// width. Encode-side lengths (name, field/variant count, tuple arity, shape length,
-/// class-value length, body length) are written as `u8`/`u16`/`u32`; a type too large
-/// or too deeply nested to serialize is rejected at `append`/`sync` **before** a
-/// silently-truncated, permanently-unreadable record is written.
-pub(in crate::rtti) fn too_large(what: &str, limit: &str) -> io::Error {
-    io_error!(
-        InvalidData,
-        format!("[BSTACK0817] RTTI {what} exceeds the maximum encodable size ({limit})")
-    )
-}
+io_errorfn!(
+    /// Error for an RTTI record component whose length overflows its fixed on-disk
+    /// field width. Encode-side lengths (name, field/variant count, tuple arity,
+    /// shape length, class-value length, body length) are written as
+    /// `u8`/`u16`/`u32`; a type too large or too deeply nested to serialize is
+    /// rejected at `append`/`sync` **before** a silently-truncated,
+    /// permanently-unreadable record is written.
+    pub(in crate::rtti) too_large(what: &str, limit: &str),
+    InvalidData,
+    "[BSTACK0817] RTTI {} exceeds the maximum encodable size ({})",
+    what,
+    limit
+);
 
 /// Build an RTTI-typed pointer: a [`WidePtr`] to `(file_id, offset)` tagged
 /// with `ordinal`. `file_id == 0` ⇒ `SELF`. For an untyped pointer (type recovered
@@ -201,12 +203,11 @@ pub(in crate::rtti) const HEADER_TAG_OFFSET: u64 = 8;
 /// control layout does not depend on `T`).
 pub(in crate::rtti) const CONTROL_SIZE: u64 = CTRL_DATA_OFFSET + 8;
 
-pub(in crate::rtti) fn unknown_tag() -> io::Error {
-    io_error!(
-        InvalidData,
-        "[BSTACK080B] RTTI pointer/field references an unregistered type tag"
-    )
-}
+io_errorfn!(
+    pub(in crate::rtti) unknown_tag,
+    InvalidData,
+    "[BSTACK080B] RTTI pointer/field references an unregistered type tag"
+);
 
 #[cfg(test)]
 mod tests {

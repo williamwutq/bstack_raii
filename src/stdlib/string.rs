@@ -32,7 +32,7 @@ use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast};
-use crate::util::read_u64;
+use crate::util::{io_error, read_u64};
 
 /// The on-disk image of a [`BStackString`]: header, a pointer to the UTF-8 bytes
 /// block (`0` = empty), and the byte length. `#[repr(C)]`, `u64` fields only —
@@ -123,10 +123,7 @@ impl BStackString {
         // len]` aborts via `handle_alloc_error` on failure, uncatchable unlike
         // a panic. A string's bytes can never exceed the file itself.
         if len > stack.len()? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupt string length exceeds file size",
-            ));
+            return Err(io_error!("corrupt string length exceeds file size"));
         }
         let mut buf = vec![0u8; len as usize];
         stack.get_into(data, &mut buf)?;
@@ -135,8 +132,7 @@ impl BStackString {
 
     /// Read the contents as a `String` (validating UTF-8).
     pub fn to_string(&self, stack: &BStack) -> io::Result<String> {
-        String::from_utf8(self.read_bytes(stack)?)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        String::from_utf8(self.read_bytes(stack)?).map_err(|e| io_error!(e))
     }
 
     /// Replace the contents with `s`, atomically swapping in the new bytes block
@@ -207,9 +203,9 @@ impl BStackString {
             return Ok(());
         }
         if !cur.is_char_boundary(new_len) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "truncate: byte index is not a UTF-8 char boundary",
+            return Err(io_error!(
+                InvalidInput,
+                "truncate: byte index is not a UTF-8 char boundary"
             ));
         }
         cur.truncate(new_len);
@@ -295,10 +291,7 @@ impl BStackBlock for BStackString {
             // See `read_bytes`: a corrupted `len` must not size an unbounded
             // allocation — bound it by the file's own size first.
             if len > allocator.stack().len()? {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "corrupt string length exceeds file size",
-                ));
+                return Err(io_error!("corrupt string length exceeds file size"));
             }
             let mut bytes = vec![0u8; len as usize];
             allocator.stack().get_into(data, &mut bytes)?;
