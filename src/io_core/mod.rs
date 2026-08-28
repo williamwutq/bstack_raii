@@ -34,4 +34,6 @@ pub use wal::{STD_WAL_ANCHOR, finish};
 
 // Crate-internal mechanism (not part of the public API).
 pub(crate) use teardown::TeardownDepthGuard;
-pub(crate) use wal::{WalStatus, WalTxn, commit_frees, commit_home_frees, wal_lock_for};
+pub(crate) use wal::{
+    WalStatus, WalTxn, alloc_logged, commit_frees, commit_home_frees, wal_lock_for,
+};

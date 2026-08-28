@@ -235,44 +235,11 @@ impl ClonePlan {
                 Ok(range)
             }
             // Single pass: allocate eagerly and log it intention-first, keeping the
-            // allocation and its WAL entry in lockstep with `allocated`.
+            // allocation and its WAL entry in lockstep with `allocated` (shared with
+            // the RTTI interpreter's clone).
             Mode::Direct => {
-                let slice = allocator.alloc(size)?;
-                let range = slice.as_range();
-                if allocator.wal_anchor().is_some()
-                    && let Err(e) = self.wal_log_alloc(allocator, range)
-                {
-                    // Keep `allocated`/logged in sync: undo this alloc, log nothing.
-                    let _ = allocator.dealloc(slice);
-                    return Err(e);
-                }
-                self.allocated.push(range);
-                Ok(range)
+                crate::io_core::alloc_logged(allocator, &mut self.wal, &mut self.allocated, size)
             }
-        }
-    }
-
-    /// Log a just-made allocation to the intention-first WAL, (lazily) beginning
-    /// the transaction on the first call. Cheap append (one entry + a `count` bump)
-    /// while the block has spare slots; a full re-[`persist_at`] — which grows the
-    /// block — when it is full. `self.allocated` does **not** yet contain `range`
-    /// (the caller pushes it only after this succeeds), so the grow path logs the
-    /// whole of `allocated` *plus* `range`.
-    fn wal_log_alloc<A: BStackRaiiAllocator>(
-        &mut self,
-        allocator: &A,
-        range: BStackRange,
-    ) -> io::Result<()> {
-        match &mut self.wal {
-            // First allocation: begin the transaction (taking the file's WAL lock for
-            // the whole descent) with this one entry.
-            None => {
-                self.wal = Some(WalTxn::begin(allocator, range)?);
-                Ok(())
-            }
-            // `self.allocated` holds exactly what is already logged (the caller pushes
-            // `range` only after this succeeds), so it is the grow-path re-log set.
-            Some(w) => w.append(allocator, &self.allocated, range),
         }
     }
 

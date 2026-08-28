@@ -9,7 +9,7 @@ use std::io;
 use bstack::{BStack, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::io_core::{WalTxn, refcount};
+use crate::io_core::{WalTxn, alloc_logged, refcount};
 use crate::primitives::{EightCC, NonNullOffset, OwnershipKind, WidePtr};
 use crate::registry::{FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
@@ -533,43 +533,10 @@ impl RttiRegistry {
         st: &mut CloneState,
     ) -> io::Result<u64> {
         let data = alloc.stack();
-        let slice = alloc.alloc(size)?;
-        let range = slice.as_range();
-        // Log the allocation intention-first so a crash mid-clone leaves it
-        // reclaimable, keeping the WAL's live entries in lockstep with `allocated`: if
-        // logging fails, undo the alloc and log nothing.
-        if alloc.wal_anchor().is_some()
-            && let Err(e) = Self::wal_log_alloc(alloc, st, range)
-        {
-            let _ = alloc.dealloc(slice);
-            return Err(e);
-        }
-        st.allocated.push(range);
+        // Allocate + WAL-log intention-first (shared with the compiled clone path).
+        let range = alloc_logged(alloc, &mut st.wal, &mut st.allocated, size)?;
         data.copy(src_off.as_u64(), range.start(), size)?;
         Ok(range.start())
-    }
-
-    /// Log a just-made clone allocation to the intention-first WAL, (lazily) beginning
-    /// the transaction (and taking the file's WAL lock) on the first call. Mirrors
-    /// [`crate::io_core::ClonePlan`]'s `wal_log_alloc`: a cheap append while the block
-    /// has spare slots, a full re-`persist_at` (which grows the block) when it is full.
-    /// `st.allocated` does **not** yet contain `range` (the caller pushes it only after
-    /// this succeeds), so the grow path logs all of `allocated` *plus* `range`.
-    fn wal_log_alloc<A: BStackRaiiAllocator>(
-        alloc: &A,
-        st: &mut CloneState,
-        range: BStackRange,
-    ) -> io::Result<()> {
-        match &mut st.wal {
-            // First allocation: begin the transaction (taking the file's WAL lock).
-            None => {
-                st.wal = Some(WalTxn::begin(alloc, range)?);
-                Ok(())
-            }
-            // `st.allocated` is exactly what is already logged (the caller pushes
-            // `range` only after this succeeds) — the grow-path re-log set.
-            Some(w) => w.append(alloc, &st.allocated, range),
-        }
     }
 
     /// The counter offset to bump when cloning a `strong` reference to `data_child`

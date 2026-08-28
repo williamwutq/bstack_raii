@@ -937,6 +937,54 @@ impl WalTxn {
     }
 }
 
+/// Allocate a `size`-byte block through `alloc` and log it intention-first to the
+/// deep-clone WAL `wal`, keeping `allocated` in lockstep so the transaction's live
+/// `Alloc` entries are *exactly* `allocated`: a crash mid-clone leaves the block
+/// reclaimable, and if the *logging* fails the block is freed and nothing is recorded.
+/// Returns the fresh range — its bytes are the caller's to write. The one home for the
+/// intention-first alloc dance both clone engines run: the compiled path's single-pass
+/// [`ClonePlan::alloc_raw`](crate::io_core::ClonePlan) `Direct` arm and the RTTI
+/// interpreter's `alloc_copy`.
+pub(crate) fn alloc_logged<A: BStackRaiiAllocator>(
+    alloc: &A,
+    wal: &mut Option<WalTxn>,
+    allocated: &mut Vec<BStackRange>,
+    size: u64,
+) -> io::Result<BStackRange> {
+    let slice = alloc.alloc(size)?;
+    let range = slice.as_range();
+    if alloc.wal_anchor().is_some()
+        && let Err(e) = log_alloc(alloc, wal, allocated, range)
+    {
+        // Keep `allocated`/logged in sync: undo this alloc, log nothing.
+        let _ = alloc.dealloc(slice);
+        return Err(e);
+    }
+    allocated.push(range);
+    Ok(range)
+}
+
+/// Log a just-made allocation to the intention-first WAL, (lazily) beginning the
+/// transaction (and taking the file's WAL lock) on the first call. A cheap append
+/// while the block has spare slots, a full re-persist (which grows the block) when it
+/// is full. `allocated` must **not** yet contain `range` — the caller pushes it only
+/// after this succeeds — so the grow path re-logs all of `allocated` *plus* `range`.
+fn log_alloc<A: BStackRaiiAllocator>(
+    alloc: &A,
+    wal: &mut Option<WalTxn>,
+    allocated: &[BStackRange],
+    range: BStackRange,
+) -> io::Result<()> {
+    match wal {
+        // First allocation: begin the transaction (taking the file's WAL lock).
+        None => {
+            *wal = Some(WalTxn::begin(alloc, range)?);
+            Ok(())
+        }
+        Some(w) => w.append(alloc, allocated, range),
+    }
+}
+
 /// The persistent WAL block [`HeldLock::ensure_block`] guarantees: its on-disk byte
 /// [`range`](Self::range) (header + `capacity` entry slots) and its
 /// [`capacity`](Self::capacity) in [`WalEntry`] slots.
