@@ -2080,8 +2080,8 @@ pub(crate) fn weak_drop_stmt(fname: &Ident, inner_ty: &Type) -> TokenStream {
 /// teardown dispatch run in reverse. Reads/patches the mutable `__od` OnDisk copy
 /// and appends allocations / refcount bumps to `__plan`. `None` = nothing to do:
 /// POD and `#[bstack_ref]` fields are byte-copied verbatim (a ref clone aliases
-/// the same borrowed target — see the borrow-rules TODO). A `0` offset (a null
-/// `Option` field, or an unset weak) is left copied as-is.
+/// the same borrowed target). A `0` offset (a null `Option` field, or an unset weak)
+/// is left copied as-is.
 pub(crate) fn clone_field_stmt(fname: &Ident, inner_ty: &Type, kind: Kind) -> Option<TokenStream> {
     match kind {
         // Deep-clone the owned child into a fresh block, repoint the field.
