@@ -1995,14 +1995,13 @@ pub(crate) fn constructor(
                     let __ctrl_payload = ::bstack_raii::__private::build_control_payload(
                         #ctrl_eightcc,
                         __data.start(),
-                        #ctrl_size,
                     );
-                    let __writes: [(u64, ::std::vec::Vec<u8>); 2] = [
+                    let __writes: [(u64, &[u8]); 2] = [
                         (
                             __data.start(),
-                            ::bstack_raii::bytemuck::bytes_of(&__on_disk).to_vec(),
+                            ::bstack_raii::bytemuck::bytes_of(&__on_disk),
                         ),
-                        (__ctrl.start(), __ctrl_payload),
+                        (__ctrl.start(), &__ctrl_payload),
                     ];
                     if let ::std::result::Result::Err(__e) =
                         allocator.stack().set_batched(__writes)

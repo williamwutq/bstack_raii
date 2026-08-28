@@ -52,7 +52,7 @@ impl EightCC {
     /// collide to one tag, and the tag is the *sole* `bstack_cast!` / on-disk type
     /// identity, so the cast could not tell them apart.)
     ///
-    /// Note: a fully-specified 8-byte explicit `tag = "…"` leaves no hash bytes,
+    /// A fully-specified 8-byte explicit `tag = "…"` leaves no hash bytes,
     /// so every instantiation shares it — don't pin an 8-byte tag on a generic.
     pub const fn mix(self, other: EightCC) -> EightCC {
         // FNV-1a over `self`'s bytes *then* `other`'s — seeding with the running tag

@@ -33,7 +33,6 @@ pub fn get_u64(buf: &[u8]) -> u64 {
 /// fixed-width on-disk `u64` load (an 8-byte `get_into` fed through [`get_u64`]).
 /// Every on-disk pointer/count field (`ctrl` back-pointers, `Foreign` targets,
 /// linked-structure offsets, refcounts) is decoded through this.
-// NOTE LATER: change to NonZeroOffset
 #[inline(always)]
 pub fn read_u64(stack: &BStack, off: u64) -> io::Result<u64> {
     let mut buf = [0u8; 8];

@@ -15,7 +15,7 @@ use crate::registry::{FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::util::read_u64;
+use crate::util::{io_error, read_u64};
 
 use super::walk::{
     DepthGuard, checked_vec_len, clone_unsupported, disc_mask, foreign_leaf, option_present,
@@ -23,7 +23,7 @@ use super::walk::{
 };
 use super::{
     BYTEVEC_HEADER, FOREIGN_REPR_LEN, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape,
-    add_off, corrupt, mul_off, unknown_tag,
+    add_off, mul_off, unknown_tag,
 };
 
 /// One step of the non-recursive clone walk (see [`RttiRegistry::clone_value`]).
@@ -91,18 +91,18 @@ impl RttiRegistry {
             return Ok(()); // aliased — the copied slot is correct
         }
         let __wp = WidePtr::read_from_stack(home_data, src_off)?;
-        let (file_id, src_target) = (__wp.file_id(), __wp.offset().get());
-        if src_target == 0 {
+        let Some(src_target) = NonNullOffset::new(__wp.offset()) else {
             return Ok(()); // null — copied as 0
-        }
-        if file_id == 0 {
+        };
+        let new_off = NonNullOffset::from_field(new_off)?;
+        if __wp.is_self() {
             self.clone_foreign_in(home, home_data, tag, kind, src_target, new_off)
         } else {
-            let fid = FileId::from_u64(file_id).ok_or_else(clone_unsupported)?;
+            let fid = FileId::from_u64(__wp.file_id()).ok_or_else(clone_unsupported)?;
             let host = crate::registry::host_arc(fid).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "[BSTACK080F] RTTI clone: the foreign target's file is detached / not attached",
+                io_error!(
+                    NotFound,
+                    "[BSTACK080F] RTTI clone: the foreign target's file is detached / not attached"
                 )
             })?;
             let alloc = ForeignHostAllocator::new(host, fid);
@@ -119,8 +119,8 @@ impl RttiRegistry {
         home_data: &BStack,
         tag: EightCC,
         kind: OwnershipKind,
-        src_target: u64,
-        new_off: u64,
+        src_target: NonNullOffset,
+        new_off: NonNullOffset,
     ) -> io::Result<()> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let tstack = target.stack();
@@ -128,29 +128,31 @@ impl RttiRegistry {
             OwnershipKind::Ref => Ok(()),
             OwnershipKind::Owned => {
                 // SAFETY: `src_target` came from the source's validated foreign slot.
-                let new_target = unsafe { self.clone_value(target, ord, src_target)? };
+                let new_target = unsafe { self.clone_value(target, ord, src_target.as_u64())? };
                 // Repoint only the address word of the copied WidePtr.
                 home_data.set(
-                    add_off(new_off, FOREIGN_REPR_LEN - 8)?,
+                    new_off.checked_add(FOREIGN_REPR_LEN - 8)?.as_u64(),
                     new_target.to_le_bytes(),
                 )
             }
             OwnershipKind::Strong => {
-                let off = if self.load_type(ord)?.weak {
-                    let ctrl = read_u64(tstack, add_off(src_target, CTRL_BACKPTR_OFFSET)?)?;
-                    add_off(ctrl, CTRL_STRONG_OFFSET)?
+                // `src_target` is proven non-null, so `strong`'s inline counter offset
+                // stays branded through `checked_add`; only the `(rc, weak)` control
+                // offset — read from disk — needs re-validating against null.
+                let slot = if self.load_type(ord)?.weak {
+                    let ctrl = read_u64(
+                        tstack,
+                        src_target.checked_add(CTRL_BACKPTR_OFFSET)?.as_u64(),
+                    )?;
+                    NonNullOffset::from_field(add_off(ctrl, CTRL_STRONG_OFFSET)?)?
                 } else {
-                    add_off(src_target, RC_REFCOUNT_OFFSET)?
+                    src_target.checked_add(RC_REFCOUNT_OFFSET)?
                 };
-                refcount::fetch_add(tstack, NonNullOffset::from_field(off)?, 1)?;
+                refcount::fetch_add(tstack, slot, 1)?;
                 Ok(())
             }
             OwnershipKind::Weak => {
-                refcount::fetch_add(
-                    tstack,
-                    NonNullOffset::from_field(add_off(src_target, CTRL_WEAK_OFFSET)?)?,
-                    1,
-                )?;
+                refcount::fetch_add(tstack, src_target.checked_add(CTRL_WEAK_OFFSET)?, 1)?;
                 Ok(())
             }
         }
@@ -234,7 +236,10 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                corrupt("[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)")
+                io_error!(
+                    InvalidData,
+                    "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)"
+                )
             })?;
             match op {
                 CloneOp::Block { src_off, ord } => {
@@ -266,9 +271,12 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    corrupt(format!(
-                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                    ))
+                                    io_error!(
+                                        InvalidData,
+                                        format!(
+                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                        )
+                                    )
                                 })?;
                             let sp = add_off(src_off, e.payload_off as u64)?;
                             let np = add_off(new_off, e.payload_off as u64)?;
@@ -312,9 +320,12 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    corrupt(format!(
-                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                    ))
+                                    io_error!(
+                                        InvalidData,
+                                        format!(
+                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                        )
+                                    )
                                 })?;
                             let sp = add_off(src_base, e.payload_off as u64)?;
                             let np = add_off(new_base, e.payload_off as u64)?;
@@ -389,7 +400,7 @@ impl RttiRegistry {
                         // Charge for all elements up front — `n` is untrusted and
                         // the ops are materialized eagerly (see the read walk).
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            corrupt(
+                            io_error!(InvalidData, 
                                 "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)",
                             )
                         })?;
@@ -487,10 +498,12 @@ impl RttiRegistry {
 
         // Every block is cloned and in `map`; repoint owned child pointers.
         for &(new_slot, src_child) in &st.patches {
-            let new_child = *st
-                .map
-                .get(&src_child)
-                .ok_or_else(|| corrupt("[BSTACK080E] RTTI clone: an owned child was not cloned"))?;
+            let new_child = *st.map.get(&src_child).ok_or_else(|| {
+                io_error!(
+                    InvalidData,
+                    "[BSTACK080E] RTTI clone: an owned child was not cloned"
+                )
+            })?;
             data.set(new_slot, new_child.to_le_bytes())?;
         }
         // Then bump every shared target's refcount (over-count-safe, never under).
@@ -498,10 +511,12 @@ impl RttiRegistry {
             refcount::fetch_add(data, NonNullOffset::from_field(off)?, 1)?;
         }
 
-        st.map
-            .get(&root_src)
-            .copied()
-            .ok_or_else(|| corrupt("[BSTACK080E] RTTI clone: the root was not cloned"))
+        st.map.get(&root_src).copied().ok_or_else(|| {
+            io_error!(
+                InvalidData,
+                "[BSTACK080E] RTTI clone: the root was not cloned"
+            )
+        })
     }
 
     /// Allocate a `size`-byte block and byte-copy `[src_off, src_off+size)` into it,

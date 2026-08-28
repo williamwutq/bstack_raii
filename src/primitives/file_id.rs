@@ -43,7 +43,6 @@ impl FileId {
     /// from `u32::MAX`). Chosen far above any plausible number of open files.
     pub const SPECIAL_FLOOR: u32 = u32::MAX - 0xFFFF;
 
-    // NOTE: "Foreign" seems to have very much similar implementation for this
     /// Whether this is [`SELF`](Self::SELF) (the current file).
     pub const fn is_self(self) -> bool {
         self.0 == 0
@@ -74,8 +73,6 @@ impl FileId {
         FileId(v)
     }
 
-    // NOTE: FileId handles values properly and has checks, while the parallel implementation
-    // in foreign might not. Please check
     /// Reconstruct a `FileId` from its on-disk `u64` form, rejecting values that
     /// do not fit the `u32` id space (corruption / a foreign id from a wider build).
     pub const fn from_u64(v: u64) -> Option<Self> {

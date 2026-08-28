@@ -7,9 +7,9 @@
 use std::io;
 
 use crate::primitives::{EightCC, OwnershipKind};
-use crate::util::{Reader, Writer};
+use crate::util::{Reader, Writer, io_error};
 
-use super::{class_error, corrupt, too_large};
+use super::{class_error, too_large};
 
 const FLAG_ENUM: u8 = 0b0000_0001;
 const FLAG_RC: u8 = 0b0000_0010;
@@ -39,7 +39,7 @@ mod shape_tag {
 /// Map a byte-cursor underrun (a `None` from [`Reader::take`](crate::util::Reader::take))
 /// to the RTTI truncation error.
 fn need<T>(v: Option<T>) -> io::Result<T> {
-    v.ok_or_else(|| corrupt("[BSTACK0804] truncated RTTI record"))
+    v.ok_or_else(|| io_error!(InvalidData, "[BSTACK0804] truncated RTTI record"))
 }
 
 #[inline(always)]
@@ -75,7 +75,7 @@ fn eightcc(r: &mut Reader) -> io::Result<EightCC> {
 /// Read an `n`-byte UTF-8 string, RTTI-framing both a short read and invalid UTF-8.
 fn string(r: &mut Reader, n: usize) -> io::Result<String> {
     String::from_utf8(need(r.take(n))?.to_vec())
-        .map_err(|_| corrupt("[BSTACK0802] RTTI name is not valid UTF-8"))
+        .map_err(|_| io_error!(InvalidData, "[BSTACK0802] RTTI name is not valid UTF-8"))
 }
 
 /// Advance `r` past zero-padding to the next `a`-byte boundary, RTTI-framing a boundary
@@ -86,7 +86,10 @@ fn align(r: &mut Reader, a: usize) -> io::Result<()> {
     if r.skip_pad(a) {
         Ok(())
     } else {
-        Err(corrupt("[BSTACK0804] truncated RTTI record (alignment)"))
+        Err(io_error!(
+            InvalidData,
+            "[BSTACK0804] truncated RTTI record (alignment)"
+        ))
     }
 }
 
@@ -217,7 +220,8 @@ impl Shape {
     fn decode_at(r: &mut Reader, depth: usize) -> io::Result<Shape> {
         use shape_tag as t;
         if depth >= MAX_SHAPE_DEPTH {
-            return Err(corrupt(
+            return Err(io_error!(
+                InvalidData,
                 "[BSTACK0818] RTTI shape nesting exceeds the maximum depth",
             ));
         }
@@ -233,7 +237,10 @@ impl Shape {
                 let tag = eightcc(r)?;
                 let kb = u8(r)?;
                 let kind = OwnershipKind::from_u8(kb).ok_or_else(|| {
-                    corrupt(format!("[BSTACK0803] unknown RTTI foreign kind {kb:#04x}"))
+                    io_error!(
+                        InvalidData,
+                        format!("[BSTACK0803] unknown RTTI foreign kind {kb:#04x}")
+                    )
                 })?;
                 Shape::Foreign { tag, kind }
             }
@@ -265,9 +272,10 @@ impl Shape {
                 }
             }
             other => {
-                return Err(corrupt(format!(
-                    "[BSTACK0803] unknown RTTI shape tag {other:#04x}"
-                )));
+                return Err(io_error!(
+                    InvalidData,
+                    format!("[BSTACK0803] unknown RTTI shape tag {other:#04x}")
+                ));
             }
         })
     }
@@ -310,7 +318,10 @@ impl RttiField {
         let shape_start = r.pos;
         let shape = Shape::decode(r)?;
         if r.pos - shape_start != shape_len {
-            return Err(corrupt("[BSTACK0805] RTTI field shape length mismatch"));
+            return Err(io_error!(
+                InvalidData,
+                "[BSTACK0805] RTTI field shape length mismatch"
+            ));
         }
         align(r, 4)?;
         Ok(RttiField {
@@ -479,7 +490,8 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
         if disc_width > 8 {
             // A discriminant is read into a `u64`; reject a corrupt wider width on
             // load so no interpreter path later slices past an 8-byte buffer.
-            return Err(corrupt(
+            return Err(io_error!(
+                InvalidData,
                 "[BSTACK0816] RTTI enum discriminant width exceeds 8 bytes",
             ));
         }
@@ -487,7 +499,10 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
             // `disc_mask(0)` is 0 and a 0-byte read yields 0, so every variant
             // search would silently match the first variant; a corrupt record
             // must error, not mis-parse.
-            return Err(corrupt("[BSTACK0816] RTTI enum discriminant width is zero"));
+            return Err(io_error!(
+                InvalidData,
+                "[BSTACK0816] RTTI enum discriminant width is zero"
+            ));
         }
         let variants = (0..count)
             .map(|_| RttiVariant::decode(&mut r))

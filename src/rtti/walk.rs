@@ -12,11 +12,11 @@ use crate::BStackRaiiAllocator;
 use crate::io_core::refcount;
 use crate::primitives::{EightCC, NonNullOffset, OwnershipKind, WidePtr};
 use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
-use crate::util::read_u64;
+use crate::util::{io_error, io_errorfn, read_u64};
 
 use super::{
     AnyRef, BYTEVEC_HEADER, CONTROL_SIZE, FOREIGN_REPR_LEN, RttiOrdinal, RttiRegistry, RttiType,
-    Shape, VECDESC_LEN, Value, add_off, corrupt, mul_off, unknown_tag,
+    Shape, VECDESC_LEN, Value, add_off, mul_off, unknown_tag,
 };
 
 impl RttiRegistry {
@@ -57,17 +57,11 @@ impl RttiRegistry {
 }
 
 pub(in crate::rtti) fn set_error(msg: impl std::fmt::Display) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("[BSTACK080D] RTTI set: {msg}"),
-    )
+    io_error!(InvalidInput, format!("[BSTACK080D] RTTI set: {msg}"))
 }
 
 pub(in crate::rtti) fn swap_error(msg: impl std::fmt::Display) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("[BSTACK0810] RTTI swap: {msg}"),
-    )
+    io_error!(InvalidInput, format!("[BSTACK0810] RTTI swap: {msg}"))
 }
 
 /// Error for a mutator ([`set`](RttiRegistry::set) / [`swap`](RttiRegistry::swap) /
@@ -78,11 +72,11 @@ pub(in crate::rtti) fn bad_target(off: u64, want: EightCC, found: Option<EightCC
         Some(t) => format!("found {t:?}"),
         None => "out of bounds or unreadable".to_string(),
     };
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
+    io_error!(
+        InvalidInput,
         format!(
             "[BSTACK0815] RTTI mutator: offset {off} does not hold a live {want:?} block ({found})"
-        ),
+        )
     )
 }
 
@@ -103,14 +97,13 @@ pub(in crate::rtti) fn verify_data_block(data: &BStack, off: u64, tag: EightCC) 
     }
 }
 
-pub(in crate::rtti) fn move_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "[BSTACK0811] RTTI move_out of an array whose element is a vector (or other \
-         reference-bearing container that is neither a flat reference, an `#[embed]`, nor a \
-         nested array) is not yet supported",
-    )
-}
+io_errorfn!(
+    pub(in crate::rtti) move_unsupported,
+    Unsupported,
+    "[BSTACK0811] RTTI move_out of an array whose element is a vector (or other \
+     reference-bearing container that is neither a flat reference, an `#[embed]`, nor a \
+     nested array) is not yet supported"
+);
 
 /// Whether `shape` contains any block reference anywhere (so it is not pure POD).
 pub(in crate::rtti) fn shape_has_reference(shape: &Shape) -> bool {
@@ -180,7 +173,10 @@ pub(in crate::rtti) fn option_present(data: &BStack, inner: &Shape, base: u64) -
 
 /// The interpret-budget-exhausted error (a corrupt schema/data pair, or a cycle).
 pub(in crate::rtti) fn budget_exceeded() -> io::Error {
-    corrupt("[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)")
+    io_error!(
+        InvalidData,
+        "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+    )
 }
 
 thread_local! {
@@ -213,7 +209,8 @@ impl DepthGuard {
         });
         if depth > MAX_RTTI_DEPTH {
             RTTI_DEPTH.with(|c| c.set(c.get() - 1)); // undo: no guard is returned
-            return Err(corrupt(
+            return Err(io_error!(
+                InvalidData,
                 "[BSTACK0807] RTTI cross-file recursion too deep (a foreign cycle?)",
             ));
         }
@@ -242,20 +239,22 @@ pub(in crate::rtti) fn checked_vec_len(
 ) -> io::Result<u64> {
     let usable = data_size.saturating_sub(BYTEVEC_HEADER);
     if byte_len > usable {
-        return Err(corrupt(format!(
-            "[BSTACK0813] RTTI vector length ({byte_len} bytes) exceeds its data block \
+        return Err(io_error!(
+            InvalidData,
+            format!(
+                "[BSTACK0813] RTTI vector length ({byte_len} bytes) exceeds its data block \
              ({usable} usable bytes) — corrupt length word"
-        )));
+            )
+        ));
     }
     Ok(byte_len.checked_div(stride).unwrap_or(0))
 }
 
-pub(in crate::rtti) fn clone_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotFound,
-        "[BSTACK080F] RTTI clone: the foreign target names an invalid file id",
-    )
-}
+io_errorfn!(
+    pub(in crate::rtti) clone_unsupported,
+    NotFound,
+    "[BSTACK080F] RTTI clone: the foreign target names an invalid file id"
+);
 
 /// Release one `weak` reference whose control block is at `ctrl_off`: decrement
 /// `ctrl.weak`; the last weak handle (or phantom) frees the control block. The data
@@ -297,7 +296,8 @@ pub(in crate::rtti) fn read_disc(data: &BStack, off: u64, width: u8) -> io::Resu
         // `Err` rather than index a `[u8; 8]` out of bounds (`disc_mask` already
         // tolerates `>= 8`). `decode_type` rejects such records on load, so this is
         // a defensive backstop.
-        return Err(corrupt(
+        return Err(io_error!(
+            InvalidData,
             "[BSTACK0816] RTTI enum discriminant width exceeds 8 bytes",
         ));
     }
@@ -307,9 +307,9 @@ pub(in crate::rtti) fn read_disc(data: &BStack, off: u64, width: u8) -> io::Resu
 }
 
 pub(in crate::rtti) fn class_error(msg: impl std::fmt::Display) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("[BSTACK0812] RTTI class variable: {msg}"),
+    io_error!(
+        InvalidInput,
+        format!("[BSTACK0812] RTTI class variable: {msg}")
     )
 }
 
@@ -320,7 +320,7 @@ pub(in crate::rtti) fn pop_n(results: &mut Vec<Value>, n: usize) -> io::Result<V
     let start = results
         .len()
         .checked_sub(n)
-        .ok_or_else(|| corrupt("[BSTACK0809] RTTI interpret stack underflow"))?;
+        .ok_or_else(|| io_error!(InvalidData, "[BSTACK0809] RTTI interpret stack underflow"))?;
     let mut v = results.split_off(start);
     v.reverse();
     Ok(v)

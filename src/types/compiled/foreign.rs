@@ -22,6 +22,7 @@ use super::{BStackOwned, BStackRc, BStackWeak};
 use crate::BStackRaiiAllocator;
 use crate::io_core::foreign::{foreign_drop_owned, foreign_drop_strong, foreign_drop_weak};
 use crate::registry::{self, FileId};
+use crate::util::io_error;
 
 /// The RAII dual of [`BStackOwned`](crate::BStackOwned) for a target owned through a
 /// [`Foreign`] pointer. [`bstack_drop`](Self::bstack_drop) deep-frees the target in its
@@ -67,21 +68,17 @@ impl<'a, T: 'static> ForeignOwned<'a, T> {
 macro_rules! foreign_dispatch_drop {
     ($repr:expr, $home:expr, $drop:path) => {{
         let repr = $repr;
-        let off = repr.offset().get();
-        if off == 0 {
-            Ok(())
-        } else if repr.file_id() == 0 {
+        // A null pointer owns nothing; otherwise `off` is the proven-non-null target.
+        let Some(off) = $crate::primitives::NonNullOffset::new(repr.offset()) else {
+            return Ok(());
+        };
+        if repr.is_self() {
             // `SELF` ⇒ the home file.
-            unsafe { $drop($home, $crate::primitives::NonNullOffset::from_field(off)?) }
+            unsafe { $drop($home, off) }
         } else if let Some(id) = FileId::from_u64(repr.file_id()) {
             if let Some(host) = registry::host_arc(id) {
                 let adapter = registry::ForeignHostAllocator::new(host, id);
-                unsafe {
-                    $drop(
-                        &adapter,
-                        $crate::primitives::NonNullOffset::from_field(off)?,
-                    )
-                }
+                unsafe { $drop(&adapter, off) }
             } else {
                 Ok(()) // target file detached ⇒ leak (permitted)
             }
@@ -121,9 +118,10 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
     /// the caller keeps that obligation, exactly as for a cast-produced
     /// [`BStackRef`].
     pub fn into_local<A: BStackRaiiAllocator>(self, target: &A) -> io::Result<BStackOwned<T>> {
-        let fid = self.ptr.repr().file_id();
-        // NOTE: see previous note
-        if fid != 0 {
+        let repr = self.ptr.repr();
+        // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file;
+        // `SELF` carries no identity to check.
+        if !repr.is_self() {
             // Resolve `target`'s identity: its adapter-declared id (a
             // `ForeignHostAllocator`), or the registry's reverse map for a plain
             // allocator over an attached file.
@@ -131,11 +129,11 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
                 FileId::SELF => registry::id_of_host(target.stack()),
                 id => Some(id),
             };
-            if target_id.map(FileId::as_u64) != Some(fid) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+            if target_id.map(FileId::as_u64) != Some(repr.file_id()) {
+                return Err(io_error!(
+                    InvalidInput,
                     "ForeignOwned::into_local: the pointer's home file is not the \
-                     given target allocator's file",
+                     given target allocator's file"
                 ));
             }
         }

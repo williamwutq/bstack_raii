@@ -14,7 +14,7 @@ use crate::registry::{FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::util::read_u64;
+use crate::util::{io_error, read_u64};
 
 use super::walk::{
     DepthGuard, checked_vec_len, commit_weak_release, disc_mask, foreign_leaf, option_present,
@@ -22,7 +22,7 @@ use super::walk::{
 };
 use super::{
     BYTEVEC_HEADER, CONTROL_SIZE, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, add_off,
-    corrupt, mul_off, unknown_tag,
+    mul_off, unknown_tag,
 };
 
 /// One step of the non-recursive teardown walk (see [`RttiRegistry::teardown`]).
@@ -94,7 +94,10 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                corrupt("[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)")
+                io_error!(
+                    InvalidData,
+                    "[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)"
+                )
             })?;
             match op {
                 TdOp::Block {
@@ -133,9 +136,12 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    corrupt(format!(
-                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                    ))
+                                    io_error!(
+                                        InvalidData,
+                                        format!(
+                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                        )
+                                    )
                                 })?;
                             let payload_base = add_off(block_off, e.payload_off as u64)?;
                             for f in &variant.fields {
@@ -202,7 +208,7 @@ impl RttiRegistry {
                         // Charge for all elements up front — `n` is untrusted and
                         // the ops are materialized eagerly (see the read walk).
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            corrupt(
+                            io_error!(InvalidData, 
                                 "[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)",
                             )
                         })?;

@@ -63,6 +63,7 @@ use std::io;
 
 use crate::primitives::WidePtr;
 use crate::types::compiled::rc::CTRL_DATA_OFFSET;
+use crate::util::io_error;
 
 mod clone;
 mod field;
@@ -104,14 +105,6 @@ pub type RttiOrdinal = u32;
 /// after which the `TypeDesc` body begins (8-aligned).
 pub(in crate::rtti) const RECORD_HEADER_LEN: u64 = 16;
 
-// NOTE: The invalid data thing might be widely used even outside of RTTI. Check if my claim
-// is accurate, and if is, we may want to refactor this.
-#[inline(always)]
-pub(in crate::rtti) fn corrupt(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.into())
-}
-
-// NOTE: An interesting idea had came to my mind: what if we brand our u64 offsets?
 // Maybe a DiskOffset or something could make our code more maintainable
 // We can also make DiskOffset behave instead like NonZeroU64, due to the null niche
 // requirement that is generally applied in this crate
@@ -123,14 +116,14 @@ pub(in crate::rtti) fn corrupt(msg: impl Into<String>) -> io::Error {
 /// release build. Reject cleanly instead.
 pub(in crate::rtti) fn add_off(a: u64, b: u64) -> io::Result<u64> {
     a.checked_add(b)
-        .ok_or_else(|| corrupt("[BSTACK081A] RTTI offset arithmetic overflow"))
+        .ok_or_else(|| io_error!(InvalidData, "[BSTACK081A] RTTI offset arithmetic overflow"))
 }
 
 /// Multiply an on-disk element stride by an index, rejecting overflow — the
 /// `mul` counterpart of [`add_off`] for `Array`/`Vec` element offsets.
 pub(in crate::rtti) fn mul_off(a: u64, b: u64) -> io::Result<u64> {
     a.checked_mul(b)
-        .ok_or_else(|| corrupt("[BSTACK081A] RTTI offset arithmetic overflow"))
+        .ok_or_else(|| io_error!(InvalidData, "[BSTACK081A] RTTI offset arithmetic overflow"))
 }
 
 /// Narrow a compile-time-fixed layout quantity (a field's `offset_of!`, a POD
@@ -155,9 +148,10 @@ pub fn rtti_narrow_u32(x: usize, what: &str) -> u32 {
 /// or too deeply nested to serialize is rejected at `append`/`sync` **before** a
 /// silently-truncated, permanently-unreadable record is written.
 pub(in crate::rtti) fn too_large(what: &str, limit: &str) -> io::Error {
-    corrupt(format!(
-        "[BSTACK0817] RTTI {what} exceeds the maximum encodable size ({limit})"
-    ))
+    io_error!(
+        InvalidData,
+        format!("[BSTACK0817] RTTI {what} exceeds the maximum encodable size ({limit})")
+    )
 }
 
 /// Build an RTTI-typed pointer: a [`WidePtr`] to `(file_id, offset)` tagged
@@ -208,7 +202,10 @@ pub(in crate::rtti) const HEADER_TAG_OFFSET: u64 = 8;
 pub(in crate::rtti) const CONTROL_SIZE: u64 = CTRL_DATA_OFFSET + 8;
 
 pub(in crate::rtti) fn unknown_tag() -> io::Error {
-    corrupt("[BSTACK080B] RTTI pointer/field references an unregistered type tag")
+    io_error!(
+        InvalidData,
+        "[BSTACK080B] RTTI pointer/field references an unregistered type tag"
+    )
 }
 
 #[cfg(test)]

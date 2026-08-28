@@ -10,9 +10,10 @@ use bstack::BStack;
 use linkme::distributed_slice;
 
 use crate::primitives::{EightCC, WidePtr};
+use crate::util::io_error;
 
 use super::{
-    RECORD_HEADER_LEN, RttiOrdinal, RttiType, class_error, class_value_slot, corrupt, decode_type,
+    RECORD_HEADER_LEN, RttiOrdinal, RttiType, class_error, class_value_slot, decode_type,
     encode_type, frame_record, layouts_match, unknown_tag,
 };
 
@@ -92,7 +93,8 @@ impl RttiRegistry {
             // hand-edited record must fail as `InvalidData` here, not size a
             // multi-GiB allocation in `load_type` (or scan past the end).
             if RECORD_HEADER_LEN + body_len as u64 > len - off {
-                return Err(corrupt(
+                return Err(io_error!(
+                    InvalidData,
                     "[BSTACK0800] RTTI record body length runs past the end of the schema stack",
                 ));
             }
@@ -107,7 +109,8 @@ impl RttiRegistry {
     fn index(&mut self, tag: EightCC, offset: u64, body_len: u32) -> io::Result<RttiOrdinal> {
         let ordinal = self.records.len() as RttiOrdinal;
         if self.by_tag.insert(tag, ordinal).is_some() {
-            return Err(corrupt(
+            return Err(io_error!(
+                InvalidData,
                 "[BSTACK0800] duplicate RTTI eightcc — two types share one tag",
             ));
         }
@@ -123,7 +126,8 @@ impl RttiRegistry {
     /// already registered.
     pub fn append(&mut self, ty: &RttiType) -> io::Result<RttiOrdinal> {
         if self.by_tag.contains_key(&ty.tag) {
-            return Err(corrupt(
+            return Err(io_error!(
+                InvalidData,
                 "[BSTACK0800] duplicate RTTI eightcc — type already registered",
             ));
         }
@@ -152,23 +156,29 @@ impl RttiRegistry {
             let ty = (reg.build)();
             if let Some(prev) = seen.get(&ty.tag) {
                 if prev.name != ty.name {
-                    return Err(corrupt(format!(
-                        "[BSTACK0806] RTTI eightcc collision: '{}' and '{}' \
+                    return Err(io_error!(
+                        InvalidData,
+                        format!(
+                            "[BSTACK0806] RTTI eightcc collision: '{}' and '{}' \
                          hash to one tag",
-                        prev.name, ty.name
-                    )));
+                            prev.name, ty.name
+                        )
+                    ));
                 }
                 // Same tag AND same name is still a collision when the layouts
                 // differ — the tag ignores the module path, so `v1::Node` and
                 // `v2::Node` arrive here as one name. Only a byte-identical
                 // layout is genuinely "the same type registered twice".
                 if !layouts_match(prev, &ty) {
-                    return Err(corrupt(format!(
-                        "[BSTACK0806] RTTI eightcc collision: two distinct types \
+                    return Err(io_error!(
+                        InvalidData,
+                        format!(
+                            "[BSTACK0806] RTTI eightcc collision: two distinct types \
                          both named '{}' (same-named types in different modules?) \
                          share one tag",
-                        ty.name
-                    )));
+                            ty.name
+                        )
+                    ));
                 }
                 continue; // same type registered twice — nothing to do
             }
@@ -180,11 +190,14 @@ impl RttiRegistry {
                     let existing = self.load_type(ord)?;
                     if existing.name != ty.name {
                         // Different type, same tag — an eightcc collision.
-                        return Err(corrupt(format!(
-                            "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
+                        return Err(io_error!(
+                            InvalidData,
+                            format!(
+                                "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
                              compiled '{}' share one tag",
-                            existing.name, ty.name
-                        )));
+                                existing.name, ty.name
+                            )
+                        ));
                     }
                     if !layouts_match(&existing, &ty) {
                         // Same name, different layout: fields added / removed / reordered
@@ -196,13 +209,16 @@ impl RttiRegistry {
                         // the name only, so neither it nor the name moved, but the
                         // persisted offsets / shapes no longer describe the compiled
                         // type. Reject rather than silently keep the stale descriptor.
-                        return Err(corrupt(format!(
-                            "[BSTACK0814] RTTI schema mismatch for '{}': the persisted \
+                        return Err(io_error!(
+                            InvalidData,
+                            format!(
+                                "[BSTACK0814] RTTI schema mismatch for '{}': the persisted \
                              layout differs from the compiled type (a field was added, \
                              removed, reordered, or resized). The on-disk data was \
                              written against the old layout.",
-                            ty.name
-                        )));
+                                ty.name
+                            )
+                        ));
                     }
                 }
                 None => {
@@ -243,12 +259,10 @@ impl RttiRegistry {
 
     /// Read + decode the full descriptor for a type.
     pub fn load_type(&self, ordinal: RttiOrdinal) -> io::Result<RttiType> {
-        let rec = self.records.get(ordinal as usize).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "[BSTACK0801] RTTI ordinal out of range",
-            )
-        })?;
+        let rec = self
+            .records
+            .get(ordinal as usize)
+            .ok_or_else(|| io_error!(NotFound, "[BSTACK0801] RTTI ordinal out of range"))?;
         // NOTE: is rec.body_len bounded and will not result in dangerous allocations?
         // check similar patterns
         let mut body = vec![0u8; rec.body_len as usize];
@@ -257,8 +271,6 @@ impl RttiRegistry {
         decode_type(rec.tag, &body)
     }
 
-    // NOTE: as I increasingly see these kind of functions, I realized the convenience
-    // of a reader / writer / buffer, which can be passed in
     /// Read a class variable's current value bytes **live** from the schema stack.
     /// A mutable one may have been rewritten (by [`set_class_value`](Self::set_class_value),
     /// possibly through another handle) since it was registered, so the snapshot in a

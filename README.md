@@ -50,6 +50,7 @@ object model on top is substantial in its own right (comparable in size to
 - [Concepts](#concepts)
 - [How it works on disk](#how-it-works-on-disk)
 - [Handles & lifetimes](#handles--lifetimes)
+  - [Type naming](#type-naming)
 - [Generated types](#generated-types)
 - [Blocks](#blocks)
   - [Field ownership](#field-ownership)
@@ -240,6 +241,26 @@ cloning is the [`TryClone`] trait, not `Clone`. `BStackRc` also derefs to `X`
 (`rc.get_field(stack)?`, no `.handle()` needed), same as `BStackOwned`; a
 `BStackWeak` doesn't — like `std::rc::Weak`, it may not observe a live block, so
 `upgrade` to a `BStackRc` first.
+
+### Type naming
+
+The **`BStack`** prefix marks the primary, user-facing tier: the handles you hold
+(`BStackOwned`, `BStackRc`, `BStackWeak`, `BStackRef`), the capability traits
+(`BStackBlock`, `BStackDrop`, `BStackShared`, …), and the
+[collections](#standard-library-collections) (`BStackHashMap`, `BStackString`, …).
+Everything else is named by role and drops the prefix:
+
+- **Low-level ref / drop-core tokens** — `OwnedRef`, `StrongRef`, `WeakRef`,
+  `VecRef`, `AnyRef` — the internal cousins of the handles. `BStackRef` is the one
+  `*Ref` that keeps the prefix, because it isn't a token but *the* typed pointer
+  every trait signature speaks in — it belongs to the primary tier.
+- **Module-namespaced subsystems** — RTTI (`RttiType`, `Shape`, `Value`, `AnyRef`,
+  … under `rtti::`) and cross-file pointers (`Foreign`, `ForeignOwned`, …). The
+  path already disambiguates, so no prefix.
+- **On-disk primitives** — `EightCC`, `Offset`, `WidePtr`, `FileId`.
+
+So a bare name like `AnyRef` (not `BStackAnyRef`) is intentional: `BStack` is a
+marker for the headline handle/trait/collection tier, not a blanket rule.
 
 ## Generated types
 

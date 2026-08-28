@@ -12,7 +12,6 @@ use crate::types::traits::{BStackBlock, BStackCast};
 
 use super::{HEADER_TAG_OFFSET, Shape, add_off};
 
-// NOTE: for our types, check the consistency of the inclusion of "BStack"
 /// A **runtime-typed reference** — an `(EightCC, offset)` into a data file, the RTTI
 /// analog of `&dyn Any`. It bridges the interpreted world back to compiled-in types:
 /// [`downcast`](Self::downcast) hands back a real typed block handle when the

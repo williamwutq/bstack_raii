@@ -9,14 +9,14 @@ use std::io;
 use bstack::BStack;
 
 use crate::primitives::{EightCC, WidePtr};
-use crate::util::read_u64;
+use crate::util::{io_error, read_u64};
 
 use super::walk::{
     budget_exceeded, checked_vec_len, disc_mask, option_present, pop_n, pop_named, read_disc,
 };
 use super::{
     AnyRef, BYTEVEC_HEADER, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, Value, add_off,
-    corrupt, mul_off, unknown_tag,
+    mul_off, unknown_tag,
 };
 
 /// One step of the non-recursive walk. The interpreter runs a `work` stack of these
@@ -91,7 +91,10 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                corrupt("[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)")
+                io_error!(
+                    InvalidData,
+                    "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+                )
             })?;
             match op {
                 Op::Block { ord, block_off } => {
@@ -128,9 +131,12 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    corrupt(format!(
-                                        "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                                    ))
+                                    io_error!(
+                                        InvalidData,
+                                        format!(
+                                            "[BSTACK0808] no RTTI variant for discriminant {raw}"
+                                        )
+                                    )
                                 })?;
                             let names = variant.fields.iter().map(|f| f.name.clone()).collect();
                             let payload_base = add_off(block_off, e.payload_off as u64)?;
@@ -160,7 +166,8 @@ impl RttiRegistry {
                         // stack before sizing an allocation with it (the read after
                         // would fail anyway — this fails first, without the alloc).
                         if width as u64 > data.len()?.saturating_sub(offset) {
-                            return Err(corrupt(
+                            return Err(io_error!(
+                                InvalidData,
                                 "[BSTACK0800] RTTI POD width runs past the end of the data stack",
                             ));
                         }
@@ -317,9 +324,9 @@ impl RttiRegistry {
                     results.push(Value::Tuple(v.into()));
                 }
                 Op::MakeSome => {
-                    let inner = results
-                        .pop()
-                        .ok_or_else(|| corrupt("[BSTACK0809] RTTI interpret stack underflow"))?;
+                    let inner = results.pop().ok_or_else(|| {
+                        io_error!(InvalidData, "[BSTACK0809] RTTI interpret stack underflow")
+                    })?;
                     results.push(Value::Some(Box::new(inner)));
                 }
             }
@@ -327,9 +334,10 @@ impl RttiRegistry {
 
         match results.len() {
             1 => Ok(results.pop().unwrap()),
-            n => Err(corrupt(format!(
-                "[BSTACK0809] RTTI interpret produced {n} values (expected 1)"
-            ))),
+            n => Err(io_error!(
+                InvalidData,
+                format!("[BSTACK0809] RTTI interpret produced {n} values (expected 1)")
+            )),
         }
     }
 
@@ -340,7 +348,10 @@ impl RttiRegistry {
     /// and call this against that file's stack.
     pub fn read_ptr(&self, data: &BStack, ptr: WidePtr) -> io::Result<Value> {
         let ord = self.resolve_ptr(ptr).ok_or_else(|| {
-            corrupt("[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer")
+            io_error!(
+                InvalidData,
+                "[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer"
+            )
         })?;
         self.read_value(data, ord, ptr.offset().get())
     }

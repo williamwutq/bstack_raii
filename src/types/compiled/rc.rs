@@ -61,6 +61,11 @@ pub(crate) const CTRL_WEAK_OFFSET: u64 = HEADER_SIZE + 8;
 /// Read by [`BStackWeak::upgrade`] once it wins the strong CAS.
 pub(crate) const CTRL_DATA_OFFSET: u64 = HEADER_SIZE + 16;
 
+/// Total bytes of an `(rc, weak)` control block: [`BlockHeader`] + `strong` + `weak` +
+/// the data forward-pointer `u64`. Fixed for every weakable type — the control layout
+/// does not depend on `T` — so a control payload is a fixed-size stack buffer.
+pub(crate) const CONTROL_SIZE: u64 = CTRL_DATA_OFFSET + 8;
+
 // Guard the hand-derived offsets against a header size change.
 const _: () = assert!(HEADER_SIZE == 16);
 
@@ -265,7 +270,6 @@ pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
 /// (control block). Its [`BStackDrop`] is the strong release, so a `BStackRc`'s
 /// embedded [`AutoDrop`] runs it automatically and the handle needs no
 /// hand-written `Drop`.
-// Note: suspecious pub(crate)
 pub(crate) struct StrongCore<T: BStackBlock> {
     data: BStackRef<T>,
     ctrl: Option<BStackRange>,
@@ -573,11 +577,13 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> TryClone for BStackWeak<'a, 
 /// block's `ctrl` back-pointer, and commits both block images in one
 /// [`bstack::BStack::set_batched`] — so a `(rc, weak)` block is created atomically,
 /// with no separate back-pointer write and no transient half-wired state.
-pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64, control_size: u64) -> Vec<u8> {
-    // NOTE: control_size probably have an upper bound, so no need for vec here
-    let mut payload = vec![0u8; control_size as usize];
+pub fn build_control_payload(ctrl_tag: EightCC, data_start: u64) -> [u8; CONTROL_SIZE as usize] {
+    // The control block is a fixed [`CONTROL_SIZE`]-byte layout, so the image is a
+    // stack buffer, no heap allocation. The caller writes it (borrowed as `&[u8]`)
+    // straight into its batched commit.
+    let mut payload = [0u8; CONTROL_SIZE as usize];
     let header = BlockHeader {
-        size: control_size,
+        size: CONTROL_SIZE,
         tag: ctrl_tag,
     };
     payload[..HEADER_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&header));

@@ -193,12 +193,10 @@ fn alloc_control<A: BStackRaiiAllocator>(
 ) -> io::Result<BStackRange> {
     let slice = allocator.alloc(control_size)?;
     let ctrl = slice.as_range();
-    let payload = build_control_payload(ctrl_tag, data.start(), control_size);
+    let payload = build_control_payload(ctrl_tag, data.start());
     let backptr_off = data.start() + CTRL_BACKPTR_OFFSET;
-    let writes: [(u64, Vec<u8>); 2] = [
-        (ctrl.start(), payload),
-        (backptr_off, ctrl.start().to_le_bytes().to_vec()),
-    ];
+    let backptr = ctrl.start().to_le_bytes();
+    let writes: [(u64, &[u8]); 2] = [(ctrl.start(), &payload), (backptr_off, &backptr)];
     if let Err(e) = allocator.stack().set_batched(writes) {
         let _ = allocator.dealloc(slice);
         return Err(e);

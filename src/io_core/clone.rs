@@ -51,7 +51,8 @@ use std::io;
 use bstack::{BStackGenOp, BStackRange};
 
 use crate::BStackRaiiAllocator;
-use crate::io_core::{WalStatus, WalTxn, dealloc_range};
+use crate::io_core::bulk::seq_free_many;
+use crate::io_core::{WalStatus, WalTxn};
 use crate::primitives::{Offset, checked_off};
 use crate::types::compiled::owned::BStackOwned;
 use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
@@ -145,7 +146,6 @@ impl ClonePlan {
     pub fn new() -> Self {
         ClonePlan {
             mode: Mode::Direct,
-            // NOTE: We have a clone plan, maybe we want with capacity 4
             allocated: Vec::new(),
             sizes: Vec::new(),
             cursor: 0,
@@ -231,7 +231,6 @@ impl ClonePlan {
             }
             // Single pass: allocate eagerly and log it intention-first, keeping the
             // allocation and its WAL entry in lockstep with `allocated`.
-            // NOTE: Single path has way more leaks. Is it still used?
             Mode::Direct => {
                 let slice = allocator.alloc(size)?;
                 let range = slice.as_range();
@@ -441,13 +440,9 @@ impl ClonePlan {
     /// persistent block idle), the same path a real crash takes; the WAL lock is held
     /// by `self` and released as it drops. Without a WAL the ranges are freed directly.
     pub fn rollback<A: BStackRaiiAllocator>(self, allocator: &A) {
-        if let Some(w) = &self.wal {
-            // Abandon the still-`Pending` transaction; `self` (and its held WAL lock)
-            // drops at the end of this call, after the reclamation has run.
-            let _ = w.finish(allocator);
-        } else {
-            Self::free_all(self.allocated, allocator);
-        }
+        // Same policy as the `commit` error path — see [`reclaim`](Self::reclaim). `self`
+        // (and its held WAL lock) drops at the end of this call, after reclamation.
+        Self::reclaim(&self.wal, self.allocated, allocator);
     }
 
     /// Commit the whole plan as **one** crash-atomic unit: every refcount bump
@@ -607,13 +602,13 @@ impl ClonePlan {
         // `wal` (holding the file's WAL lock) drops here, after reclamation.
     }
 
-    /// Reclaim a failed commit's allocations. With a WAL, `finish_at_locked`
-    /// abandons the still-`Pending` transaction — freeing the logged alloc orphans
-    /// (exactly `allocated`) and marking the persistent block idle — matching what
-    /// `finish` does after a real crash; without one, free them directly. The WAL
-    /// lock is held by the still-live `wal` in the caller, so the *locked* variant
-    /// is used.
-    // NOTE: is this not just rollback?
+    /// The shared reclamation policy for a failed plan, used by both
+    /// [`rollback`](Self::rollback) (whole-plan) and the [`commit`](Self::commit) error
+    /// path (which holds the WAL lock as a live local through the call). With an
+    /// intention-first WAL in flight, abandoning the still-`Pending` transaction frees
+    /// exactly the logged allocs (which equal `allocated`) and marks the persistent
+    /// block idle — the same path a real crash's reclamation takes. Without a WAL, the
+    /// ranges are freed directly.
     fn reclaim<A: BStackRaiiAllocator>(
         wal: &Option<WalTxn>,
         allocated: Vec<BStackRange>,
@@ -625,17 +620,17 @@ impl ClonePlan {
             Some(w) => {
                 let _ = w.finish(allocator);
             }
-            None => Self::free_all(allocated, allocator),
-        }
-    }
-
-    // NOTE: this looks like seq_free_many, which could be better, if it's not for
-    // its strange problems
-    fn free_all<A: BStackRaiiAllocator>(allocated: Vec<BStackRange>, allocator: &A) {
-        for r in allocated.into_iter().rev() {
-            // SAFETY: each range was returned by our own `alloc_raw` and never
-            // handed to another owner, so freeing it here is sound.
-            let _ = unsafe { dealloc_range(allocator, r) };
+            // No WAL: best-effort direct free of the plan's own `alloc_raw` blocks.
+            // They are disjoint fresh allocations, so order is immaterial (unlike
+            // `teardown`, there are no forged interior pointers to sequence around).
+            // `seq_free_many` frees every range and continues past a failure; the error
+            // is unactionable here (the commit already failed) — an unfreeable range
+            // then just leaks, recorded nowhere.
+            None => {
+                // SAFETY (deferred to `seq_free_many` / `dealloc_range`): each range
+                // came from our own `alloc_raw` and was never handed to another owner.
+                let _ = seq_free_many(allocator, allocated);
+            }
         }
     }
 }

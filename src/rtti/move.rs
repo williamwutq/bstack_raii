@@ -13,7 +13,7 @@ use crate::primitives::{NonNullOffset, WidePtr};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::util::{SmallStringMap, read_u64};
+use crate::util::{SmallStringMap, io_error, read_u64};
 
 use super::walk::{
     disc_mask, element_ref_tag, foreign_leaf, move_unsupported, read_disc, shape_has_reference,
@@ -21,7 +21,7 @@ use super::walk::{
 };
 use super::{
     AnyRef, CONTROL_SIZE, FOREIGN_REPR_LEN, ForeignPtr, Moved, RttiBody, RttiField, RttiOrdinal,
-    RttiRegistry, RttiType, Shape, VecRef, add_off, corrupt, mul_off, unknown_tag,
+    RttiRegistry, RttiType, Shape, VecRef, add_off, mul_off, unknown_tag,
 };
 
 impl RttiRegistry {
@@ -95,10 +95,13 @@ impl RttiRegistry {
                 // the zero count for the whole field walk — never both succeeding.
                 if !refcount::cas(data, NonNullOffset::from_field(strong_slot)?, 1, 0)? {
                     let strong = read_u64(data, strong_slot)?;
-                    return Err(corrupt(format!(
-                        "[BSTACK0819] RTTI move_out of a shared reference-counted block \
+                    return Err(io_error!(
+                        InvalidData,
+                        format!(
+                            "[BSTACK0819] RTTI move_out of a shared reference-counted block \
                          (strong count {strong}); only the sole owner may disassemble it"
-                    )));
+                        )
+                    ));
                 }
                 (Some(strong_slot), ctrl)
             } else {
@@ -189,9 +192,10 @@ impl RttiRegistry {
                         .iter()
                         .find(|v| (v.disc_value as u64) & mask == raw)
                         .ok_or_else(|| {
-                            corrupt(format!(
-                                "[BSTACK0808] no RTTI variant for discriminant {raw}"
-                            ))
+                            io_error!(
+                                InvalidData,
+                                format!("[BSTACK0808] no RTTI variant for discriminant {raw}")
+                            )
                         })?;
                     (
                         variant.fields.clone(),
@@ -220,10 +224,10 @@ impl RttiRegistry {
             // instead: the caller's error path reclaims `materialized`, and per
             // move_out's contract nothing else has been freed yet.
             if map.insert(f.name.clone(), moved).is_some() {
-                return Err(corrupt(format!(
-                    "[BSTACK0800] RTTI record has two fields named '{}'",
-                    f.name
-                )));
+                return Err(io_error!(
+                    InvalidData,
+                    format!("[BSTACK0800] RTTI record has two fields named '{}'", f.name)
+                ));
             }
         }
         Ok(map)
@@ -245,7 +249,8 @@ impl RttiRegistry {
             Shape::Pod { width } => {
                 // Untrusted width: bound against the stack before allocating.
                 if *width as u64 > data.len()?.saturating_sub(off) {
-                    return Err(corrupt(
+                    return Err(io_error!(
+                        InvalidData,
                         "[BSTACK0800] RTTI POD width runs past the end of the data stack",
                     ));
                 }

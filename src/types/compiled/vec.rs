@@ -58,7 +58,6 @@ pub(crate) const BYTEVEC_HEADER: u64 = 16;
 /// single place that on-disk shape is assembled, shared by a cloned vec
 /// ([`crate::ClonePlan::stage_bytevec`]) and a field-resident growth
 /// [`push`](BStackVec::push).
-// NOTE: suspecious pub(crate). This is because clone plan still use it, we will refactor later
 pub(crate) fn bytevec_image(len: u64, cap: u64, data: &[u8]) -> Vec<u8> {
     let mut img = vec![0u8; BYTEVEC_HEADER as usize + data.len()];
     put_u64(&mut img, 0, len);

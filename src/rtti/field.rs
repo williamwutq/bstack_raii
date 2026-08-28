@@ -392,12 +392,11 @@ impl RttiRegistry {
         // caller displaced.
         let old_repr = data.swap(offset, b)?;
         let __wp = WidePtr::decode(&old_repr);
-        let (old_file, old_off) = (__wp.file_id(), __wp.offset().get());
-        Ok((old_off != 0).then_some(ForeignPtr {
+        Ok((!__wp.is_null()).then_some(ForeignPtr {
             tag,
             kind,
-            file_id: old_file,
-            offset: old_off,
+            file_id: __wp.file_id(),
+            offset: __wp.offset().get(),
         }))
     }
 }
