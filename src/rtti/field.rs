@@ -3,8 +3,6 @@
 //! [`set`](RttiRegistry::set) / [`swap`](RttiRegistry::swap) /
 //! [`swap_foreign`](RttiRegistry::swap_foreign)), plus the `resolve_field` navigator.
 
-use std::io;
-
 use bstack::BStack;
 
 use crate::primitives::{EightCC, WidePtr};
@@ -12,6 +10,7 @@ use crate::registry::FileId;
 use crate::types::compiled::rc::{CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET};
 use crate::util::{get_u64, read_u64};
 
+use super::RttiResult;
 use super::read::Op;
 use super::walk::{disc_mask, read_disc, set_error, swap_error, verify_data_block};
 use super::{
@@ -35,7 +34,7 @@ impl RttiRegistry {
         ordinal: RttiOrdinal,
         block_off: u64,
         path: &[&str],
-    ) -> io::Result<Resolved> {
+    ) -> RttiResult<Resolved> {
         if path.is_empty() {
             return Err(set_error("empty field path"));
         }
@@ -113,10 +112,10 @@ impl RttiRegistry {
         ordinal: RttiOrdinal,
         block_off: u64,
         path: &[&str],
-    ) -> io::Result<Value> {
+    ) -> RttiResult<Value> {
         match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => {
-                self.run_read(data, vec![Op::Shape { shape, offset }])
+                self.run_read(data, Op::Shape { shape, offset })
             }
             Resolved::Class { tag, name } => Ok(Value::Class(self.class_value(tag, &name)?.into())),
         }
@@ -146,7 +145,7 @@ impl RttiRegistry {
         block_off: u64,
         path: &[&str],
         value: &[u8],
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         let (offset, shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             // A class variable is schema-side; write it in place there.
@@ -182,7 +181,7 @@ impl RttiRegistry {
                 ));
             }
         }
-        data.set(offset, value)
+        data.set(offset, value).map_err(Into::into)
     }
 
     /// **Swap** the reference field named by `path` to point at `new`, returning the
@@ -210,7 +209,7 @@ impl RttiRegistry {
         block_off: u64,
         path: &[&str],
         new: AnyRef,
-    ) -> io::Result<Option<AnyRef>> {
+    ) -> RttiResult<Option<AnyRef>> {
         let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             Resolved::Class { .. } => {
@@ -329,7 +328,7 @@ impl RttiRegistry {
         block_off: u64,
         path: &[&str],
         new: ForeignPtr,
-    ) -> io::Result<Option<ForeignPtr>> {
+    ) -> RttiResult<Option<ForeignPtr>> {
         let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             Resolved::Class { .. } => {

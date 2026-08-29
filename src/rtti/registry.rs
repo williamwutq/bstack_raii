@@ -3,19 +3,18 @@
 //! the `linkme`-collected compiled-in type set and the [`sync`] entry point.
 
 use std::collections::HashMap;
-use std::io;
 use std::path::Path;
 
 use bstack::BStack;
 use linkme::distributed_slice;
 
 use crate::primitives::{EightCC, WidePtr};
-use crate::util::io_error;
 
 use super::{
     RECORD_HEADER_LEN, RttiOrdinal, RttiType, class_error, class_value_slot, decode_type,
     encode_type, frame_record, layouts_match, unknown_tag,
 };
+use super::{RttiResult, rtti_err};
 
 // -- Compile-time registration (linkme) ------------------------------------
 
@@ -40,7 +39,7 @@ pub static RTTI_TYPES: [RttiRegistration];
 /// schema it does not already carry, and return the loaded registry. Idempotent
 /// and safe to call on every open. Runs eightcc-collision detection. This is the
 /// producer-side entry point; see [`RttiRegistry::sync_compiled`] for the details.
-pub fn sync(path: impl AsRef<Path>) -> io::Result<RttiRegistry> {
+pub fn sync(path: impl AsRef<Path>) -> RttiResult<RttiRegistry> {
     let mut reg = RttiRegistry::open(path)?;
     reg.sync_compiled()?;
     Ok(reg)
@@ -67,7 +66,7 @@ pub struct RttiRegistry {
 
 impl RttiRegistry {
     /// Open (creating if absent) an RTTI stack and scan every record into memory.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> RttiResult<Self> {
         let stack = BStack::open(path)?;
         let mut reg = Self {
             stack,
@@ -81,7 +80,7 @@ impl RttiRegistry {
     /// Walk the stack front-to-back, recording each record's tag / offset / length
     /// and building the tag→ordinal map. A repeated tag is corruption (eightcc is
     /// the resolution key; two distinct types must never share one).
-    fn scan(&mut self) -> io::Result<()> {
+    fn scan(&mut self) -> RttiResult<()> {
         let len = self.stack.len()?;
         let mut off = 0u64;
         while off < len {
@@ -93,9 +92,9 @@ impl RttiRegistry {
             // hand-edited record must fail as `InvalidData` here, not size a
             // multi-GiB allocation in `load_type` (or scan past the end).
             if RECORD_HEADER_LEN + body_len as u64 > len - off {
-                return Err(io_error!(
-                    InvalidData,
-                    "[BSTACK0800] RTTI record body length runs past the end of the schema stack",
+                return Err(rtti_err!(
+                    Malformed,
+                    "RTTI record body length runs past the end of the schema stack",
                 ));
             }
             self.index(tag, off, body_len)?;
@@ -106,11 +105,12 @@ impl RttiRegistry {
     }
 
     /// Record one scanned/appended entry, rejecting a duplicate tag.
-    fn index(&mut self, tag: EightCC, offset: u64, body_len: u32) -> io::Result<RttiOrdinal> {
+    fn index(&mut self, tag: EightCC, offset: u64, body_len: u32) -> RttiResult<RttiOrdinal> {
         let ordinal = self.records.len() as RttiOrdinal;
         if self.by_tag.insert(tag, ordinal).is_some() {
-            return Err(io_error!(
-                "[BSTACK0800] duplicate RTTI eightcc — two types share one tag",
+            return Err(rtti_err!(
+                Malformed,
+                "duplicate RTTI eightcc — two types share one tag",
             ));
         }
         self.records.push(RecordRef {
@@ -123,11 +123,11 @@ impl RttiRegistry {
 
     /// Append a new type's record to the stack and index it. Errors if its tag is
     /// already registered.
-    pub fn append(&mut self, ty: &RttiType) -> io::Result<RttiOrdinal> {
+    pub fn append(&mut self, ty: &RttiType) -> RttiResult<RttiOrdinal> {
         if self.by_tag.contains_key(&ty.tag) {
-            return Err(io_error!(
-                InvalidData,
-                "[BSTACK0800] duplicate RTTI eightcc — type already registered",
+            return Err(rtti_err!(
+                Malformed,
+                "duplicate RTTI eightcc — type already registered",
             ));
         }
         // Encode once and validate every on-disk length fits its field width, so a
@@ -147,7 +147,7 @@ impl RttiRegistry {
     /// is the resolution key, two *distinct* types (different names) hashing to one
     /// eightcc is corruption, caught here rather than silently overwriting. A tag
     /// that is already on disk under the *same* name is a benign re-sync.
-    pub fn sync_compiled(&mut self) -> io::Result<usize> {
+    pub fn sync_compiled(&mut self) -> RttiResult<usize> {
         let mut appended = 0;
         // Guards a collision *within* the compiled-in set (two builders, one tag).
         let mut seen: HashMap<EightCC, RttiType> = HashMap::new();
@@ -155,9 +155,9 @@ impl RttiRegistry {
             let ty = (reg.build)();
             if let Some(prev) = seen.get(&ty.tag) {
                 if prev.name != ty.name {
-                    return Err(io_error!(
-                        InvalidData,
-                        "[BSTACK0806] RTTI eightcc collision: '{}' and '{}' \
+                    return Err(rtti_err!(
+                        Collision,
+                        "RTTI eightcc collision: '{}' and '{}' \
                          hash to one tag",
                         prev.name,
                         ty.name
@@ -168,9 +168,9 @@ impl RttiRegistry {
                 // `v2::Node` arrive here as one name. Only a byte-identical
                 // layout is genuinely "the same type registered twice".
                 if !layouts_match(prev, &ty) {
-                    return Err(io_error!(
-                        InvalidData,
-                        "[BSTACK0806] RTTI eightcc collision: two distinct types \
+                    return Err(rtti_err!(
+                        Collision,
+                        "RTTI eightcc collision: two distinct types \
                          both named '{}' (same-named types in different modules?) \
                          share one tag",
                         ty.name
@@ -186,9 +186,9 @@ impl RttiRegistry {
                     let existing = self.load_type(ord)?;
                     if existing.name != ty.name {
                         // Different type, same tag — an eightcc collision.
-                        return Err(io_error!(
-                            InvalidData,
-                            "[BSTACK0806] RTTI eightcc collision: on-disk '{}' vs \
+                        return Err(rtti_err!(
+                            Collision,
+                            "RTTI eightcc collision: on-disk '{}' vs \
                              compiled '{}' share one tag",
                             existing.name,
                             ty.name
@@ -204,9 +204,9 @@ impl RttiRegistry {
                         // the name only, so neither it nor the name moved, but the
                         // persisted offsets / shapes no longer describe the compiled
                         // type. Reject rather than silently keep the stale descriptor.
-                        return Err(io_error!(
-                            InvalidData,
-                            "[BSTACK0814] RTTI schema mismatch for '{}': the persisted \
+                        return Err(rtti_err!(
+                            SchemaMismatch,
+                            "RTTI schema mismatch for '{}': the persisted \
                              layout differs from the compiled type (a field was added, \
                              removed, reordered, or resized). The on-disk data was \
                              written against the old layout.",
@@ -251,11 +251,11 @@ impl RttiRegistry {
     }
 
     /// Read + decode the full descriptor for a type.
-    pub fn load_type(&self, ordinal: RttiOrdinal) -> io::Result<RttiType> {
+    pub fn load_type(&self, ordinal: RttiOrdinal) -> RttiResult<RttiType> {
         let rec = self
             .records
             .get(ordinal as usize)
-            .ok_or_else(|| io_error!(NotFound, "[BSTACK0801] RTTI ordinal out of range"))?;
+            .ok_or_else(|| rtti_err!(OrdinalRange, "RTTI ordinal out of range"))?;
         // NOTE: is rec.body_len bounded and will not result in dangerous allocations?
         // check similar patterns
         let mut body = vec![0u8; rec.body_len as usize];
@@ -269,7 +269,7 @@ impl RttiRegistry {
     /// possibly through another handle) since it was registered, so the snapshot in a
     /// cached [`load_type`](Self::load_type) can be stale — this always reads the file.
     /// Works for const and mutable class variables alike.
-    pub fn class_value(&self, tag: EightCC, name: &str) -> io::Result<Vec<u8>> {
+    pub fn class_value(&self, tag: EightCC, name: &str) -> RttiResult<Vec<u8>> {
         let (off, len, _mutable) = self.locate_class_value(tag, name)?;
         let mut buf = vec![0u8; len];
         self.stack.get_into(off, &mut buf)?;
@@ -283,7 +283,7 @@ impl RttiRegistry {
     ///
     /// Errors if the class variable is absent, is `const` (not `#[bstack_mut]`), or
     /// `value` is not the slot's exact width.
-    pub fn set_class_value(&self, tag: EightCC, name: &str, value: &[u8]) -> io::Result<()> {
+    pub fn set_class_value(&self, tag: EightCC, name: &str, value: &[u8]) -> RttiResult<()> {
         let (off, len, mutable) = self.locate_class_value(tag, name)?;
         if !mutable {
             return Err(class_error(format!(
@@ -296,12 +296,12 @@ impl RttiRegistry {
                 value.len()
             )));
         }
-        self.stack.set(off, value)
+        self.stack.set(off, value).map_err(Into::into)
     }
 
     /// Locate a class variable's value slot: its absolute offset in the schema stack,
     /// byte length, and mutability.
-    fn locate_class_value(&self, tag: EightCC, name: &str) -> io::Result<(u64, usize, bool)> {
+    fn locate_class_value(&self, tag: EightCC, name: &str) -> RttiResult<(u64, usize, bool)> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let rec = &self.records[ord as usize];
         let mut body = vec![0u8; rec.body_len as usize];

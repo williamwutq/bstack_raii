@@ -4,18 +4,18 @@
 //! ones, which also breaks reference cycles.
 
 use std::collections::HashMap;
-use std::io;
 
 use bstack::BStack;
 
 use crate::primitives::{EightCC, WidePtr};
-use crate::util::{io_error, read_u64};
+use crate::util::read_u64;
 
-use super::walk::{checked_vec_len, disc_mask, option_present, pop_n, pop_named, read_disc};
+use super::walk::{checked_vec_len, disc_mask, pop_n, pop_named, read_disc};
 use super::{
     AnyRef, BYTEVEC_HEADER, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, Value, add_off,
     mul_off, unknown_tag,
 };
+use super::{RttiResult, rtti_err};
 
 /// One step of the non-recursive walk. The interpreter runs a `work` stack of these
 /// against a `results` value stack: leaf steps push a [`Value`]; an `Assemble*` step
@@ -66,22 +66,23 @@ impl RttiRegistry {
         data: &BStack,
         ordinal: RttiOrdinal,
         block_off: u64,
-    ) -> io::Result<Value> {
+    ) -> RttiResult<Value> {
         self.run_read(
             data,
-            vec![Op::Block {
+            Op::Block {
                 ord: ordinal,
                 block_off,
-            }],
+            },
         )
     }
 
-    /// The read machine: run a `work` stack of [`Op`]s to a single [`Value`]. Seeded
-    /// with a `Block` op by [`read_value`](Self::read_value) (a whole block) or a
-    /// `Shape` op by [`get`](Self::get) (one field).
-    pub(in crate::rtti) fn run_read(&self, data: &BStack, initial: Vec<Op>) -> io::Result<Value> {
+    /// The read machine: run a `work` stack to a single [`Value`], from one `seed`
+    /// [`Op`] — a `Block` op from [`read_value`](Self::read_value) (a whole block) or a
+    /// `Shape` op from [`get`](Self::get) (one field). The seed is singular by contract:
+    /// the walk must bottom out at exactly one value (enforced at the tail).
+    pub(in crate::rtti) fn run_read(&self, data: &BStack, seed: Op) -> RttiResult<Value> {
         let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
-        let mut work: Vec<Op> = initial;
+        let mut work: Vec<Op> = vec![seed];
         let mut results: Vec<Value> = Vec::new();
         // Bounds the total nodes visited: a corrupt schema/data pair (or a strong
         // cycle) can otherwise loop forever.
@@ -89,9 +90,9 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                io_error!(
-                    InvalidData,
-                    "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+                rtti_err!(
+                    Budget,
+                    "RTTI interpret budget exceeded (corrupt data or a cycle?)"
                 )
             })?;
             match op {
@@ -107,13 +108,13 @@ impl RttiRegistry {
                             // order (so they pop child-first into the marker).
                             let field_ops: Vec<Op> = fields
                                 .iter()
-                                .map(|f| -> io::Result<Op> {
+                                .map(|f| -> RttiResult<Op> {
                                     Ok(Op::Shape {
                                         shape: f.shape.clone(),
                                         offset: add_off(block_off, f.offset as u64)?,
                                     })
                                 })
-                                .collect::<io::Result<Vec<Op>>>()?;
+                                .collect::<RttiResult<Vec<Op>>>()?;
                             work.push(Op::MakeBlock { tag: ty.tag, names });
                             work.extend(field_ops);
                         }
@@ -129,24 +130,20 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    io_error!(
-                                        InvalidData,
-                                        "[BSTACK0808] no RTTI variant for discriminant {}",
-                                        raw
-                                    )
+                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
                                 })?;
                             let names = variant.fields.iter().map(|f| f.name.clone()).collect();
                             let payload_base = add_off(block_off, e.payload_off as u64)?;
                             let field_ops: Vec<Op> = variant
                                 .fields
                                 .iter()
-                                .map(|f| -> io::Result<Op> {
+                                .map(|f| -> RttiResult<Op> {
                                     Ok(Op::Shape {
                                         shape: f.shape.clone(),
                                         offset: add_off(payload_base, f.offset as u64)?,
                                     })
                                 })
-                                .collect::<io::Result<Vec<Op>>>()?;
+                                .collect::<RttiResult<Vec<Op>>>()?;
                             work.push(Op::MakeEnum {
                                 tag: ty.tag,
                                 variant: variant.name.clone(),
@@ -163,9 +160,9 @@ impl RttiRegistry {
                         // stack before sizing an allocation with it (the read after
                         // would fail anyway — this fails first, without the alloc).
                         if width as u64 > data.len()?.saturating_sub(offset) {
-                            return Err(io_error!(
-                                InvalidData,
-                                "[BSTACK0800] RTTI POD width runs past the end of the data stack",
+                            return Err(rtti_err!(
+                                Malformed,
+                                "RTTI POD width runs past the end of the data stack",
                             ));
                         }
                         let mut buf = vec![0u8; width as usize];
@@ -217,7 +214,7 @@ impl RttiRegistry {
                     Shape::Option(inner) => {
                         // Niche location depends on the inner shape (a `Foreign`'s is
                         // its offset word @8, not the leading word).
-                        if option_present(data, &inner, offset)? {
+                        if inner.option_present(data, offset)? {
                             work.push(Op::MakeSome);
                             work.push(Op::Shape {
                                 shape: *inner,
@@ -233,20 +230,20 @@ impl RttiRegistry {
                         // are materialized eagerly, so an absurd count must fail
                         // cleanly rather than pre-allocate past the budget.
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            io_error!(
-                                InvalidData,
-                                "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+                            rtti_err!(
+                                Budget,
+                                "RTTI interpret budget exceeded (corrupt data or a cycle?)"
                             )
                         })?;
                         let stride = self.shape_stride(&inner, &mut cache)?;
                         let elem_ops: Vec<Op> = (0..n as u64)
-                            .map(|i| -> io::Result<Op> {
+                            .map(|i| -> RttiResult<Op> {
                                 Ok(Op::Shape {
                                     shape: (*inner).clone(),
                                     offset: add_off(offset, mul_off(i, stride)?)?,
                                 })
                             })
-                            .collect::<io::Result<Vec<Op>>>()?;
+                            .collect::<RttiResult<Vec<Op>>>()?;
                         work.push(Op::MakeArray(n as usize));
                         work.extend(elem_ops);
                     }
@@ -267,19 +264,19 @@ impl RttiRegistry {
                             // materialized eagerly, so a huge (but in-block) length must
                             // fail cleanly rather than pre-allocate past the budget.
                             budget = budget.checked_sub(len).ok_or_else(|| {
-                                io_error!(
-                                    InvalidData,
-                                    "[BSTACK0807] RTTI interpret budget exceeded (corrupt data or a cycle?)"
+                                rtti_err!(
+                                    Budget,
+                                    "RTTI interpret budget exceeded (corrupt data or a cycle?)"
                                 )
                             })?;
                             let elem_ops: Vec<Op> = (0..len)
-                                .map(|i| -> io::Result<Op> {
+                                .map(|i| -> RttiResult<Op> {
                                     Ok(Op::Shape {
                                         shape: (*inner).clone(),
                                         offset: add_off(base, mul_off(i, stride)?)?,
                                     })
                                 })
-                                .collect::<io::Result<Vec<Op>>>()?;
+                                .collect::<RttiResult<Vec<Op>>>()?;
                             work.push(Op::MakeVec(len as usize));
                             work.extend(elem_ops);
                         }
@@ -333,7 +330,7 @@ impl RttiRegistry {
                 Op::MakeSome => {
                     let inner = results
                         .pop()
-                        .ok_or_else(|| io_error!("[BSTACK0809] RTTI interpret stack underflow"))?;
+                        .ok_or_else(|| rtti_err!(Interpret, "RTTI interpret stack underflow"))?;
                     results.push(Value::Some(Box::new(inner)));
                 }
             }
@@ -341,9 +338,9 @@ impl RttiRegistry {
 
         match results.len() {
             1 => Ok(results.pop().unwrap()),
-            n => Err(io_error!(
-                InvalidData,
-                "[BSTACK0809] RTTI interpret produced {} values (expected 1)",
+            n => Err(rtti_err!(
+                Interpret,
+                "RTTI interpret produced {} values (expected 1)",
                 n
             )),
         }
@@ -354,11 +351,11 @@ impl RttiRegistry {
     /// it targets. This resolves within a single file by design — for a cross-file
     /// pointer, resolve its `file_id` through the [`registry`](crate::registry) first
     /// and call this against that file's stack.
-    pub fn read_ptr(&self, data: &BStack, ptr: WidePtr) -> io::Result<Value> {
+    pub fn read_ptr(&self, data: &BStack, ptr: WidePtr) -> RttiResult<Value> {
         let ord = self.resolve_ptr(ptr).ok_or_else(|| {
-            io_error!(
-                InvalidData,
-                "[BSTACK080A] cannot read an untyped / out-of-range RTTI pointer"
+            rtti_err!(
+                UntypedPointer,
+                "cannot read an untyped / out-of-range RTTI pointer"
             )
         })?;
         self.read_value(data, ord, ptr.offset().get())
@@ -380,7 +377,7 @@ impl RttiRegistry {
     /// Interpret the structure an [`AnyRef`] points at into a [`Value`] tree — the
     /// generic fallback when [`AnyRef::downcast`] does not match a compiled-in type.
     /// Errors if the reference's tag is not a registered type.
-    pub fn read_any(&self, data: &BStack, any: &AnyRef) -> io::Result<Value> {
+    pub fn read_any(&self, data: &BStack, any: &AnyRef) -> RttiResult<Value> {
         let ord = self.ordinal_of(any.tag()).ok_or_else(unknown_tag)?;
         self.read_value(data, ord, any.offset())
     }

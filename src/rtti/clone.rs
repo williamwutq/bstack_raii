@@ -4,7 +4,6 @@
 //! of `io_core::clone`.
 
 use std::collections::HashMap;
-use std::io;
 
 use bstack::{BStack, BStackRange};
 
@@ -15,15 +14,14 @@ use crate::registry::{FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::util::{io_error, read_u64};
+use crate::util::read_u64;
 
-use super::walk::{
-    DepthGuard, checked_vec_len, disc_mask, foreign_leaf, option_present, read_disc,
-};
+use super::walk::{DepthGuard, checked_vec_len, disc_mask, read_disc};
 use super::{
     BYTEVEC_HEADER, FOREIGN_REPR_LEN, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape,
     add_off, mul_off, unknown_tag,
 };
+use super::{RttiResult, rtti_err};
 
 /// One step of the non-recursive clone walk (see [`RttiRegistry::clone_value`]).
 enum CloneOp {
@@ -85,7 +83,7 @@ impl RttiRegistry {
         kind: OwnershipKind,
         src_off: u64,
         new_off: u64,
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         if matches!(kind, OwnershipKind::Ref) {
             return Ok(()); // aliased — the copied slot is correct
         }
@@ -98,15 +96,15 @@ impl RttiRegistry {
             self.clone_foreign_in(home, home_data, tag, kind, src_target, new_off)
         } else {
             let fid = FileId::from_u64(__wp.file_id()).ok_or_else(|| {
-                io_error!(
-                    NotFound,
-                    "[BSTACK080F] RTTI clone: the foreign target names an invalid file id"
+                rtti_err!(
+                    ForeignFile,
+                    "RTTI clone: the foreign target names an invalid file id"
                 )
             })?;
             let host = crate::registry::host_arc(fid).ok_or_else(|| {
-                io_error!(
-                    NotFound,
-                    "[BSTACK080F] RTTI clone: the foreign target's file is detached / not attached"
+                rtti_err!(
+                    ForeignFile,
+                    "RTTI clone: the foreign target's file is detached / not attached"
                 )
             })?;
             let alloc = ForeignHostAllocator::new(host, fid);
@@ -125,7 +123,7 @@ impl RttiRegistry {
         kind: OwnershipKind,
         src_target: NonNullOffset,
         new_off: NonNullOffset,
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let tstack = target.stack();
         match kind {
@@ -134,10 +132,12 @@ impl RttiRegistry {
                 // SAFETY: `src_target` came from the source's validated foreign slot.
                 let new_target = unsafe { self.clone_value(target, ord, src_target.as_u64())? };
                 // Repoint only the address word of the copied WidePtr.
-                home_data.set(
-                    new_off.checked_add(FOREIGN_REPR_LEN - 8)?.as_u64(),
-                    new_target.to_le_bytes(),
-                )
+                home_data
+                    .set(
+                        new_off.checked_add(FOREIGN_REPR_LEN - 8)?.as_u64(),
+                        new_target.to_le_bytes(),
+                    )
+                    .map_err(Into::into)
             }
             OwnershipKind::Strong => {
                 // `src_target` is proven non-null, so `strong`'s inline counter offset
@@ -189,7 +189,7 @@ impl RttiRegistry {
         alloc: &A,
         ordinal: RttiOrdinal,
         src_off: u64,
-    ) -> io::Result<u64> {
+    ) -> RttiResult<u64> {
         // Bound cross-file recursion (each `Foreign` hop recurses here natively).
         let _depth = DepthGuard::enter()?;
         let data = alloc.stack();
@@ -231,7 +231,7 @@ impl RttiRegistry {
         ordinal: RttiOrdinal,
         root_src: u64,
         st: &mut CloneState,
-    ) -> io::Result<u64> {
+    ) -> RttiResult<u64> {
         let mut work: Vec<CloneOp> = vec![CloneOp::Block {
             src_off: root_src,
             ord: ordinal,
@@ -240,7 +240,10 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                io_error!("[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)")
+                rtti_err!(
+                    Budget,
+                    "RTTI clone budget exceeded (corrupt data or a cycle?)"
+                )
             })?;
             match op {
                 CloneOp::Block { src_off, ord } => {
@@ -273,10 +276,7 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    io_error!(
-                                        "[BSTACK0808] no RTTI variant for discriminant {}",
-                                        raw
-                                    )
+                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
                                 })?;
                             let sp = add_off(src_off, e.payload_off as u64)?;
                             let np = add_off(new_off, e.payload_off as u64)?;
@@ -320,10 +320,7 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    io_error!(
-                                        "[BSTACK0808] no RTTI variant for discriminant {}",
-                                        raw
-                                    )
+                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
                                 })?;
                             let sp = add_off(src_base, e.payload_off as u64)?;
                             let np = add_off(new_base, e.payload_off as u64)?;
@@ -386,7 +383,7 @@ impl RttiRegistry {
                         // The slot (and its `0` niche) is already copied; only a
                         // present reference needs its child cloned / bumped. The niche
                         // location depends on the inner shape (`Foreign` → offset @8).
-                        if option_present(data, &inner, src_off)? {
+                        if inner.option_present(data, src_off)? {
                             work.push(CloneOp::Field {
                                 shape: *inner,
                                 src_off,
@@ -398,8 +395,9 @@ impl RttiRegistry {
                         // Charge for all elements up front — `n` is untrusted and
                         // the ops are materialized eagerly (see the read walk).
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            io_error!(
-                                "[BSTACK0807] RTTI clone budget exceeded (corrupt data or a cycle?)"
+                            rtti_err!(
+                                Budget,
+                                "RTTI clone budget exceeded (corrupt data or a cycle?)"
                             )
                         })?;
                         let stride = self.shape_stride(&inner, &mut st.cache)?;
@@ -481,8 +479,8 @@ impl RttiRegistry {
                                 // its reprs) was byte-copied above; deep-copy each
                                 // `owned` target across the boundary, bump `strong` /
                                 // `weak` — the per-element mirror of the scalar path.
-                                other if foreign_leaf(other).is_some() => {
-                                    let (tag, kind) = foreign_leaf(other).unwrap();
+                                other if other.foreign_leaf().is_some() => {
+                                    let (tag, kind) = other.foreign_leaf().unwrap();
                                     for i in 0..len {
                                         let delta = mul_off(i, stride)?;
                                         let so = add_off(sbase, delta)?;
@@ -501,9 +499,10 @@ impl RttiRegistry {
 
         // Every block is cloned and in `map`; repoint owned child pointers.
         for &(new_slot, src_child) in &st.patches {
-            let new_child = *st.map.get(&src_child).ok_or_else(|| {
-                io_error!("[BSTACK080E] RTTI clone: an owned child was not cloned")
-            })?;
+            let new_child = *st
+                .map
+                .get(&src_child)
+                .ok_or_else(|| rtti_err!(Clone, "RTTI clone: an owned child was not cloned"))?;
             data.set(new_slot, new_child.to_le_bytes())?;
         }
         // Then bump every shared target's refcount (over-count-safe, never under).
@@ -514,7 +513,7 @@ impl RttiRegistry {
         st.map
             .get(&root_src)
             .copied()
-            .ok_or_else(|| io_error!("[BSTACK080E] RTTI clone: the root was not cloned"))
+            .ok_or_else(|| rtti_err!(Clone, "RTTI clone: the root was not cloned"))
     }
 
     /// Allocate a `size`-byte block and byte-copy `[src_off, src_off+size)` into it,
@@ -531,7 +530,7 @@ impl RttiRegistry {
         src_off: NonNullOffset,
         size: u64,
         st: &mut CloneState,
-    ) -> io::Result<u64> {
+    ) -> RttiResult<u64> {
         let data = alloc.stack();
         // Allocate + WAL-log intention-first (shared with the compiled clone path).
         let range = alloc_logged(alloc, &mut st.wal, &mut st.allocated, size)?;
@@ -549,7 +548,7 @@ impl RttiRegistry {
         tag: EightCC,
         data_child: u64,
         st: &mut CloneState,
-    ) -> io::Result<u64> {
+    ) -> RttiResult<u64> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         self.ensure_type(ord, st)?;
         if st.cache[&ord].weak {
@@ -561,7 +560,7 @@ impl RttiRegistry {
     }
 
     /// Load + cache a type descriptor if not already present.
-    fn ensure_type(&self, ord: RttiOrdinal, st: &mut CloneState) -> io::Result<()> {
+    fn ensure_type(&self, ord: RttiOrdinal, st: &mut CloneState) -> RttiResult<()> {
         if let std::collections::hash_map::Entry::Vacant(e) = st.cache.entry(ord) {
             e.insert(self.load_type(ord)?);
         }

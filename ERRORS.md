@@ -514,3 +514,15 @@ block) or panic under `overflow-checks`, the walk rejects the record. **Fix:**
 the root offset is bogus — obtain it from a real block (a constructor, a field
 read, `move_out`, or `AnyRef::from_block`) rather than an arbitrary value.
 
+### BSTACK081B — underlying I/O error during an RTTI operation
+An RTTI interpreter or codec operation called down into a lower layer — a stack
+read/write, an allocator, the WAL, a refcount, or (for the registry persistence
+methods) the filesystem — and *that* call failed with a [`std::io::Error`]. The
+interpreter has no more specific RTTI cause to report, so it surfaces the
+underlying error verbatim under this one catch-all code, preserving the original
+[`io::ErrorKind`] and message (so a round-trip back to `io::Error` is lossless).
+This is the only `RttiError` category that is not itself an RTTI-level fault.
+**Fix:** diagnose the wrapped I/O error by its own message — a truncated/corrupt
+file, an out-of-bounds offset into the data stack, an exhausted allocator, or a
+missing/locked registry file — rather than the RTTI layer.
+

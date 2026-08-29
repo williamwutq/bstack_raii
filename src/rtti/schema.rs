@@ -4,11 +4,10 @@
 //! reads over the generic [`Reader`](crate::util::Reader) cursor, and the schema-side
 //! `layouts_match` / `class_value_slot` helpers.
 
-use std::io;
-
 use crate::primitives::{EightCC, OwnershipKind};
-use crate::util::{Reader, Writer, io_error};
+use crate::util::{Reader, Writer};
 
+use super::{RttiResult, rtti_err};
 use super::{class_error, too_large};
 
 const FLAG_ENUM: u8 = 0b0000_0001;
@@ -30,66 +29,33 @@ mod shape_tag {
     pub const CLASS: u8 = 0x20;
 }
 
-// -- RTTI-framed reads over the generic byte cursor --------------------------
-// The cursor ([`Reader`]) is a pure, error-free primitive: a short read is a `None`,
-// a failed alignment a `false`. These free wrappers add the little-endian typed reads
-// and map that failure to the RTTI truncation error, keeping the domain vocabulary
-// here at the caller rather than baked into `util`.
+// -- RTTI error framing over the generic byte cursor -------------------------
+// The cursor ([`Reader`]) is a pure, error-free primitive: its typed little-endian
+// reads return `None` on a short read, a failed alignment returns `false`. `need`
+// maps that `None` to the RTTI truncation error, so a read site is `need(r.u32())?`,
+// keeping the domain vocabulary here at the caller rather than baked into `util`.
 
-/// Map a byte-cursor underrun (a `None` from [`Reader::take`](crate::util::Reader::take))
-/// to the RTTI truncation error.
-fn need<T>(v: Option<T>) -> io::Result<T> {
-    v.ok_or_else(|| io_error!("[BSTACK0804] truncated RTTI record"))
-}
-
-#[inline(always)]
-fn u8(r: &mut Reader) -> io::Result<u8> {
-    Ok(need(r.take(1))?[0])
-}
-
-#[inline(always)]
-fn u16(r: &mut Reader) -> io::Result<u16> {
-    Ok(u16::from_le_bytes(need(r.take(2))?.try_into().unwrap()))
-}
-
-#[inline(always)]
-fn u32(r: &mut Reader) -> io::Result<u32> {
-    Ok(u32::from_le_bytes(need(r.take(4))?.try_into().unwrap()))
-}
-
-#[inline(always)]
-fn u64(r: &mut Reader) -> io::Result<u64> {
-    Ok(u64::from_le_bytes(need(r.take(8))?.try_into().unwrap()))
-}
-
-#[inline(always)]
-fn i64(r: &mut Reader) -> io::Result<i64> {
-    Ok(i64::from_le_bytes(need(r.take(8))?.try_into().unwrap()))
-}
-
-#[inline(always)]
-fn eightcc(r: &mut Reader) -> io::Result<EightCC> {
-    Ok(EightCC(need(r.take(8))?.try_into().unwrap()))
+/// Map a byte-cursor underrun (a `None` from a [`Reader`] read) to the RTTI truncation
+/// error, so `need(r.u32())?` reads a `u32` or fails as a truncated record.
+fn need<T>(v: Option<T>) -> RttiResult<T> {
+    v.ok_or(rtti_err!(Truncated, "truncated RTTI record"))
 }
 
 /// Read an `n`-byte UTF-8 string, RTTI-framing both a short read and invalid UTF-8.
-fn string(r: &mut Reader, n: usize) -> io::Result<String> {
+fn string(r: &mut Reader, n: usize) -> RttiResult<String> {
     String::from_utf8(need(r.take(n))?.to_vec())
-        .map_err(|_| io_error!("[BSTACK0802] RTTI name is not valid UTF-8"))
+        .map_err(|_| rtti_err!(Utf8, "RTTI name is not valid UTF-8"))
 }
 
 /// Advance `r` past zero-padding to the next `a`-byte boundary, RTTI-framing a boundary
 /// that runs past the record. The bounds check lives in the generic
 /// [`Reader::skip_pad`](crate::util::Reader::skip_pad) (which reports fit as a `bool`);
 /// the domain error is applied here, at the caller.
-fn align(r: &mut Reader, a: usize) -> io::Result<()> {
+fn align(r: &mut Reader, a: usize) -> RttiResult<()> {
     if r.skip_pad(a) {
         Ok(())
     } else {
-        Err(io_error!(
-            InvalidData,
-            "[BSTACK0804] truncated RTTI record (alignment)"
-        ))
+        Err(rtti_err!(Truncated, "truncated RTTI record (alignment)"))
     }
 }
 
@@ -136,7 +102,7 @@ pub enum Shape {
 const MAX_SHAPE_DEPTH: usize = 64;
 
 impl Shape {
-    fn encode(&self, w: &mut Writer) -> io::Result<()> {
+    fn encode(&self, w: &mut Writer) -> RttiResult<()> {
         use shape_tag as t;
         match self {
             Shape::Pod { width } => {
@@ -208,7 +174,7 @@ impl Shape {
         Ok(())
     }
 
-    fn decode(r: &mut Reader) -> io::Result<Shape> {
+    fn decode(r: &mut Reader) -> RttiResult<Shape> {
         Self::decode_at(r, 0)
     }
 
@@ -217,33 +183,35 @@ impl Shape {
     /// tag per `Option` / `Array` / `Vec` / `Tuple` / `Class` level), so an
     /// unbounded decode would let a corrupt record overflow the native stack during
     /// `load_type` / `open`. (Width is already bounded — a tuple's arity is a `u8`.)
-    fn decode_at(r: &mut Reader, depth: usize) -> io::Result<Shape> {
+    fn decode_at(r: &mut Reader, depth: usize) -> RttiResult<Shape> {
         use shape_tag as t;
         if depth >= MAX_SHAPE_DEPTH {
-            return Err(io_error!(
-                InvalidData,
-                "[BSTACK0818] RTTI shape nesting exceeds the maximum depth",
+            return Err(rtti_err!(
+                Depth,
+                "RTTI shape nesting exceeds the maximum depth",
             ));
         }
-        let tag = u8(r)?;
+        let tag = need(r.u8())?;
         Ok(match tag {
-            t::POD => Shape::Pod { width: u32(r)? },
-            t::OWNED => Shape::Owned(eightcc(r)?),
-            t::STRONG => Shape::Strong(eightcc(r)?),
-            t::WEAK => Shape::Weak(eightcc(r)?),
-            t::REF => Shape::Ref(eightcc(r)?),
-            t::EMBED => Shape::Embed(eightcc(r)?),
+            t::POD => Shape::Pod {
+                width: need(r.u32())?,
+            },
+            t::OWNED => Shape::Owned(need(r.eightcc())?),
+            t::STRONG => Shape::Strong(need(r.eightcc())?),
+            t::WEAK => Shape::Weak(need(r.eightcc())?),
+            t::REF => Shape::Ref(need(r.eightcc())?),
+            t::EMBED => Shape::Embed(need(r.eightcc())?),
             t::FOREIGN => {
-                let tag = eightcc(r)?;
-                let kb = u8(r)?;
+                let tag = need(r.eightcc())?;
+                let kb = need(r.u8())?;
                 let kind = OwnershipKind::from_u8(kb).ok_or_else(|| {
-                    io_error!("[BSTACK0803] unknown RTTI foreign kind {:#04x}", kb)
+                    rtti_err!(UnknownTag, "unknown RTTI foreign kind {:#04x}", kb)
                 })?;
                 Shape::Foreign { tag, kind }
             }
             t::OPTION => Shape::Option(Box::new(Shape::decode_at(r, depth + 1)?)),
             t::ARRAY => {
-                let n = u32(r)?;
+                let n = need(r.u32())?;
                 Shape::Array {
                     n,
                     inner: Box::new(Shape::decode_at(r, depth + 1)?),
@@ -251,16 +219,16 @@ impl Shape {
             }
             t::VEC => Shape::Vec(Box::new(Shape::decode_at(r, depth + 1)?)),
             t::TUPLE => {
-                let k = u8(r)? as usize;
+                let k = need(r.u8())? as usize;
                 let items = (0..k)
                     .map(|_| Shape::decode_at(r, depth + 1))
                     .collect::<Result<Box<[_]>, _>>()?;
                 Shape::Tuple(items)
             }
             t::CLASS => {
-                let mutable = u8(r)? != 0;
+                let mutable = need(r.u8())? != 0;
                 let inner = Box::new(Shape::decode_at(r, depth + 1)?);
-                let value_len = u32(r)? as usize;
+                let value_len = need(r.u32())? as usize;
                 let value = need(r.take(value_len))?.into();
                 Shape::Class {
                     mutable,
@@ -269,9 +237,9 @@ impl Shape {
                 }
             }
             other => {
-                return Err(io_error!(
-                    InvalidData,
-                    "[BSTACK0803] unknown RTTI shape tag {:#04x}",
+                return Err(rtti_err!(
+                    UnknownTag,
+                    "unknown RTTI shape tag {:#04x}",
                     other
                 ));
             }
@@ -289,7 +257,7 @@ pub struct RttiField {
 }
 
 impl RttiField {
-    fn encode(&self, w: &mut Writer) -> io::Result<()> {
+    fn encode(&self, w: &mut Writer) -> RttiResult<()> {
         let mut sw = Writer::default();
         self.shape.encode(&mut sw)?;
         let name = self.name.as_bytes();
@@ -307,18 +275,18 @@ impl RttiField {
         Ok(())
     }
 
-    fn decode(r: &mut Reader) -> io::Result<RttiField> {
-        let offset = u32(r)?;
-        let name_len = u16(r)? as usize;
-        let shape_len = u16(r)? as usize;
+    fn decode(r: &mut Reader) -> RttiResult<RttiField> {
+        let offset = need(r.u32())?;
+        let name_len = need(r.u16())? as usize;
+        let shape_len = need(r.u16())? as usize;
         let name = string(r, name_len)?;
         align(r, 4)?;
         let shape_start = r.pos;
         let shape = Shape::decode(r)?;
         if r.pos - shape_start != shape_len {
-            return Err(io_error!(
-                InvalidData,
-                "[BSTACK0805] RTTI field shape length mismatch"
+            return Err(rtti_err!(
+                ShapeLenMismatch,
+                "RTTI field shape length mismatch"
             ));
         }
         align(r, 4)?;
@@ -340,7 +308,7 @@ pub struct RttiVariant {
 }
 
 impl RttiVariant {
-    fn encode(&self, w: &mut Writer) -> io::Result<()> {
+    fn encode(&self, w: &mut Writer) -> RttiResult<()> {
         w.align(8); // each variant is 8-aligned
         w.i64(self.disc_value);
         let name = self.name.as_bytes();
@@ -359,12 +327,12 @@ impl RttiVariant {
         Ok(())
     }
 
-    fn decode(r: &mut Reader) -> io::Result<RttiVariant> {
+    fn decode(r: &mut Reader) -> RttiResult<RttiVariant> {
         align(r, 8)?;
-        let disc_value = i64(r)?;
-        let name_len = u16(r)? as usize;
-        let field_count = u16(r)? as usize;
-        let _pad = u32(r)?;
+        let disc_value = need(r.i64())?;
+        let name_len = need(r.u16())? as usize;
+        let field_count = need(r.u16())? as usize;
+        let _pad = need(r.u32())?;
         let name = string(r, name_len)?;
         align(r, 8)?;
         let fields = (0..field_count)
@@ -414,7 +382,7 @@ pub struct RttiType {
 }
 
 /// Serialize a type's record **body** (the `TypeDesc`, without the record framing).
-pub fn encode_type(ty: &RttiType) -> io::Result<Vec<u8>> {
+pub fn encode_type(ty: &RttiType) -> RttiResult<Vec<u8>> {
     let mut w = Writer::default();
 
     let raw_count = match &ty.body {
@@ -470,16 +438,16 @@ pub fn encode_type(ty: &RttiType) -> io::Result<Vec<u8>> {
 
 /// Deserialize a type's record **body** back into an [`RttiType`], given its tag
 /// (which lives in the record framing, not the body).
-pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
+pub fn decode_type(tag: EightCC, body: &[u8]) -> RttiResult<RttiType> {
     let mut r = Reader::new(body);
-    let flags = u8(&mut r)?;
-    let disc_width = u8(&mut r)?;
-    let name_len = u16(&mut r)? as usize;
-    let count = u16(&mut r)? as usize;
-    let disc_off = u16(&mut r)?;
-    let payload_off = u16(&mut r)?;
-    let ondisk_size = u64(&mut r)?;
-    let ctrl_tag_raw = eightcc(&mut r)?;
+    let flags = need(r.u8())?;
+    let disc_width = need(r.u8())?;
+    let name_len = need(r.u16())? as usize;
+    let count = need(r.u16())? as usize;
+    let disc_off = need(r.u16())?;
+    let payload_off = need(r.u16())?;
+    let ondisk_size = need(r.u64())?;
+    let ctrl_tag_raw = need(r.eightcc())?;
     let name = string(&mut r, name_len)?;
     align(&mut r, 8)?;
     let weak = flags & FLAG_WEAK != 0;
@@ -488,19 +456,16 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
         if disc_width > 8 {
             // A discriminant is read into a `u64`; reject a corrupt wider width on
             // load so no interpreter path later slices past an 8-byte buffer.
-            return Err(io_error!(
-                InvalidData,
-                "[BSTACK0816] RTTI enum discriminant width exceeds 8 bytes",
+            return Err(rtti_err!(
+                DiscWidth,
+                "RTTI enum discriminant width exceeds 8 bytes",
             ));
         }
         if disc_width == 0 {
             // `disc_mask(0)` is 0 and a 0-byte read yields 0, so every variant
             // search would silently match the first variant; a corrupt record
             // must error, not mis-parse.
-            return Err(io_error!(
-                InvalidData,
-                "[BSTACK0816] RTTI enum discriminant width is zero"
-            ));
+            return Err(rtti_err!(DiscWidth, "RTTI enum discriminant width is zero"));
         }
         let variants = (0..count)
             .map(|_| RttiVariant::decode(&mut r))
@@ -531,7 +496,7 @@ pub fn decode_type(tag: EightCC, body: &[u8]) -> io::Result<RttiType> {
 
 /// Frame an already-encoded body into a full record: `eightcc + body_len + _pad +
 /// body`, padded to 8. Returns the framed record and the validated `body_len`.
-pub(in crate::rtti) fn frame_record(tag: EightCC, body: &[u8]) -> io::Result<(Vec<u8>, u32)> {
+pub(in crate::rtti) fn frame_record(tag: EightCC, body: &[u8]) -> RttiResult<(Vec<u8>, u32)> {
     let body_len =
         u32::try_from(body.len()).map_err(|_| too_large("record body length", "4 GiB"))?;
     let mut w = Writer::default();
@@ -591,16 +556,16 @@ pub(in crate::rtti) fn layouts_match(a: &RttiType, b: &RttiType) -> bool {
 pub(in crate::rtti) fn class_value_slot(
     body: &[u8],
     target: &str,
-) -> io::Result<Option<(usize, usize, bool)>> {
+) -> RttiResult<Option<(usize, usize, bool)>> {
     let mut r = Reader::new(body);
-    let flags = u8(&mut r)?;
-    let _disc_width = u8(&mut r)?;
-    let name_len = u16(&mut r)? as usize;
-    let count = u16(&mut r)? as usize;
-    let _disc_off = u16(&mut r)?;
-    let _payload_off = u16(&mut r)?;
-    let _ondisk_size = u64(&mut r)?;
-    let _ctrl_tag = eightcc(&mut r)?; // control tag — same fixed-header slot
+    let flags = need(r.u8())?;
+    let _disc_width = need(r.u8())?;
+    let name_len = need(r.u16())? as usize;
+    let count = need(r.u16())? as usize;
+    let _disc_off = need(r.u16())?;
+    let _payload_off = need(r.u16())?;
+    let _ondisk_size = need(r.u64())?;
+    let _ctrl_tag = need(r.eightcc())?; // control tag — same fixed-header slot
     let _name = string(&mut r, name_len)?;
     align(&mut r, 8)?;
     // Only structs carry class variables; an enum's `count` is its variants.
@@ -608,9 +573,9 @@ pub(in crate::rtti) fn class_value_slot(
         return Ok(None);
     }
     for _ in 0..count {
-        let _offset = u32(&mut r)?;
-        let fname_len = u16(&mut r)? as usize;
-        let _shape_len = u16(&mut r)? as usize;
+        let _offset = need(r.u32())?;
+        let fname_len = need(r.u16())? as usize;
+        let _shape_len = need(r.u16())? as usize;
         let fname = string(&mut r, fname_len)?;
         align(&mut r, 4)?;
         if fname == target {
@@ -626,13 +591,13 @@ pub(in crate::rtti) fn class_value_slot(
 /// If the shape at the cursor is a `CLASS` shape, consume its header and return
 /// `(value offset within body, value length, mutable)` with the cursor left at the
 /// value bytes; otherwise `None` (the named field is not a class variable).
-fn class_value_within_shape(r: &mut Reader) -> io::Result<Option<(usize, usize, bool)>> {
-    if u8(r)? != shape_tag::CLASS {
+fn class_value_within_shape(r: &mut Reader) -> RttiResult<Option<(usize, usize, bool)>> {
+    if need(r.u8())? != shape_tag::CLASS {
         return Ok(None);
     }
-    let mutable = u8(r)? != 0;
+    let mutable = need(r.u8())? != 0;
     let _inner = Shape::decode(r)?;
-    let value_len = u32(r)? as usize;
+    let value_len = need(r.u32())? as usize;
     // The value slot `[pos, pos + value_len)` must lie fully within this record's
     // body. Without this check a corrupt `value_len` flows into `set_class_value`,
     // which then writes `value_len` bytes at an offset past the record — tearing a

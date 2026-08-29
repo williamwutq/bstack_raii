@@ -3,13 +3,12 @@
 //! `&dyn Any`), the read [`Value`] tree, and the `move_out` transfer types
 //! ([`Moved`] / [`VecRef`] / [`ForeignPtr`]).
 
-use std::io;
-
 use bstack::{BStack, BStackRange};
 
 use crate::primitives::{EightCC, OwnershipKind};
 use crate::types::traits::{BStackBlock, BStackCast};
 
+use super::RttiResult;
 use super::{HEADER_TAG_OFFSET, Shape, add_off};
 
 /// A **runtime-typed reference** — an `(EightCC, offset)` into a data file, the RTTI
@@ -50,7 +49,7 @@ impl AnyRef {
 
     /// Recover the type tag from the target block's on-disk [`BlockHeader`](crate::BlockHeader)
     /// (`tag` at offset 8) — the no-registry path, one small read.
-    pub fn from_block(data: &BStack, offset: u64) -> io::Result<Self> {
+    pub fn from_block(data: &BStack, offset: u64) -> RttiResult<Self> {
         let mut tag = [0u8; 8];
         data.get_into(add_off(offset, HEADER_TAG_OFFSET)?, &mut tag)?;
         Ok(Self {

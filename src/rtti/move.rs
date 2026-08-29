@@ -3,7 +3,6 @@
 //! each owned reference back to the caller.
 
 use std::collections::HashMap;
-use std::io;
 
 use bstack::{BStack, BStackRange};
 
@@ -13,15 +12,14 @@ use crate::primitives::{NonNullOffset, WidePtr};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::util::{SmallStringMap, io_error, read_u64};
+use crate::util::{SmallStringMap, read_u64};
 
-use super::walk::{
-    disc_mask, element_ref_tag, foreign_leaf, read_disc, shape_has_reference, weak_element_tag,
-};
+use super::walk::{disc_mask, read_disc};
 use super::{
     AnyRef, CONTROL_SIZE, FOREIGN_REPR_LEN, ForeignPtr, Moved, RttiBody, RttiField, RttiOrdinal,
     RttiRegistry, RttiType, Shape, VecRef, add_off, mul_off, unknown_tag,
 };
+use super::{RttiResult, rtti_err};
 
 impl RttiRegistry {
     /// **Disassemble** the block of type `ordinal` at `block_off`: hand back its
@@ -65,7 +63,7 @@ impl RttiRegistry {
         alloc: &A,
         ordinal: RttiOrdinal,
         block_off: u64,
-    ) -> io::Result<SmallStringMap<Moved>> {
+    ) -> RttiResult<SmallStringMap<Moved>> {
         let data = alloc.stack();
         let mut cache: HashMap<RttiOrdinal, RttiType> = HashMap::new();
         let mut materialized: Vec<BStackRange> = Vec::new();
@@ -94,9 +92,9 @@ impl RttiRegistry {
                 // the zero count for the whole field walk — never both succeeding.
                 if !refcount::cas(data, NonNullOffset::from_field(strong_slot)?, 1, 0)? {
                     let strong = read_u64(data, strong_slot)?;
-                    return Err(io_error!(
-                        InvalidData,
-                        "[BSTACK0819] RTTI move_out of a shared reference-counted block \
+                    return Err(rtti_err!(
+                        SharedMove,
+                        "RTTI move_out of a shared reference-counted block \
                          (strong count {}); only the sole owner may disassemble it",
                         strong
                     ));
@@ -156,7 +154,7 @@ impl RttiRegistry {
         if let Err(e) = unsafe { crate::io_core::commit_home_frees(alloc, to_free) } {
             // SAFETY: `materialized` are this call's own embed copies.
             let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
-            return Err(e);
+            return Err(e.into());
         }
         Ok(map)
     }
@@ -171,7 +169,7 @@ impl RttiRegistry {
         block_off: u64,
         cache: &mut HashMap<RttiOrdinal, RttiType>,
         materialized: &mut Vec<BStackRange>,
-    ) -> io::Result<SmallStringMap<Moved>> {
+    ) -> RttiResult<SmallStringMap<Moved>> {
         if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ordinal) {
             e.insert(self.load_type(ordinal)?);
         }
@@ -190,11 +188,7 @@ impl RttiRegistry {
                         .iter()
                         .find(|v| (v.disc_value as u64) & mask == raw)
                         .ok_or_else(|| {
-                            io_error!(
-                                InvalidData,
-                                "[BSTACK0808] no RTTI variant for discriminant {}",
-                                raw
-                            )
+                            rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
                         })?;
                     (
                         variant.fields.clone(),
@@ -223,9 +217,9 @@ impl RttiRegistry {
             // instead: the caller's error path reclaims `materialized`, and per
             // move_out's contract nothing else has been freed yet.
             if map.insert(f.name.clone(), moved).is_some() {
-                return Err(io_error!(
-                    InvalidData,
-                    "[BSTACK0800] RTTI record has two fields named '{}'",
+                return Err(rtti_err!(
+                    Malformed,
+                    "RTTI record has two fields named '{}'",
                     f.name
                 ));
             }
@@ -244,14 +238,14 @@ impl RttiRegistry {
         off: u64,
         cache: &mut HashMap<RttiOrdinal, RttiType>,
         materialized: &mut Vec<BStackRange>,
-    ) -> io::Result<Moved> {
+    ) -> RttiResult<Moved> {
         Ok(match shape {
             Shape::Pod { width } => {
                 // Untrusted width: bound against the stack before allocating.
                 if *width as u64 > data.len()?.saturating_sub(off) {
-                    return Err(io_error!(
-                        InvalidData,
-                        "[BSTACK0800] RTTI POD width runs past the end of the data stack",
+                    return Err(rtti_err!(
+                        Malformed,
+                        "RTTI POD width runs past the end of the data stack",
                     ));
                 }
                 let mut buf = vec![0u8; *width as usize];
@@ -311,7 +305,7 @@ impl RttiRegistry {
                 }
             }
             Shape::Array { n, inner } => {
-                if let Some((tag, kind)) = foreign_leaf(inner) {
+                if let Some((tag, kind)) = inner.foreign_leaf() {
                     // A foreign array: each element is a 16-byte `WidePtr` inline
                     // in the shell; hand every cross-file pointer back to the caller.
                     let mut list = Vec::new(); // no capacity hint: `n` is untrusted
@@ -329,7 +323,7 @@ impl RttiRegistry {
                         });
                     }
                     Moved::ForeignList(list.into())
-                } else if let Some(tag) = weak_element_tag(inner) {
+                } else if let Some(tag) = inner.weak_element_tag() {
                     // A weak array (`[#[bstack_weak] T; N]`, opt): each element is a
                     // `u64` **control-block** offset at `off + i*8`. Kept distinct from a
                     // data-ref list (`Moved::WeakList`, the array analog of `Moved::Weak`)
@@ -340,7 +334,7 @@ impl RttiRegistry {
                         list.push((e != 0).then(|| unsafe { AnyRef::new(tag, e) }));
                     }
                     Moved::WeakList(list.into())
-                } else if let Some(tag) = element_ref_tag(inner) {
+                } else if let Some(tag) = inner.element_ref_tag() {
                     // A flat data-reference array (`owned` / `strong` / `ref`, opt): each
                     // element is a `u64` **data** offset at `off + i*8`.
                     let mut list = Vec::new(); // no capacity hint: `n` is untrusted
@@ -367,7 +361,7 @@ impl RttiRegistry {
                         list.push(Some(unsafe { AnyRef::new(*etag, range.start()) }));
                     }
                     Moved::List(list.into())
-                } else if matches!(&**inner, Shape::Array { .. }) && shape_has_reference(inner) {
+                } else if matches!(&**inner, Shape::Array { .. }) && inner.has_reference() {
                     // A nested reference array (`[[T; M]; N]`, …): move each outer
                     // element (itself a container) as its own `Moved`.
                     let stride = self.shape_stride(inner, cache)?;
@@ -383,11 +377,11 @@ impl RttiRegistry {
                         )?);
                     }
                     Moved::Array(parts.into())
-                } else if shape_has_reference(inner) {
+                } else if inner.has_reference() {
                     // Any other reference-bearing element we can't flatten one-per-`u64`.
-                    return Err(io_error!(
+                    return Err(rtti_err!(
                         Unsupported,
-                        "[BSTACK0811] RTTI move_out of an array whose element is a vector (or \
+                        "RTTI move_out of an array whose element is a vector (or \
                          other reference-bearing container that is neither a flat reference, \
                          an `#[embed]`, nor a nested array) is not yet supported"
                     ));
@@ -400,7 +394,7 @@ impl RttiRegistry {
                 }
             }
             Shape::Tuple(items) => {
-                if items.iter().any(|it| foreign_leaf(it).is_some()) {
+                if items.iter().any(|it| it.foreign_leaf().is_some()) {
                     // A tuple with a `Foreign` member: move each member individually —
                     // POD by value, a foreign member as its own `Moved::Foreign` — at
                     // cumulative element offsets.

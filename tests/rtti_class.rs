@@ -8,7 +8,9 @@
 
 use bstack::{BStack, BStackAllocator, FirstFitBStackAllocator};
 use bstack_raii::registry;
-use bstack_raii::rtti::{self, AnyRef, ForeignPtr, Moved, OwnershipKind, RttiBody, Shape, Value};
+use bstack_raii::rtti::{
+    self, AnyRef, ForeignPtr, Moved, OwnershipKind, RttiBody, RttiErrorKind, Shape, Value,
+};
 use bstack_raii::{
     BStackBlock, BStackBlockVec, BStackCast, BStackDrop, BStackOwned, Foreign, TryClone, WidePtr,
     bstack_class, rtti_path,
@@ -2781,7 +2783,8 @@ fn interpret_foreign_cycle_recursion_bounded() {
     // reached — either way a clean error, never a stack overflow.
     let e = unsafe { reg.clone_value(&alloc, ord, a_off) }.unwrap_err();
     assert!(
-        e.to_string().contains("BSTACK0807") || e.kind() == std::io::ErrorKind::WouldBlock,
+        e.to_string().contains("BSTACK0807")
+            || e.kind() == RttiErrorKind::Io(std::io::ErrorKind::WouldBlock),
         "clone: {e}"
     );
 

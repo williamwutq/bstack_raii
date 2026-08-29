@@ -3,7 +3,6 @@
 //! option storage, refcount decrements and all. The RTTI analog of `io_core::teardown`.
 
 use std::collections::HashMap;
-use std::io;
 
 use bstack::BStackRange;
 
@@ -14,16 +13,14 @@ use crate::registry::{FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
 };
-use crate::util::{io_error, read_u64};
+use crate::util::read_u64;
 
-use super::walk::{
-    DepthGuard, checked_vec_len, commit_weak_release, disc_mask, foreign_leaf, option_present,
-    read_disc,
-};
+use super::walk::{DepthGuard, checked_vec_len, commit_weak_release, disc_mask, read_disc};
 use super::{
     BYTEVEC_HEADER, CONTROL_SIZE, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, add_off,
     mul_off, unknown_tag,
 };
+use super::{RttiResult, rtti_err};
 
 /// One step of the non-recursive teardown walk (see [`RttiRegistry::teardown`]).
 enum TdOp {
@@ -70,7 +67,7 @@ impl RttiRegistry {
         alloc: &A,
         ordinal: RttiOrdinal,
         block_off: u64,
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         // Bound cross-file recursion (each `Foreign` hop recurses here natively).
         let _depth = DepthGuard::enter()?;
         let data = alloc.stack();
@@ -94,9 +91,9 @@ impl RttiRegistry {
 
         while let Some(op) = work.pop() {
             budget = budget.checked_sub(1).ok_or_else(|| {
-                io_error!(
-                    InvalidData,
-                    "[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)"
+                rtti_err!(
+                    Budget,
+                    "RTTI teardown budget exceeded (corrupt data or a cycle?)"
                 )
             })?;
             match op {
@@ -136,11 +133,7 @@ impl RttiRegistry {
                                 .iter()
                                 .find(|v| (v.disc_value as u64) & mask == raw)
                                 .ok_or_else(|| {
-                                    io_error!(
-                                        InvalidData,
-                                        "[BSTACK0808] no RTTI variant for discriminant {}",
-                                        raw
-                                    )
+                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
                                 })?;
                             let payload_base = add_off(block_off, e.payload_off as u64)?;
                             for f in &variant.fields {
@@ -196,7 +189,7 @@ impl RttiRegistry {
                         foreign_releases.push((tag, kind, file_id, off));
                     }
                     Shape::Option(inner) => {
-                        if option_present(data, &inner, offset)? {
+                        if inner.option_present(data, offset)? {
                             work.push(TdOp::Shape {
                                 shape: *inner,
                                 offset,
@@ -207,7 +200,10 @@ impl RttiRegistry {
                         // Charge for all elements up front — `n` is untrusted and
                         // the ops are materialized eagerly (see the read walk).
                         budget = budget.checked_sub(n as u64).ok_or_else(|| {
-                            io_error!("[BSTACK0807] RTTI teardown budget exceeded (corrupt data or a cycle?)")
+                            rtti_err!(
+                                Budget,
+                                "RTTI teardown budget exceeded (corrupt data or a cycle?)"
+                            )
                         })?;
                         let stride = self.shape_stride(&inner, &mut cache)?;
                         for i in 0..n as u64 {
@@ -275,8 +271,8 @@ impl RttiRegistry {
                                 // A vector of `Foreign` pointers: each element is a
                                 // 16-byte `WidePtr`; its target is torn down in its
                                 // own file in the commit phase (a null offset is a no-op).
-                                other if foreign_leaf(other).is_some() => {
-                                    let (tag, kind) = foreign_leaf(other).unwrap();
+                                other if other.foreign_leaf().is_some() => {
+                                    let (tag, kind) = other.foreign_leaf().unwrap();
                                     for i in 0..len {
                                         let __wp = WidePtr::read_from_stack(
                                             data,
@@ -330,7 +326,7 @@ impl RttiRegistry {
         // rather than leaking permanently.
         // SAFETY: every range in `to_free` was collected by the walk from
         // owned slots of the structure being torn down, in this file.
-        unsafe { crate::io_core::commit_home_frees(alloc, to_free) }
+        unsafe { crate::io_core::commit_home_frees(alloc, to_free) }.map_err(Into::into)
     }
 
     /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown)):
@@ -343,7 +339,7 @@ impl RttiRegistry {
         alloc: &A,
         tag: EightCC,
         data_off: u64,
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         let data = alloc.stack();
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         if self.load_type(ord)?.weak {
@@ -391,7 +387,7 @@ impl RttiRegistry {
         kind: OwnershipKind,
         file_id: u64,
         offset: u64,
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         if offset == 0 || matches!(kind, OwnershipKind::Ref) {
             return Ok(()); // null, or a non-owning alias
         }
@@ -422,7 +418,7 @@ impl RttiRegistry {
         tag: EightCC,
         kind: OwnershipKind,
         offset: u64,
-    ) -> io::Result<()> {
+    ) -> RttiResult<()> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let data = target.stack();
         match kind {
