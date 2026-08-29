@@ -11,7 +11,7 @@ use crate::types::compiled::rc::{CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET};
 use crate::util::{get_u64, read_u64};
 
 use super::read::Op;
-use super::walk::{disc_mask, read_disc, set_error, swap_error, verify_data_block};
+use super::walk::{disc_mask, read_disc, verify_data_block};
 use super::{
     AnyRef, FOREIGN_REPR_LEN, ForeignPtr, HEADER_TAG_OFFSET, Resolved, RttiBody, RttiField,
     RttiOrdinal, RttiRegistry, Shape, Value, add_off, unknown_tag,
@@ -36,7 +36,7 @@ impl RttiRegistry {
         path: &[&str],
     ) -> RttiResult<Resolved> {
         if path.is_empty() {
-            return Err(set_error("empty field path"));
+            return Err(rtti_err!(Set, "RTTI set: empty field path"));
         }
         let mut ord = ordinal;
         let mut base = block_off;
@@ -53,14 +53,16 @@ impl RttiRegistry {
                         .variants
                         .iter()
                         .find(|v| (v.disc_value as u64) & mask == raw)
-                        .ok_or_else(|| set_error(format!("no variant for discriminant {raw}")))?;
+                        .ok_or_else(|| {
+                            rtti_err!(Set, "RTTI set: no variant for discriminant {}", raw)
+                        })?;
                     (&variant.fields, add_off(base, e.payload_off as u64)?)
                 }
             };
             let field = fields
                 .iter()
                 .find(|f| &f.name == seg)
-                .ok_or_else(|| set_error(format!("no field named `{seg}`")))?;
+                .ok_or_else(|| rtti_err!(Set, "RTTI set: no field named `{}`", seg))?;
             let field_off = add_off(field_base, field.offset as u64)?;
 
             if i + 1 == path.len() {
@@ -83,7 +85,7 @@ impl RttiRegistry {
                 Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
                     let child = read_u64(data, field_off)?;
                     if child == 0 {
-                        return Err(set_error(format!("null reference at `{seg}`")));
+                        return Err(rtti_err!(Set, "RTTI set: null reference at `{}`", seg));
                     }
                     ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                     base = child;
@@ -93,9 +95,11 @@ impl RttiRegistry {
                     base = field_off;
                 }
                 _ => {
-                    return Err(set_error(format!(
-                        "cannot descend through non-block field `{seg}`"
-                    )));
+                    return Err(rtti_err!(
+                        Set,
+                        "RTTI set: cannot descend through non-block field `{}`",
+                        seg
+                    ));
                 }
             }
         }
@@ -154,19 +158,22 @@ impl RttiRegistry {
         match shape {
             Shape::Pod { width } => {
                 if value.len() != width as usize {
-                    return Err(set_error(format!(
-                        "field is {width} bytes, got {}",
+                    return Err(rtti_err!(
+                        Set,
+                        "RTTI set: field is {} bytes, got {}",
+                        width,
                         value.len()
-                    )));
+                    ));
                 }
             }
             // A `ref` is a bare `u64` target offset (a non-owning alias).
             Shape::Ref(t) => {
                 if value.len() != 8 {
-                    return Err(set_error(format!(
-                        "a `ref` field is an 8-byte offset, got {}",
+                    return Err(rtti_err!(
+                        Set,
+                        "RTTI set: a `ref` field is an 8-byte offset, got {}",
                         value.len()
-                    )));
+                    ));
                 }
                 // Validate the offset names a live block of the ref's type — an
                 // unchecked offset would let a later path descend into an arbitrary
@@ -175,9 +182,10 @@ impl RttiRegistry {
                 verify_data_block(data, Offset::from_raw(target), t)?;
             }
             _ => {
-                return Err(set_error(
-                    "field is not POD / `ref` / class variable; an owning reference is \
-                     `swap`ped, not set",
+                return Err(rtti_err!(
+                    Set,
+                    "RTTI set: field is not POD / `ref` / class variable; an owning \
+                     reference is `swap`ped, not set"
                 ));
             }
         }
@@ -213,8 +221,9 @@ impl RttiRegistry {
         let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             Resolved::Class { .. } => {
-                return Err(swap_error(
-                    "a class variable is a value, not a reference — use `set`",
+                return Err(rtti_err!(
+                    Swap,
+                    "RTTI swap: a class variable is a value, not a reference — use `set`"
                 ));
             }
         };
@@ -230,15 +239,23 @@ impl RttiRegistry {
             Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) => (t, false),
             Shape::Weak(t) => (t, true),
             Shape::Foreign { .. } => {
-                return Err(swap_error(
-                    "a `foreign` reference names a cross-file target — use `swap_foreign`",
+                return Err(rtti_err!(
+                    Swap,
+                    "RTTI swap: a `foreign` reference names a cross-file target — use \
+                     `swap_foreign`"
                 ));
             }
-            _ => return Err(swap_error("field is not a swappable reference")),
+            _ => {
+                return Err(rtti_err!(
+                    Swap,
+                    "RTTI swap: field is not a swappable reference"
+                ));
+            }
         };
         if new.tag() != tag {
-            return Err(swap_error(
-                "eightcc mismatch: `new` is not the field's type",
+            return Err(rtti_err!(
+                Swap,
+                "RTTI swap: eightcc mismatch: `new` is not the field's type"
             ));
         }
         // A non-nullable slot must never hold the `0` niche: the generated walks
@@ -333,8 +350,9 @@ impl RttiRegistry {
         let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             Resolved::Class { .. } => {
-                return Err(swap_error(
-                    "a class variable is a value, not a reference — use `set`",
+                return Err(rtti_err!(
+                    Swap,
+                    "RTTI swap: a class variable is a value, not a reference — use `set`"
                 ));
             }
         };
@@ -345,14 +363,17 @@ impl RttiRegistry {
         let (tag, kind) = match shape {
             Shape::Foreign { tag, kind } => (tag, kind),
             _ => {
-                return Err(swap_error(
-                    "field is not a `foreign` reference — use `swap` for in-file references",
+                return Err(rtti_err!(
+                    Swap,
+                    "RTTI swap: field is not a `foreign` reference — use `swap` for \
+                     in-file references"
                 ));
             }
         };
         if new.tag != tag {
-            return Err(swap_error(
-                "eightcc mismatch: `new` is not the field's foreign target type",
+            return Err(rtti_err!(
+                Swap,
+                "RTTI swap: eightcc mismatch: `new` is not the field's foreign target type"
             ));
         }
         // As `swap`: a non-nullable slot must never hold the null niche.
@@ -368,7 +389,7 @@ impl RttiRegistry {
         // would let a later cross-file teardown free an arbitrary range in that file.
         if new.offset != 0 {
             let fid = FileId::from_u64(new.file_id)
-                .ok_or_else(|| swap_error("invalid foreign file id in `new`"))?;
+                .ok_or_else(|| rtti_err!(Swap, "RTTI swap: invalid foreign file id in `new`"))?;
             if fid.is_self() {
                 verify_data_block(data, Offset::from_raw(new.offset), new.tag)?;
             } else {
@@ -376,8 +397,10 @@ impl RttiRegistry {
                     verify_data_block(h.stack(), Offset::from_raw(new.offset), new.tag)
                 })
                 .ok_or_else(|| {
-                    swap_error(
-                        "the new target's file is not attached — cannot validate the pointer",
+                    rtti_err!(
+                        Swap,
+                        "RTTI swap: the new target's file is not attached — cannot \
+                         validate the pointer"
                     )
                 })??;
             }

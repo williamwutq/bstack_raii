@@ -15,17 +15,7 @@ use crate::primitives::{EightCC, NonNullOffset, Offset};
 use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
 
 use super::{AnyRef, BYTEVEC_HEADER, CONTROL_SIZE, Value, add_off};
-use super::{RttiError, RttiResult, rtti_err};
-
-/// Error for an RTTI `set` mutator whose argument the field rejected.
-pub(in crate::rtti) fn set_error(msg: impl std::fmt::Display) -> RttiError {
-    rtti_err!(Set, "RTTI set: {}", msg)
-}
-
-/// Error for an RTTI `swap` mutator whose argument the field rejected.
-pub(in crate::rtti) fn swap_error(msg: impl std::fmt::Display) -> RttiError {
-    rtti_err!(Swap, "RTTI swap: {}", msg)
-}
+use super::{RttiResult, rtti_err};
 
 /// Verify a **live block of type `tag`** sits at `off` in `data` (a null `off` is the
 /// allowed sentinel — a null reference). The safe RTTI mutators install caller-supplied offsets into
@@ -183,11 +173,6 @@ pub(in crate::rtti) fn read_disc(data: &BStack, off: u64, width: u8) -> RttiResu
     let mut b = [0u8; 8];
     data.get_into(off, &mut b[..w])?;
     Ok(u64::from_le_bytes(b))
-}
-
-/// Error for a failed RTTI class-variable operation.
-pub(in crate::rtti) fn class_error(msg: impl std::fmt::Display) -> RttiError {
-    rtti_err!(Class, "RTTI class variable: {}", msg)
 }
 
 /// Pop the `n` values a container's children pushed, restoring declaration order.

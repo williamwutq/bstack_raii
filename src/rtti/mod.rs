@@ -83,9 +83,6 @@ pub use schema::{
 pub(in crate::rtti) use schema::{class_value_slot, frame_record, layouts_match};
 pub(in crate::rtti) use value::Resolved;
 pub use value::{AnyRef, ForeignPtr, Moved, Value, VecRef};
-// `class_error` lives with the other shared helpers in `walk`; re-export it so
-// `schema` / `registry` reach it as `super::class_error` like the rest.
-pub(in crate::rtti) use walk::class_error;
 
 /// Re-exports so the `#[bstack_class]` macro's generated registration code can name
 /// `linkme` without the downstream crate depending on it directly. The generated

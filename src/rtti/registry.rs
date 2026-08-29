@@ -11,8 +11,8 @@ use linkme::distributed_slice;
 use crate::primitives::{EightCC, WidePtr};
 
 use super::{
-    RECORD_HEADER_LEN, RttiOrdinal, RttiType, class_error, class_value_slot, decode_type,
-    encode_type, frame_record, layouts_match, unknown_tag,
+    RECORD_HEADER_LEN, RttiOrdinal, RttiType, class_value_slot, decode_type, encode_type,
+    frame_record, layouts_match, unknown_tag,
 };
 use super::{RttiResult, rtti_err};
 
@@ -286,15 +286,21 @@ impl RttiRegistry {
     pub fn set_class_value(&self, tag: EightCC, name: &str, value: &[u8]) -> RttiResult<()> {
         let (off, len, mutable) = self.locate_class_value(tag, name)?;
         if !mutable {
-            return Err(class_error(format!(
-                "`{name}` is a const class variable; only a `#[bstack_mut]` one is settable"
-            )));
+            return Err(rtti_err!(
+                Class,
+                "RTTI class variable: `{}` is a const class variable; only a \
+                 `#[bstack_mut]` one is settable",
+                name
+            ));
         }
         if value.len() != len {
-            return Err(class_error(format!(
-                "class variable `{name}` is {len} bytes, got {}",
+            return Err(rtti_err!(
+                Class,
+                "RTTI class variable: class variable `{}` is {} bytes, got {}",
+                name,
+                len,
                 value.len()
-            )));
+            ));
         }
         self.stack.set(off, value).map_err(Into::into)
     }
@@ -307,8 +313,13 @@ impl RttiRegistry {
         let mut body = vec![0u8; rec.body_len as usize];
         self.stack
             .get_into(rec.offset + RECORD_HEADER_LEN, &mut body)?;
-        let (pos, len, mutable) = class_value_slot(&body, name)?
-            .ok_or_else(|| class_error(format!("no class variable named `{name}`")))?;
+        let (pos, len, mutable) = class_value_slot(&body, name)?.ok_or_else(|| {
+            rtti_err!(
+                Class,
+                "RTTI class variable: no class variable named `{}`",
+                name
+            )
+        })?;
         Ok((rec.offset + RECORD_HEADER_LEN + pos as u64, len, mutable))
     }
 }

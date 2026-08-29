@@ -7,8 +7,8 @@
 use crate::primitives::{EightCC, OwnershipKind};
 use crate::util::{Reader, Writer};
 
+use super::too_large;
 use super::{RttiResult, rtti_err};
-use super::{class_error, too_large};
 
 const FLAG_ENUM: u8 = 0b0000_0001;
 const FLAG_RC: u8 = 0b0000_0010;
@@ -606,7 +606,10 @@ fn class_value_within_shape(r: &mut Reader) -> RttiResult<Option<(usize, usize, 
         .checked_add(value_len)
         .is_none_or(|end| end > r.buf.len())
     {
-        return Err(class_error("value length exceeds the record body"));
+        return Err(rtti_err!(
+            Class,
+            "RTTI class variable: value length exceeds the record body"
+        ));
     }
     Ok(Some((r.pos, value_len, mutable)))
 }
