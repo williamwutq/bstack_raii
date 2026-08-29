@@ -11,7 +11,7 @@ use bstack::{BStack, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::io_core::refcount;
-use crate::primitives::{EightCC, NonNullOffset};
+use crate::primitives::{EightCC, NonNullOffset, Offset};
 use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
 
 use super::{AnyRef, BYTEVEC_HEADER, CONTROL_SIZE, Value, add_off};
@@ -27,16 +27,21 @@ pub(in crate::rtti) fn swap_error(msg: impl std::fmt::Display) -> RttiError {
     rtti_err!(Swap, "RTTI swap: {}", msg)
 }
 
-/// Verify a **live block of type `tag`** sits at `off` in `data` (`off == 0` is the null
-/// sentinel, allowed). The safe RTTI mutators install caller-supplied offsets into
+/// Verify a **live block of type `tag`** sits at `off` in `data` (a null `off` is the
+/// allowed sentinel — a null reference). The safe RTTI mutators install caller-supplied offsets into
 /// owning slots; without this check a fabricated [`AnyRef`] / [`ForeignPtr`] could point
 /// a slot at an arbitrary location that a later teardown would free (recursively, for
 /// `owned`) or a later path would descend into — the same hazard `Foreign::new` /
 /// `raw_<field>_slice` are `unsafe` for, but here checkable against the on-disk header.
-pub(in crate::rtti) fn verify_data_block(data: &BStack, off: u64, tag: EightCC) -> RttiResult<()> {
-    if off == 0 {
+pub(in crate::rtti) fn verify_data_block(
+    data: &BStack,
+    off: Offset,
+    tag: EightCC,
+) -> RttiResult<()> {
+    // A null offset is the allowed sentinel (a null reference points nowhere).
+    let Some(off) = off.to_non_null() else {
         return Ok(());
-    }
+    };
     // Error for a mutator (`set` / `swap` / `swap_foreign`) whose caller-supplied
     // target offset does not name a live block of the field's declared type.
     let bad_target = |found: Option<EightCC>| {
@@ -47,12 +52,12 @@ pub(in crate::rtti) fn verify_data_block(data: &BStack, off: u64, tag: EightCC) 
         rtti_err!(
             Mutator,
             "RTTI mutator: offset {} does not hold a live {:?} block ({})",
-            off,
+            off.as_u64(),
             tag,
             found
         )
     };
-    match AnyRef::from_block(data, off) {
+    match AnyRef::from_block(data, off.as_u64()) {
         Ok(a) if a.tag() == tag => Ok(()),
         Ok(a) => Err(bad_target(Some(a.tag()))),
         Err(_) => Err(bad_target(None)),

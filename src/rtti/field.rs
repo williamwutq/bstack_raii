@@ -5,18 +5,18 @@
 
 use bstack::BStack;
 
-use crate::primitives::{EightCC, WidePtr};
+use crate::primitives::{EightCC, Offset, WidePtr};
 use crate::registry::FileId;
 use crate::types::compiled::rc::{CTRL_BACKPTR_OFFSET, CTRL_DATA_OFFSET};
 use crate::util::{get_u64, read_u64};
 
-use super::RttiResult;
 use super::read::Op;
 use super::walk::{disc_mask, read_disc, set_error, swap_error, verify_data_block};
 use super::{
     AnyRef, FOREIGN_REPR_LEN, ForeignPtr, HEADER_TAG_OFFSET, Resolved, RttiBody, RttiField,
     RttiOrdinal, RttiRegistry, Shape, Value, add_off, unknown_tag,
 };
+use super::{RttiResult, rtti_err};
 
 impl RttiRegistry {
     /// Resolve a **field path** (`["outer", "inner", …]`) from the root of type
@@ -172,7 +172,7 @@ impl RttiRegistry {
                 // unchecked offset would let a later path descend into an arbitrary
                 // in-file location.
                 let target = get_u64(value);
-                verify_data_block(data, target, t)?;
+                verify_data_block(data, Offset::from_raw(target), t)?;
             }
             _ => {
                 return Err(set_error(
@@ -245,9 +245,9 @@ impl RttiRegistry {
         // treat non-nullable as proof of non-null, so installing a null here would
         // persist a handle over offset 0 and derail every later read / teardown.
         if new.offset() == 0 && !nullable {
-            return Err(swap_error(
-                "[BSTACK0815] RTTI mutator: a null reference cannot be installed \
-                 into a non-nullable field",
+            return Err(rtti_err!(
+                Mutator,
+                "RTTI mutator: a null reference cannot be installed into a non-nullable field"
             ));
         }
         // Validate that `new` actually names a live block of the field's type before
@@ -273,28 +273,29 @@ impl RttiRegistry {
                     let mut hdr = [0u8; 8];
                     data.get_into(add_off(new.offset(), HEADER_TAG_OFFSET)?, &mut hdr)?;
                     if EightCC(hdr) != ctrl_tag {
-                        return Err(swap_error(format!(
-                            "[BSTACK0815] RTTI mutator: offset {} does not hold a live \
-                             control block of the target type (its header tag is not the \
-                             type's control tag)",
+                        return Err(rtti_err!(
+                            Mutator,
+                            "RTTI mutator: offset {} does not hold a live control block of \
+                             the target type (its header tag is not the type's control tag)",
                             new.offset()
-                        )));
+                        ));
                     }
                 }
                 // (2) Forward data pointer + backpointer round-trip.
                 let data_ptr = read_u64(data, add_off(new.offset(), CTRL_DATA_OFFSET)?)?;
-                verify_data_block(data, data_ptr, tag)?;
+                verify_data_block(data, Offset::from_raw(data_ptr), tag)?;
                 let backptr = read_u64(data, add_off(data_ptr, CTRL_BACKPTR_OFFSET)?)?;
                 if backptr != new.offset() {
-                    return Err(swap_error(format!(
-                        "[BSTACK0815] RTTI mutator: offset {} is not the target's \
-                         control block (its backpointer names {backptr})",
+                    return Err(rtti_err!(
+                        Mutator,
+                        "RTTI mutator: offset {} is not the target's control block \
+                         (its backpointer names {backptr})",
                         new.offset()
-                    )));
+                    ));
                 }
             }
         } else {
-            verify_data_block(data, new.offset(), tag)?;
+            verify_data_block(data, Offset::from_raw(new.offset()), tag)?;
         }
         // Atomic exchange: install the new offset and take the displaced one in one
         // locked step, so concurrent callers each get the distinct old target they
@@ -356,9 +357,10 @@ impl RttiRegistry {
         }
         // As `swap`: a non-nullable slot must never hold the null niche.
         if new.offset == 0 && !nullable {
-            return Err(swap_error(
-                "[BSTACK0815] RTTI mutator: a null foreign reference cannot be \
-                 installed into a non-nullable field",
+            return Err(rtti_err!(
+                Mutator,
+                "RTTI mutator: a null foreign reference cannot be installed into a \
+                 non-nullable field"
             ));
         }
         // Validate the new target names a live block of the field's type in its own
@@ -368,10 +370,10 @@ impl RttiRegistry {
             let fid = FileId::from_u64(new.file_id)
                 .ok_or_else(|| swap_error("invalid foreign file id in `new`"))?;
             if fid.is_self() {
-                verify_data_block(data, new.offset, new.tag)?;
+                verify_data_block(data, Offset::from_raw(new.offset), new.tag)?;
             } else {
                 crate::registry::with_host(fid, |h| {
-                    verify_data_block(h.stack(), new.offset, new.tag)
+                    verify_data_block(h.stack(), Offset::from_raw(new.offset), new.tag)
                 })
                 .ok_or_else(|| {
                     swap_error(
