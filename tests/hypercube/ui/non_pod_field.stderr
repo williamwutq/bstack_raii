@@ -10,14 +10,14 @@ error[E0204]: the trait `Copy` cannot be implemented for this type
   |
   = note: this error originates in the derive macro `::core::marker::Copy` which comes from the expansion of the attribute macro `bstack_block` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `NotPod: Clone` is not satisfied
+error[E0277]: the trait bound `NotPod: std::clone::Clone` is not satisfied
  --> tests/hypercube/ui/non_pod_field.rs:6:5
   |
 4 | #[bstack_block]
   | --------------- in this attribute macro expansion
 5 | struct X {
 6 |     f: NotPod,
-  |     ^^^^^^^^^ the trait `Clone` is not implemented for `NotPod`
+  |     ^^^^^^^^^ the trait `std::clone::Clone` is not implemented for `NotPod`
   |
 note: required by a bound in `std::clone::AssertParamIsClone`
  --> $RUST/core/src/clone.rs
