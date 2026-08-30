@@ -173,6 +173,13 @@ where
     // a failure is captured here, the generator aborts (commits nothing), and
     // the error surfaces after `inplace_gen` returns.
     let mut plan_err: Option<io::Error> = None;
+    // A failed `Read` op is reported here as the *previous* op's result. This
+    // closure derives its writes from the read-back buffers, so a swallowed read
+    // error would commit writes computed from stale/zero bytes (or, if aborted
+    // silently, return a false `Ok` for an update that never happened). Capture it
+    // in the read phase — nothing is staged yet, so ending commits nothing — and
+    // surface it after `inplace_gen` returns.
+    let mut read_err: Option<io::Error> = None;
 
     let mut reads2 = Some(reads2);
     let mut plan = Some(plan);
@@ -183,7 +190,11 @@ where
     let mut did_b = false;
     let mut w = 0usize;
 
-    allocator.stack().inplace_gen(|_feedback| {
+    allocator.stack().inplace_gen(|feedback| {
+        if let Err(e) = feedback {
+            read_err = Some(e);
+            return None; // read phase, nothing staged → commits nothing
+        }
         // Round 1 — read the fixed offsets.
         if r1 < reads1.len() {
             let i = r1;
@@ -245,7 +256,7 @@ where
         }
         None
     })?;
-    match plan_err {
+    match read_err.or(plan_err) {
         Some(e) => Err(e),
         None => Ok(()),
     }
@@ -313,8 +324,18 @@ where
     // offset is captured here, the probe aborts (commits nothing), and the
     // error surfaces after `inplace_gen` returns.
     let mut probe_err: Option<io::Error> = None;
+    // A failed `Read` (bad metadata/bucket read) is reported here as the previous
+    // op's result. `inspect`/`exhausted` run on the read-back buffers, so a
+    // swallowed read error would commit a decision made on stale/zero bytes (or a
+    // false `Ok` for a probe that read nothing). Capture it in the read phase —
+    // nothing is staged yet — and surface it after `inplace_gen` returns.
+    let mut read_err: Option<io::Error> = None;
 
-    allocator.stack().inplace_gen(|_feedback| {
+    allocator.stack().inplace_gen(|feedback| {
+        if let Err(e) = feedback {
+            read_err = Some(e);
+            return None; // read phase, nothing staged → commits nothing
+        }
         // 1. Read the 32-byte metadata block.
         if !meta_issued {
             meta_issued = true;
@@ -403,7 +424,7 @@ where
         }
         None
     })?;
-    match probe_err {
+    match read_err.or(probe_err) {
         Some(e) => Err(e),
         None => Ok(()),
     }
@@ -462,7 +483,16 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
     // the error surfaces after `inplace_gen` returns.
     let mut grow_err: Option<io::Error> = None;
 
-    allocator.stack().inplace_gen(|_feedback| {
+    allocator.stack().inplace_gen(|feedback| {
+        // A failed `Read` is reported here as the previous op's result. The rebuild
+        // below runs on the read-back `meta_buf`/`old_buf`, so a swallowed read
+        // error would rebuild from stale/zero bytes (or return a false `Ok`).
+        // Capture it in `grow_err` (read phase, nothing staged → commits nothing)
+        // so it flows through the orphan-`newtable` reclaim path after the call.
+        if let Err(e) = feedback {
+            grow_err = Some(e);
+            return None;
+        }
         if !meta_issued {
             meta_issued = true;
             // SAFETY: `meta_buf` outlives the call.

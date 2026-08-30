@@ -264,8 +264,18 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
         let mut computed = false;
         let mut wc = 0usize;
         let mut n_written = false;
+        // A failed `Read` is reported here as the previous op's result. The adjusted
+        // counters are computed from `read_c`/`n_buf`, so a swallowed read error
+        // would write back values derived from stale/zero bytes (or return a false
+        // `Ok` for an adjustment that never happened). Capture it in the read phase —
+        // nothing is staged yet — and surface it after `inplace_gen` returns.
+        let mut read_err: Option<io::Error> = None;
 
-        allocator.stack().inplace_gen(|_feedback| {
+        let result = allocator.stack().inplace_gen(|feedback| {
+            if let Err(e) = feedback {
+                read_err = Some(e);
+                return None; // read phase, nothing staged → commits nothing
+            }
             // Read each distinct counter (one byte).
             if rc < cn {
                 let i = rc;
@@ -335,7 +345,11 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
                 });
             }
             None
-        })
+        });
+        match read_err {
+            Some(e) => Err(e),
+            None => result,
+        }
     }
 }
 

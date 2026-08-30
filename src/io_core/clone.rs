@@ -469,6 +469,13 @@ impl ClonePlan {
         let mut readbufs: Vec<[u8; 8]> = vec![[0u8; 8]; n];
         let mut newbufs: Vec<[u8; 8]> = vec![[0u8; 8]; n];
         let mut overflow = false;
+        // A failed counter `Read` is reported here as the previous op's result. The
+        // incremented values are computed from `readbufs`, so a swallowed read error
+        // would write back counts derived from stale/zero bytes (or return a false
+        // `Ok` for a clone whose refcounts were never bumped → a later double-free).
+        // Capture it in the read phase — nothing is staged yet — and route it through
+        // the same reclaim path as an error return below.
+        let mut read_err: Option<io::Error> = None;
 
         // The WAL commit marker (`WalHeader.txn_status`, the byte after the u64
         // magic). Written last, so it lands in the same atomic batch as the clone.
@@ -481,7 +488,11 @@ impl ClonePlan {
         let mut cwrite_i = 0usize;
         let mut write_i = 0usize;
 
-        let result = stack.inplace_gen(|_feedback| {
+        let result = stack.inplace_gen(|feedback| {
+            if let Err(e) = feedback {
+                read_err = Some(e);
+                return None; // read phase, nothing staged → commits nothing
+            }
             // Phase 1 — read every distinct counter.
             if read_i < n {
                 let i = read_i;
@@ -546,6 +557,14 @@ impl ClonePlan {
         });
 
         match result {
+            // A counter read failed mid-generator: nothing committed (the read
+            // phase stages no writes), and the refcounts were *not* bumped — so
+            // reclaim the plan's allocations and surface the read error rather than
+            // reporting a false success.
+            Ok(()) if read_err.is_some() => {
+                Self::reclaim(&wal, allocated, allocator);
+                Err(read_err.unwrap())
+            }
             Ok(()) if overflow => {
                 Self::reclaim(&wal, allocated, allocator);
                 Err(io_error!("refcount overflow while committing clone"))
