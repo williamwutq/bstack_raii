@@ -15,7 +15,7 @@ use crate::types::compiled::rc::{
 };
 use crate::util::read_u64;
 
-use super::walk::{DepthGuard, checked_vec_len, commit_weak_release, disc_mask, read_disc};
+use super::walk::{DepthGuard, checked_vec_len, commit_weak_release};
 use super::{
     BYTEVEC_HEADER, CONTROL_SIZE, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, add_off,
     mul_off, unknown_tag,
@@ -122,20 +122,7 @@ impl RttiRegistry {
                             }
                         }
                         RttiBody::Enum(e) => {
-                            let raw = read_disc(
-                                data,
-                                add_off(block_off, e.disc_off as u64)?,
-                                e.disc_width,
-                            )?;
-                            let mask = disc_mask(e.disc_width);
-                            let variant = e
-                                .variants
-                                .iter()
-                                .find(|v| (v.disc_value as u64) & mask == raw)
-                                .ok_or_else(|| {
-                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
-                                })?;
-                            let payload_base = add_off(block_off, e.payload_off as u64)?;
+                            let (variant, payload_base) = e.resolve_variant(data, block_off)?;
                             for f in &variant.fields {
                                 work.push(TdOp::Shape {
                                     shape: f.shape.clone(),
@@ -329,19 +316,25 @@ impl RttiRegistry {
         unsafe { crate::io_core::commit_home_frees(alloc, to_free) }.map_err(Into::into)
     }
 
-    /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown)):
-    /// decrement the target's strong count in its (home) file and, only if it was the last
-    /// owner, tear the data subtree down (its own transaction) and release the phantom weak,
-    /// freeing the control block if no real weak handles remain. The target's `weak` flag
-    /// selects the inline-refcount vs control-block path.
-    fn commit_strong_release<A: BStackRaiiAllocator>(
+    /// Release one `strong` reference to an `ord`-typed block at `data_off` in the file
+    /// `alloc` owns: decrement its strong count and, only if this was the last owner,
+    /// tear the data subtree down (its own transaction) and release the phantom weak,
+    /// freeing the control block if no real weak handles remain. The type's `weak` flag
+    /// selects the inline-refcount vs separate-control-block path. Shared by the
+    /// deferred commit ([`commit_strong_release`](Self::commit_strong_release)) and the
+    /// resolved-foreign path ([`teardown_foreign_in`](Self::teardown_foreign_in)) — the
+    /// same last-owner ladder, differing only in which file's allocator is passed.
+    ///
+    /// `data_off` must be the data offset of a live `ord`-typed block held by the owning
+    /// slot being released — the precondition of [`teardown`](Self::teardown), whose
+    /// ownership transfers with the slot; both callers uphold it by construction.
+    fn release_strong<A: BStackRaiiAllocator>(
         &self,
         alloc: &A,
-        tag: EightCC,
+        ord: RttiOrdinal,
         data_off: u64,
     ) -> RttiResult<()> {
         let data = alloc.stack();
-        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         if self.load_type(ord)?.weak {
             let ctrl_off = read_u64(data, add_off(data_off, CTRL_BACKPTR_OFFSET)?)?;
             if refcount::fetch_sub(
@@ -350,8 +343,8 @@ impl RttiRegistry {
                 1,
             )? == 1
             {
-                // SAFETY: this caller was the last strong owner (the fetch_sub hit
-                // zero), and `data_off` came from the owning slot being released.
+                // SAFETY: last strong owner (the fetch_sub hit zero); `data_off` is the
+                // caller's slot-derived block offset.
                 unsafe { self.teardown(alloc, ord, data_off)? };
                 if refcount::fetch_sub(
                     data,
@@ -373,6 +366,19 @@ impl RttiRegistry {
             unsafe { self.teardown(alloc, ord, data_off)? };
         }
         Ok(())
+    }
+
+    /// Release one deferred `strong` reference (commit phase of [`teardown`](Self::teardown))
+    /// in its home file: resolve `tag` to its ordinal and run the shared last-owner
+    /// ladder ([`release_strong`](Self::release_strong)).
+    fn commit_strong_release<A: BStackRaiiAllocator>(
+        &self,
+        alloc: &A,
+        tag: EightCC,
+        data_off: u64,
+    ) -> RttiResult<()> {
+        let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
+        self.release_strong(alloc, ord, data_off)
     }
 
     /// Tear down a `Foreign` reference's target **in the target's own file**. `SELF`
@@ -426,38 +432,9 @@ impl RttiRegistry {
             // SAFETY: `offset` came from the owning foreign slot being torn down;
             // ownership of the target transfers with the slot.
             OwnershipKind::Owned => unsafe { self.teardown(target, ord, offset) },
-            OwnershipKind::Strong => {
-                if self.load_type(ord)?.weak {
-                    let ctrl = read_u64(data, add_off(offset, CTRL_BACKPTR_OFFSET)?)?;
-                    if refcount::fetch_sub(
-                        data,
-                        NonNullOffset::from_field(add_off(ctrl, CTRL_STRONG_OFFSET)?)?,
-                        1,
-                    )? == 1
-                    {
-                        // SAFETY: last strong owner; slot-derived offset.
-                        unsafe { self.teardown(target, ord, offset)? };
-                        if refcount::fetch_sub(
-                            data,
-                            NonNullOffset::from_field(add_off(ctrl, CTRL_WEAK_OFFSET)?)?,
-                            1,
-                        )? == 1
-                        {
-                            // SAFETY: last weak released — control block unreferenced.
-                            unsafe { target.free_many([BStackRange::new(ctrl, CONTROL_SIZE)])? };
-                        }
-                    }
-                } else if refcount::fetch_sub(
-                    data,
-                    NonNullOffset::from_field(add_off(offset, RC_REFCOUNT_OFFSET)?)?,
-                    1,
-                )? == 1
-                {
-                    // SAFETY: last strong owner; slot-derived offset.
-                    unsafe { self.teardown(target, ord, offset)? };
-                }
-                Ok(())
-            }
+            // SAFETY: `offset` is the target's data offset, from the owning foreign
+            // slot being torn down; ownership transfers with the slot.
+            OwnershipKind::Strong => self.release_strong(target, ord, offset),
             OwnershipKind::Weak => {
                 // A weak foreign's offset is the control offset.
                 if refcount::fetch_sub(

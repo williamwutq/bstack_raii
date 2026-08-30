@@ -10,7 +10,7 @@ use bstack::BStack;
 use crate::primitives::{EightCC, WidePtr};
 use crate::util::read_u64;
 
-use super::walk::{checked_vec_len, disc_mask, pop_n, pop_named, read_disc};
+use super::walk::{checked_vec_len, pop_n, pop_named};
 use super::{
     AnyRef, BYTEVEC_HEADER, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, Value, add_off,
     mul_off, unknown_tag,
@@ -119,21 +119,8 @@ impl RttiRegistry {
                             work.extend(field_ops);
                         }
                         RttiBody::Enum(e) => {
-                            let raw = read_disc(
-                                data,
-                                add_off(block_off, e.disc_off as u64)?,
-                                e.disc_width,
-                            )?;
-                            let mask = disc_mask(e.disc_width);
-                            let variant = e
-                                .variants
-                                .iter()
-                                .find(|v| (v.disc_value as u64) & mask == raw)
-                                .ok_or_else(|| {
-                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
-                                })?;
+                            let (variant, payload_base) = e.resolve_variant(data, block_off)?;
                             let names = variant.fields.iter().map(|f| f.name.clone()).collect();
-                            let payload_base = add_off(block_off, e.payload_off as u64)?;
                             let field_ops: Vec<Op> = variant
                                 .fields
                                 .iter()

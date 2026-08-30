@@ -16,7 +16,7 @@ use crate::types::compiled::rc::{
 };
 use crate::util::read_u64;
 
-use super::walk::{DepthGuard, checked_vec_len, disc_mask, read_disc};
+use super::walk::{DepthGuard, checked_vec_len};
 use super::{
     BYTEVEC_HEADER, FOREIGN_REPR_LEN, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape,
     add_off, mul_off, unknown_tag,
@@ -254,41 +254,7 @@ impl RttiRegistry {
                     st.map.insert(src_off, new_off);
                     // Walk the fields at matching source / destination offsets.
                     let ty = &st.cache[&ord];
-                    match &ty.body {
-                        RttiBody::Struct(fields) => {
-                            for f in fields {
-                                work.push(CloneOp::Field {
-                                    shape: f.shape.clone(),
-                                    src_off: add_off(src_off, f.offset as u64)?,
-                                    new_off: add_off(new_off, f.offset as u64)?,
-                                });
-                            }
-                        }
-                        RttiBody::Enum(e) => {
-                            let raw = read_disc(
-                                data,
-                                add_off(src_off, e.disc_off as u64)?,
-                                e.disc_width,
-                            )?;
-                            let mask = disc_mask(e.disc_width);
-                            let variant = e
-                                .variants
-                                .iter()
-                                .find(|v| (v.disc_value as u64) & mask == raw)
-                                .ok_or_else(|| {
-                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
-                                })?;
-                            let sp = add_off(src_off, e.payload_off as u64)?;
-                            let np = add_off(new_off, e.payload_off as u64)?;
-                            for f in &variant.fields {
-                                work.push(CloneOp::Field {
-                                    shape: f.shape.clone(),
-                                    src_off: add_off(sp, f.offset as u64)?,
-                                    new_off: add_off(np, f.offset as u64)?,
-                                });
-                            }
-                        }
-                    }
+                    self.push_clone_fields(&mut work, data, ty, src_off, new_off)?;
                 }
 
                 CloneOp::Inline {
@@ -298,41 +264,7 @@ impl RttiRegistry {
                 } => {
                     self.ensure_type(ord, st)?;
                     let ty = &st.cache[&ord];
-                    match &ty.body {
-                        RttiBody::Struct(fields) => {
-                            for f in fields {
-                                work.push(CloneOp::Field {
-                                    shape: f.shape.clone(),
-                                    src_off: add_off(src_base, f.offset as u64)?,
-                                    new_off: add_off(new_base, f.offset as u64)?,
-                                });
-                            }
-                        }
-                        RttiBody::Enum(e) => {
-                            let raw = read_disc(
-                                data,
-                                add_off(src_base, e.disc_off as u64)?,
-                                e.disc_width,
-                            )?;
-                            let mask = disc_mask(e.disc_width);
-                            let variant = e
-                                .variants
-                                .iter()
-                                .find(|v| (v.disc_value as u64) & mask == raw)
-                                .ok_or_else(|| {
-                                    rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
-                                })?;
-                            let sp = add_off(src_base, e.payload_off as u64)?;
-                            let np = add_off(new_base, e.payload_off as u64)?;
-                            for f in &variant.fields {
-                                work.push(CloneOp::Field {
-                                    shape: f.shape.clone(),
-                                    src_off: add_off(sp, f.offset as u64)?,
-                                    new_off: add_off(np, f.offset as u64)?,
-                                });
-                            }
-                        }
-                    }
+                    self.push_clone_fields(&mut work, data, ty, src_base, new_base)?;
                 }
 
                 CloneOp::Field {
@@ -557,6 +489,47 @@ impl RttiRegistry {
         } else {
             add_off(data_child, RC_REFCOUNT_OFFSET)
         }
+    }
+
+    /// Push a [`CloneOp::Field`] for every field of `ty` — a struct's fields, or the
+    /// active enum variant's fields (selected by the **source** discriminant) — pairing
+    /// each field's source offset (`src_base + f.offset`) with its destination
+    /// (`new_base + f.offset`). Shared by the `Block` and `Inline` arms of the clone
+    /// walk, whose only difference is that `Block` first allocates and byte-copies the
+    /// block before walking it.
+    fn push_clone_fields(
+        &self,
+        work: &mut Vec<CloneOp>,
+        data: &BStack,
+        ty: &RttiType,
+        src_base: u64,
+        new_base: u64,
+    ) -> RttiResult<()> {
+        match &ty.body {
+            RttiBody::Struct(fields) => {
+                for f in fields {
+                    work.push(CloneOp::Field {
+                        shape: f.shape.clone(),
+                        src_off: add_off(src_base, f.offset as u64)?,
+                        new_off: add_off(new_base, f.offset as u64)?,
+                    });
+                }
+            }
+            RttiBody::Enum(e) => {
+                // The active variant is chosen by the source discriminant; its payload
+                // sits at the same `payload_off` in the fresh block.
+                let (variant, src_payload) = e.resolve_variant(data, src_base)?;
+                let new_payload = add_off(new_base, e.payload_off as u64)?;
+                for f in &variant.fields {
+                    work.push(CloneOp::Field {
+                        shape: f.shape.clone(),
+                        src_off: add_off(src_payload, f.offset as u64)?,
+                        new_off: add_off(new_payload, f.offset as u64)?,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load + cache a type descriptor if not already present.

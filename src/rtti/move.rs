@@ -14,7 +14,6 @@ use crate::types::compiled::rc::{
 };
 use crate::util::{SmallStringMap, read_u64};
 
-use super::walk::{disc_mask, read_disc};
 use super::{
     AnyRef, CONTROL_SIZE, FOREIGN_REPR_LEN, ForeignPtr, Moved, RttiBody, RttiField, RttiOrdinal,
     RttiRegistry, RttiType, Shape, VecRef, add_off, mul_off, unknown_tag,
@@ -180,20 +179,8 @@ impl RttiRegistry {
             match &ty.body {
                 RttiBody::Struct(f) => (f.clone(), block_off),
                 RttiBody::Enum(e) => {
-                    let raw =
-                        read_disc(data, add_off(block_off, e.disc_off as u64)?, e.disc_width)?;
-                    let mask = disc_mask(e.disc_width);
-                    let variant = e
-                        .variants
-                        .iter()
-                        .find(|v| (v.disc_value as u64) & mask == raw)
-                        .ok_or_else(|| {
-                            rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw)
-                        })?;
-                    (
-                        variant.fields.clone(),
-                        add_off(block_off, e.payload_off as u64)?,
-                    )
+                    let (variant, payload_base) = e.resolve_variant(data, block_off)?;
+                    (variant.fields.clone(), payload_base)
                 }
             }
         };

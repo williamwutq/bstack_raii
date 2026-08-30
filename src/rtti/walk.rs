@@ -14,7 +14,7 @@ use crate::io_core::refcount;
 use crate::primitives::{EightCC, NonNullOffset, Offset};
 use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
 
-use super::{AnyRef, BYTEVEC_HEADER, CONTROL_SIZE, Value, add_off};
+use super::{AnyRef, BYTEVEC_HEADER, CONTROL_SIZE, RttiEnum, RttiVariant, Value, add_off};
 use super::{RttiResult, rtti_err};
 
 /// Verify a **live block of type `tag`** sits at `off` in `data` (a null `off` is the
@@ -173,6 +173,34 @@ pub(in crate::rtti) fn read_disc(data: &BStack, off: u64, width: u8) -> RttiResu
     let mut b = [0u8; 8];
     data.get_into(off, &mut b[..w])?;
     Ok(u64::from_le_bytes(b))
+}
+
+impl RttiEnum {
+    /// Resolve the **active variant** of an enum block at `block_off`: read the stored
+    /// `disc_width`-byte discriminant (masked to that width), match it against the
+    /// variants' `disc_value`s, and return the matched variant together with the base
+    /// offset of its payload region (`block_off + payload_off`). `NoVariant` when no
+    /// variant matches — a corrupt or truncated discriminant. Shared by every
+    /// interpreter (`read` / `teardown` / `move` / `clone`) that walks into an enum.
+    pub(in crate::rtti) fn resolve_variant<'e>(
+        &'e self,
+        data: &BStack,
+        block_off: u64,
+    ) -> RttiResult<(&'e RttiVariant, u64)> {
+        let raw = read_disc(
+            data,
+            add_off(block_off, self.disc_off as u64)?,
+            self.disc_width,
+        )?;
+        let mask = disc_mask(self.disc_width);
+        let variant = self
+            .variants
+            .iter()
+            .find(|v| (v.disc_value as u64) & mask == raw)
+            .ok_or_else(|| rtti_err!(NoVariant, "no RTTI variant for discriminant {}", raw))?;
+        let payload_base = add_off(block_off, self.payload_off as u64)?;
+        Ok((variant, payload_base))
+    }
 }
 
 /// Pop the `n` values a container's children pushed, restoring declaration order.
