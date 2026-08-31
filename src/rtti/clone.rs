@@ -9,7 +9,7 @@ use bstack::{BStack, BStackRange};
 
 use crate::BStackRaiiAllocator;
 use crate::io_core::{WalTxn, alloc_logged, refcount};
-use crate::primitives::{EightCC, NonNullOffset, OwnershipKind, WidePtr};
+use crate::primitives::{EightCC, NonNullOffset, Offset, OwnershipKind, WidePtr};
 use crate::registry::{FileId, ForeignHostAllocator};
 use crate::types::compiled::rc::{
     CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
@@ -54,7 +54,7 @@ struct CloneState {
     /// slot is set to `map[source child]` once every block has been cloned.
     patches: Vec<(u64, u64)>,
     /// Refcount counters to bump (shared `strong` / `weak` targets), applied last.
-    bumps: Vec<u64>,
+    bumps: Vec<NonNullOffset>,
     /// Every freshly allocated range, so a failed clone frees its orphans.
     allocated: Vec<BStackRange>,
     /// The in-flight intention-first WAL transaction: when the allocator
@@ -294,16 +294,17 @@ impl RttiRegistry {
                         });
                     }
                     Shape::Strong(tag) => {
-                        let child = read_u64(data, src_off)?;
-                        if child != 0 {
+                        if let Some(child) =
+                            Offset::from_raw(read_u64(data, src_off)?).to_non_null()
+                        {
                             let off = self.strong_bump_off(data, tag, child, st)?;
                             st.bumps.push(off);
                         }
                     }
                     Shape::Weak(_) => {
-                        let ctrl = read_u64(data, src_off)?;
-                        if ctrl != 0 {
-                            st.bumps.push(add_off(ctrl, CTRL_WEAK_OFFSET)?);
+                        if let Some(ctrl) = Offset::from_raw(read_u64(data, src_off)?).to_non_null()
+                        {
+                            st.bumps.push(ctrl.checked_add(CTRL_WEAK_OFFSET)?);
                         }
                     }
                     Shape::Foreign { tag, kind } => {
@@ -392,7 +393,7 @@ impl RttiRegistry {
                                     for i in 0..len {
                                         let e =
                                             read_u64(data, add_off(sbase, mul_off(i, stride)?)?)?;
-                                        if e != 0 {
+                                        if let Some(e) = Offset::from_raw(e).to_non_null() {
                                             let off = self.strong_bump_off(data, *tag, e, st)?;
                                             st.bumps.push(off);
                                         }
@@ -402,8 +403,8 @@ impl RttiRegistry {
                                     for i in 0..len {
                                         let c =
                                             read_u64(data, add_off(sbase, mul_off(i, stride)?)?)?;
-                                        if c != 0 {
-                                            st.bumps.push(add_off(c, CTRL_WEAK_OFFSET)?);
+                                        if let Some(c) = Offset::from_raw(c).to_non_null() {
+                                            st.bumps.push(c.checked_add(CTRL_WEAK_OFFSET)?);
                                         }
                                     }
                                 }
@@ -439,7 +440,7 @@ impl RttiRegistry {
         }
         // Then bump every shared target's refcount (over-count-safe, never under).
         for &off in &st.bumps {
-            refcount::fetch_add(data, NonNullOffset::from_field(off)?, 1)?;
+            refcount::fetch_add(data, off, 1)?;
         }
 
         st.map
@@ -478,16 +479,22 @@ impl RttiRegistry {
         &self,
         data: &BStack,
         tag: EightCC,
-        data_child: u64,
+        data_child: NonNullOffset,
         st: &mut CloneState,
-    ) -> RttiResult<u64> {
+    ) -> RttiResult<NonNullOffset> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         self.ensure_type(ord, st)?;
         if st.cache[&ord].weak {
-            let ctrl = read_u64(data, add_off(data_child, CTRL_BACKPTR_OFFSET)?)?;
-            add_off(ctrl, CTRL_STRONG_OFFSET)
+            // `data_child` is proven non-null, so the back-pointer address stays branded
+            // through `checked_add`; the `ctrl` read *from disk* is the one value that can
+            // be null (a corrupt back-pointer), so it re-validates via `from_field`.
+            let ctrl = read_u64(data, data_child.checked_add(CTRL_BACKPTR_OFFSET)?.as_u64())?;
+            Ok(NonNullOffset::from_field(add_off(
+                ctrl,
+                CTRL_STRONG_OFFSET,
+            )?)?)
         } else {
-            add_off(data_child, RC_REFCOUNT_OFFSET)
+            Ok(data_child.checked_add(RC_REFCOUNT_OFFSET)?)
         }
     }
 

@@ -39,15 +39,24 @@ impl RttiRegistry {
             return Err(rtti_err!(Set, "RTTI set: empty field path"));
         }
         let mut ord = ordinal;
-        let mut base = block_off;
+        // Carry the descent offset as a branded `Offset` so each step's arithmetic is
+        // overflow-checked. It stays *nullable*: a top-level class-variable path
+        // (`block_off == 0`, the class var living in the schema, not the instance) never
+        // dereferences `base`, so `0` is a legal sentinel here — a follow re-checks
+        // non-null explicitly below before reading through it.
+        let mut base = Offset::from_raw(block_off);
         for (i, seg) in path.iter().enumerate() {
             let ty = self.load_type(ord)?;
             // A struct's fields are block-relative; an enum's active variant's fields
             // are payload-relative.
-            let (fields, field_base): (&[RttiField], u64) = match &ty.body {
+            let (fields, field_base): (&[RttiField], Offset) = match &ty.body {
                 RttiBody::Struct(f) => (f, base),
                 RttiBody::Enum(e) => {
-                    let raw = read_disc(data, add_off(base, e.disc_off as u64)?, e.disc_width)?;
+                    let raw = read_disc(
+                        data,
+                        base.checked_add(e.disc_off as u64)?.get(),
+                        e.disc_width,
+                    )?;
                     let mask = disc_mask(e.disc_width);
                     let variant = e
                         .variants
@@ -56,14 +65,14 @@ impl RttiRegistry {
                         .ok_or_else(|| {
                             rtti_err!(Set, "RTTI set: no variant for discriminant {}", raw)
                         })?;
-                    (&variant.fields, add_off(base, e.payload_off as u64)?)
+                    (&variant.fields, base.checked_add(e.payload_off as u64)?)
                 }
             };
             let field = fields
                 .iter()
                 .find(|f| &f.name == seg)
                 .ok_or_else(|| rtti_err!(Set, "RTTI set: no field named `{}`", seg))?;
-            let field_off = add_off(field_base, field.offset as u64)?;
+            let field_off = field_base.checked_add(field.offset as u64)?;
 
             if i + 1 == path.len() {
                 // A `#[bstack_static]` class variable lives in the schema record for
@@ -76,19 +85,21 @@ impl RttiRegistry {
                     });
                 }
                 return Ok(Resolved::Instance {
-                    offset: field_off,
+                    offset: field_off.get(),
                     shape: field.shape.clone(),
                 });
             }
             // Descend into a block reference for the next segment.
             match &field.shape {
                 Shape::Owned(tag) | Shape::Strong(tag) | Shape::Ref(tag) => {
-                    let child = read_u64(data, field_off)?;
-                    if child == 0 {
+                    // The stored offset points at the child block; a null is a dangling
+                    // path. Check non-null here (the deref happens next iteration).
+                    let child = Offset::from_raw(read_u64(data, field_off.get())?);
+                    if child.is_null() {
                         return Err(rtti_err!(Set, "RTTI set: null reference at `{}`", seg));
                     }
-                    ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                     base = child;
+                    ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                 }
                 Shape::Embed(tag) => {
                     ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
@@ -258,10 +269,13 @@ impl RttiRegistry {
                 "RTTI swap: eightcc mismatch: `new` is not the field's type"
             ));
         }
+        // The offset being installed — bound once as an `Offset` so the null-niche test
+        // and the validation arithmetic below share one branded value.
+        let new_off = Offset::from_raw(new.offset());
         // A non-nullable slot must never hold the `0` niche: the generated walks
         // treat non-nullable as proof of non-null, so installing a null here would
         // persist a handle over offset 0 and derail every later read / teardown.
-        if new.offset() == 0 && !nullable {
+        if new_off.is_null() && !nullable {
             return Err(rtti_err!(
                 Mutator,
                 "RTTI mutator: a null reference cannot be installed into a non-nullable field"
@@ -278,7 +292,7 @@ impl RttiRegistry {
             // up) is rejected outright; (2) through its forward data pointer, then
             // require the data block's backpointer to round-trip to `new` — the
             // structural cross-check the direct tag alone does not give.
-            if new.offset() != 0 {
+            if let Some(new_off) = new_off.to_non_null() {
                 // (1) Direct: the control block's header tag. Enforced whenever the
                 // target type's schema records a control tag (every `weak` type does);
                 // if unresolvable, fall back to the forward-pointer check below.
@@ -288,36 +302,36 @@ impl RttiRegistry {
                     .and_then(|t| t.ctrl_tag);
                 if let Some(ctrl_tag) = ctrl_tag {
                     let mut hdr = [0u8; 8];
-                    data.get_into(add_off(new.offset(), HEADER_TAG_OFFSET)?, &mut hdr)?;
+                    data.get_into(new_off.checked_add(HEADER_TAG_OFFSET)?.as_u64(), &mut hdr)?;
                     if EightCC(hdr) != ctrl_tag {
                         return Err(rtti_err!(
                             Mutator,
                             "RTTI mutator: offset {} does not hold a live control block of \
                              the target type (its header tag is not the type's control tag)",
-                            new.offset()
+                            new_off.as_u64()
                         ));
                     }
                 }
                 // (2) Forward data pointer + backpointer round-trip.
-                let data_ptr = read_u64(data, add_off(new.offset(), CTRL_DATA_OFFSET)?)?;
+                let data_ptr = read_u64(data, new_off.checked_add(CTRL_DATA_OFFSET)?.as_u64())?;
                 verify_data_block(data, Offset::from_raw(data_ptr), tag)?;
                 let backptr = read_u64(data, add_off(data_ptr, CTRL_BACKPTR_OFFSET)?)?;
-                if backptr != new.offset() {
+                if backptr != new_off.as_u64() {
                     return Err(rtti_err!(
                         Mutator,
                         "RTTI mutator: offset {} is not the target's control block \
                          (its backpointer names {backptr})",
-                        new.offset()
+                        new_off.as_u64()
                     ));
                 }
             }
         } else {
-            verify_data_block(data, Offset::from_raw(new.offset()), tag)?;
+            verify_data_block(data, new_off, tag)?;
         }
         // Atomic exchange: install the new offset and take the displaced one in one
         // locked step, so concurrent callers each get the distinct old target they
         // displaced — never both hand back an owning `AnyRef` to the same block.
-        let old_bytes = data.swap(offset, new.offset().to_le_bytes())?;
+        let old_bytes = data.swap(offset, new_off.get().to_le_bytes())?;
         let old = u64::from_le_bytes(old_bytes[..8].try_into().unwrap());
         // SAFETY: `old` was displaced from the field's own slot, which held a live
         // target of the field's declared (schema-resolved) tag.
