@@ -375,6 +375,17 @@ impl RttiRegistry {
                             let stride = self.shape_stride(&inner, &mut st.cache)?;
                             let byte_len = read_u64(data, src_data)?;
                             let len = checked_vec_len(byte_len, data_size, stride)?;
+                            // Charge for all elements up front — `len` comes off the
+                            // (untrusted) descriptor, and the element ops are pushed
+                            // eagerly, so a huge count must fail cleanly here rather than
+                            // grow `work` past the budget before the per-pop check trips
+                            // (the same guard the `Array` arm and the read walk apply).
+                            budget = budget.checked_sub(len).ok_or_else(|| {
+                                rtti_err!(
+                                    Budget,
+                                    "RTTI clone budget exceeded (corrupt data or a cycle?)"
+                                )
+                            })?;
                             let sbase = add_off(src_data, BYTEVEC_HEADER)?;
                             let nbase = add_off(new_data, BYTEVEC_HEADER)?;
                             match &*inner {

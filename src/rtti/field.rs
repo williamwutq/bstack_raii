@@ -14,7 +14,7 @@ use super::read::Op;
 use super::walk::{disc_mask, read_disc, verify_data_block};
 use super::{
     AnyRef, FOREIGN_REPR_LEN, ForeignPtr, HEADER_TAG_OFFSET, Resolved, RttiBody, RttiField,
-    RttiOrdinal, RttiRegistry, Shape, Value, add_off, unknown_tag,
+    RttiOrdinal, RttiRegistry, Shape, Value, add_off, ordinal_type_index, unknown_tag,
 };
 use super::{RttiResult, rtti_err};
 
@@ -424,7 +424,7 @@ impl RttiRegistry {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         let mut b = [0u8; FOREIGN_REPR_LEN as usize];
         b[0..4].copy_from_slice(&(new.file_id as u32).to_le_bytes());
-        b[4..8].copy_from_slice(&(ord + 1).to_le_bytes());
+        b[4..8].copy_from_slice(&ordinal_type_index(ord).to_le_bytes());
         b[8..16].copy_from_slice(&new.offset.to_le_bytes());
         // Atomic exchange of the whole 16-byte pointer, taking the old one this
         // caller displaced.

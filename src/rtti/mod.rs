@@ -155,12 +155,25 @@ pub(in crate::rtti) fn too_large(what: &str, limit: &str) -> RttiError {
     )
 }
 
+/// The on-disk `type_index` for an `ordinal`: `ordinal + 1`, reserving `0` for the
+/// untyped pointer (type recovered from the target block header on deref). Panics on
+/// the single unrepresentable input, `ordinal == u32::MAX` — unreachable from a real
+/// registry, which cannot hold that many types, so the only way to trip it is a
+/// fabricated ordinal, where a silent wrap to the untyped `0` would quietly drop the
+/// type tag instead of failing. Mirrors [`rtti_narrow_u32`]'s panic-on-pathological
+/// contract rather than widening the callers to `Result`.
+pub(in crate::rtti) fn ordinal_type_index(ordinal: RttiOrdinal) -> u32 {
+    ordinal.checked_add(1).unwrap_or_else(|| {
+        panic!("[BSTACK0817] RTTI ordinal {ordinal} exceeds the maximum encodable type index")
+    })
+}
+
 /// Build an RTTI-typed pointer: a [`WidePtr`] to `(file_id, offset)` tagged
 /// with `ordinal`. `file_id == 0` ⇒ `SELF`. For an untyped pointer (type recovered
 /// from the target block header on deref) use [`WidePtr::from_raw`] with a `0` type
 /// index. The raw `(file_id, offset)` inputs are decoded through the wire boundary.
 pub fn typed_ptr(file_id: u64, offset: u64, ordinal: RttiOrdinal) -> WidePtr {
-    WidePtr::from_raw(file_id, ordinal + 1, offset)
+    WidePtr::from_raw(file_id, ordinal_type_index(ordinal), offset)
 }
 
 /// Build an RTTI field path from **dotted field names** for

@@ -4,7 +4,7 @@
 //! live here rather than in any one interpreter).
 //!
 //! Static analysis *of a [`Shape`](super::Shape)* — its on-disk layout and
-//! classification (`shape_stride`, `shape_has_reference`, `foreign_leaf`, …) — lives in
+//! classification (`shape_stride`, `has_reference`, `foreign_leaf`, …) — lives in
 //! the sibling [`shape`](super::shape) module; this one holds the walk *mechanics*.
 
 use bstack::{BStack, BStackRange};
@@ -125,11 +125,9 @@ pub(in crate::rtti) fn checked_vec_len(
     Ok(byte_len.checked_div(stride).unwrap_or(0))
 }
 
-/// Release one `weak` reference whose control block is at `ctrl_off`: decrement
-/// `ctrl.weak`; the last weak handle (or phantom) frees the control block. The data
-/// block is never touched by a weak drop.
-/// Release one deferred `weak` reference (commit phase of teardown): decrement the
-/// control block's weak count and free the control block if this was the last handle.
+/// Release one deferred `weak` reference (commit phase of teardown) whose control
+/// block is at `ctrl_off`: decrement `ctrl.weak`; the last weak handle (or phantom)
+/// frees the control block. The data block is never touched by a weak drop.
 pub(in crate::rtti) fn commit_weak_release<A: BStackRaiiAllocator>(
     alloc: &A,
     ctrl_off: u64,

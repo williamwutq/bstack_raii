@@ -374,17 +374,29 @@ impl RttiRegistry {
                     ));
                 } else {
                     // A POD array (nested or not): the whole inline run of bytes.
+                    // Untrusted `n`: bound the run against the stack before allocating,
+                    // as the scalar `Pod` arm does — a forged length must fail cleanly,
+                    // not size a multi-GiB `vec` before the `get_into` would reject it.
                     let total = mul_off(*n as u64, self.shape_stride(inner, cache)?)?;
+                    if total > data.len()?.saturating_sub(off) {
+                        return Err(rtti_err!(
+                            Malformed,
+                            "RTTI POD array runs past the end of the data stack",
+                        ));
+                    }
                     let mut buf = vec![0u8; total as usize];
                     data.get_into(off, &mut buf)?;
                     Moved::Pod(buf.into())
                 }
             }
             Shape::Tuple(items) => {
-                if items.iter().any(|it| it.foreign_leaf().is_some()) {
-                    // A tuple with a `Foreign` member: move each member individually —
-                    // POD by value, a foreign member as its own `Moved::Foreign` — at
-                    // cumulative element offsets.
+                if items.iter().any(Shape::has_reference) {
+                    // A tuple carrying any reference member — a same-file `owned` /
+                    // `strong` / `weak` / `vec`, or a cross-file `foreign` — is moved
+                    // member-by-member: a POD member by value, a reference member as its
+                    // own `Moved` holding the transferred `AnyRef`, at cumulative element
+                    // offsets. A whole-tuple POD copy here would bury an owned pointer in
+                    // opaque bytes, orphaning its block (never handed back, never freed).
                     let mut parts = Vec::with_capacity(items.len());
                     let mut eo = off;
                     for it in items {
@@ -393,10 +405,18 @@ impl RttiRegistry {
                     }
                     Moved::Tuple(parts.into())
                 } else {
-                    // A POD aggregate: its inline bytes (sum of element strides).
+                    // A pure-POD aggregate: its inline bytes (sum of element strides),
+                    // bounded against the stack before allocating (element strides are
+                    // schema-derived and untrusted).
                     let mut total = 0u64;
                     for it in items {
                         total = add_off(total, self.shape_stride(it, cache)?)?;
+                    }
+                    if total > data.len()?.saturating_sub(off) {
+                        return Err(rtti_err!(
+                            Malformed,
+                            "RTTI POD tuple runs past the end of the data stack",
+                        ));
                     }
                     let mut buf = vec![0u8; total as usize];
                     data.get_into(off, &mut buf)?;
