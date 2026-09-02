@@ -324,6 +324,63 @@ mod tddiff {
         std::fs::remove_file(&schema).ok();
         std::fs::remove_file(&data).ok();
     }
+
+    #[test]
+    fn rtti_swap_rejects_a_ref_field() {
+        // A `#[bstack_ref] d: Leaf` owns nothing — some *other* slot owns its target.
+        // `swap` is an ownership transfer: it hands the displaced offset back as an
+        // owning `AnyRef` the caller may tear down. Doing that for a `ref` would free a
+        // block the real owner still holds (double free). The reference kind is edge
+        // metadata (the field's `Shape`), not a fact about the block, so an isolated
+        // `AnyRef` can't carry it — hence `swap` must reject a `ref` outright (repointing
+        // one is `set`'s job). See `field.rs::swap`.
+        use bstack::BStackAllocator;
+        use bstack_raii::BStackDrop;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = std::env::temp_dir().join(format!("bstack_raii_swref_s_{stamp}.bstack"));
+        let data = std::env::temp_dir().join(format!("bstack_raii_swref_d_{stamp}.bstack"));
+        let reg = rtti::sync(&schema).unwrap();
+        let alloc = FirstFitBStackAllocator::new(BStack::open(&data).unwrap()).unwrap();
+
+        // Build a `Wide` whose `d` ref aliases a `Leaf` we own separately.
+        let d_keep: BStackOwned<Leaf> = Leaf::new(&alloc, 4).unwrap();
+        let root = Wide::new(
+            &alloc,
+            Leaf::new(&alloc, 1).unwrap(),
+            Some(Leaf::new(&alloc, 2).unwrap()),
+            RcLeaf::new(&alloc, 3).unwrap(),
+            unsafe { bstack_raii::BStackRef::<Leaf>::from_range(d_keep.handle().range()) },
+            vec![Leaf::new(&alloc, 5).unwrap()],
+            b"hi",
+            None,
+        )
+        .unwrap();
+        let root_off = root.handle().range().start();
+        let ord = reg.ordinal_of(Wide::eightcc()).unwrap();
+
+        // A distinct live `Leaf` we (would) install into `d`.
+        let other: BStackOwned<Leaf> = Leaf::new(&alloc, 7).unwrap();
+        let r = reg.swap(alloc.stack(), ord, root_off, &["d"], unsafe {
+            bstack_raii::rtti::AnyRef::new(Leaf::eightcc(), other.handle().range().start())
+        });
+        let msg = r.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("non-owning alias") && msg.contains("`set`"),
+            "swap on a `ref` field must be rejected and point at `set`, got: {msg:?}"
+        );
+
+        // The rejection touched nothing: `d` still aliases the original target, and the
+        // block we tried to install is still ours to drop — no offset was exchanged.
+        root.bstack_drop(&alloc).unwrap(); // frees the shell + a/b/c/many, leaves `d`
+        other.bstack_drop(&alloc).unwrap(); // never installed — still ours
+        d_keep.bstack_drop(&alloc).unwrap(); // the `ref` target, never freed by the above
+
+        std::fs::remove_file(&schema).ok();
+        std::fs::remove_file(&data).ok();
+    }
 }
 
 mod enumschema {

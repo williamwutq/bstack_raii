@@ -203,10 +203,10 @@ impl RttiRegistry {
         data.set(offset, value).map_err(Into::into)
     }
 
-    /// **Swap** the reference field named by `path` to point at `new`, returning the
-    /// previous target as an [`AnyRef`] (`None` if it was null). A pointer exchange:
-    /// the field takes ownership of `new`, and the old reference is handed back for
-    /// the caller to reuse or tear down — no refcount changes (ownership moves, it is
+    /// **Swap** the **owning** reference field named by `path` to point at `new`,
+    /// returning the previous target as an [`AnyRef`] (`None` if it was null). A pointer
+    /// exchange: the field takes ownership of `new`, and the old reference is handed back
+    /// for the caller to reuse or tear down — no refcount changes (ownership moves, it is
     /// not duplicated).
     ///
     /// `new` is **validated** against the on-disk header before it is installed: a live
@@ -215,11 +215,13 @@ impl RttiRegistry {
     /// pointing an owning slot at an arbitrary location — rejected with `[BSTACK0815]`.
     ///
     /// `new`'s [`tag`](AnyRef::tag) **must equal the field's declared type** (an
-    /// eightcc mismatch is rejected), and the target must be an in-file reference
-    /// (`owned` / `strong` / `weak` / `ref`, optionally `Option`-wrapped). For a `weak`
+    /// eightcc mismatch is rejected), and the target must be an **owning** in-file
+    /// reference (`owned` / `strong` / `weak`, optionally `Option`-wrapped). For a `weak`
     /// field, `new` and the returned old reference are the target's **control-block**
     /// [`AnyRef`] (exactly what [`move_out`](Self::move_out) hands back). A POD field or
-    /// a container is rejected; a cross-file `foreign` field uses
+    /// a container is rejected; a **`ref`** field is a non-owning alias (swapping it
+    /// would hand back a tear-down-able alias to a block it does not own) — repoint it
+    /// with [`set`](Self::set) instead; a cross-file `foreign` field uses
     /// [`swap_foreign`](Self::swap_foreign) instead (an [`AnyRef`] can't name its file).
     pub fn swap(
         &self,
@@ -245,10 +247,29 @@ impl RttiRegistry {
             shape = *inner;
         }
         let (tag, is_weak) = match shape {
-            // `owned`/`strong`/`ref` hold a data offset; `weak` holds a control offset —
-            // both are a single `u64` slot exchanged the same way (no refcount change).
-            Shape::Owned(t) | Shape::Strong(t) | Shape::Ref(t) => (t, false),
+            // `owned`/`strong` hold a data offset; `weak` holds a control offset — both
+            // are a single `u64` slot exchanged the same way (no refcount change). Each
+            // owns something the swap transfers out, so the displaced `AnyRef` is the
+            // caller's to keep or tear down.
+            Shape::Owned(t) | Shape::Strong(t) => (t, false),
             Shape::Weak(t) => (t, true),
+            // A `ref` owns nothing — it aliases a block some *other* slot owns. Swapping
+            // it would hand the displaced offset back as an owning `AnyRef`, which a
+            // caller could tear down and double-free the block its real owner still
+            // holds. The reference kind is edge metadata (the field's `Shape`), not a
+            // fact about the block, so an isolated `AnyRef` cannot carry it — which is
+            // exactly why `swap`, an ownership transfer, does not accept a `ref`. Repoint
+            // one in place with `set` (same validation, returns nothing); a typed,
+            // non-owning handle to the old target is the static `replace_<field>`'s
+            // `BStackRef` return, which the untyped RTTI API cannot reproduce.
+            Shape::Ref(_) => {
+                return Err(rtti_err!(
+                    Swap,
+                    "RTTI swap: a `ref` field is a non-owning alias — repoint it with \
+                     `set`; `swap` exchanges an owning reference (`owned` / `strong` / \
+                     `weak`)"
+                ));
+            }
             Shape::Foreign { .. } => {
                 return Err(rtti_err!(
                     Swap,
