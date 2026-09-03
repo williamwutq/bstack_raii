@@ -496,7 +496,45 @@ pub(crate) fn foreign_elem_clone(kind: Kind, ftarget: &Type) -> TokenStream {
     }
 }
 
-/// makes ref accessors return `Option<Handle>`, treating a `0` offset as `None`.
+/// The `TryCloneIn` impl for a deep-clonable block/enum: drive a `ClonePlan::run_clone`
+/// descent (single-pass intention-first, or two-pass atomic bulk on a bulk allocator —
+/// chosen inside `run_clone`, which may run the descent twice) over the generated
+/// `__bstack_clone_into`, and wrap the fresh root as a `BStackOwned<Self>`. `impl_g` /
+/// `ty_g` / `where_g` are the type's split generics, `name` its handle type. Shared by
+/// `bstack_block` (plain mode) and `bstack_enum`.
+pub(crate) fn try_clone_in_impl(
+    impl_g: &impl quote::ToTokens,
+    name: &Ident,
+    ty_g: &impl quote::ToTokens,
+    where_g: &impl quote::ToTokens,
+) -> TokenStream {
+    quote! {
+        impl #impl_g ::bstack_raii::TryCloneIn for #name #ty_g #where_g {
+            fn try_clone_in<__A: ::bstack_raii::BStackRaiiAllocator>(
+                &self,
+                allocator: &__A,
+            ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
+                use ::bstack_raii::BStackBlock as _;
+                // The clone strategy (single-pass intention-first, or two-pass
+                // atomic bulk on a `BStackBulkAllocator`) is chosen inside
+                // `run_clone`, which may run this descent twice (measure + build).
+                let __dst = ::bstack_raii::ClonePlan::run_clone(allocator, |__plan| {
+                    self.__bstack_clone_into(allocator, __plan)
+                })?;
+                ::std::result::Result::Ok(unsafe {
+                    ::bstack_raii::BStackOwned::from_raw(
+                        unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__dst) },
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// The reader method (`get_<field>`) for a scalar field — POD (by value), or an
+/// `owned` / `strong` / `weak` / `ref` block reference (its typed handle). A `nullable`
+/// (`Option<_>`) block-reference field returns `Option<Handle>`, treating a `0` offset
+/// as `None`.
 pub(crate) fn accessor(
     vis: &syn::Visibility,
     fname: &Ident,
@@ -1686,14 +1724,14 @@ pub(crate) fn move_field(
                     ::core::option::Option::None
                 } else {
                     let __ctrl = unsafe {
-                        unsafe { ::bstack_raii::BStackRef::<
+                        ::bstack_raii::BStackRef::<
                             <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                         >::from_range(::bstack_raii::BStackRange::new(
                             #cap,
                             ::core::mem::size_of::<
                                 <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                             >() as u64,
-                        )) }
+                        ))
                     };
                     ::core::option::Option::Some(
                         unsafe { ::bstack_raii::BStackWeak::from_raw(__ctrl, __alloc) }
@@ -2057,14 +2095,14 @@ pub(crate) fn weak_drop_stmt(fname: &Ident, inner_ty: &Type) -> TokenStream {
             let __off = __on_disk.#fname;
             if __off != 0 {
                 let __ctrl = unsafe {
-                    unsafe { ::bstack_raii::BStackRef::<
+                    ::bstack_raii::BStackRef::<
                         <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                     >::from_range(::bstack_raii::BStackRange::new(
                         __off,
                         ::core::mem::size_of::<
                             <#inner_ty as ::bstack_raii::BStackWeakable>::Control
                         >() as u64,
-                    )) }
+                    ))
                 };
                 unsafe { ::bstack_raii::WeakRef::<#inner_ty>::new(__ctrl) }.bstack_drop(allocator)?;
             }
@@ -4689,9 +4727,9 @@ pub(crate) fn embed_field(
     Ok(Some(parts))
 }
 
-/// Lower a **scalar** field (the fall-through: POD inline, or a single
-/// `#[bstack_owned/strong/weak/ref]` / `#[embed]`... no — embed handled earlier)
-/// block reference) to its [`FieldParts`]: on-disk slot, `get_`/`raw_`_slice
+/// Lower a **scalar** field — the fall-through: POD stored inline, or a single
+/// `#[bstack_owned/strong/weak/ref]` block reference (`#[embed]` is handled upstream) —
+/// to its [`FieldParts`]: on-disk slot, `get_`/`raw_`_slice
 /// accessor, `#[bstack_mut]` `set_`/`replace_` mutators, ctor wiring (or a weak
 /// setter), teardown, clone, and `bstack_move!` pieces. Always applies.
 pub(crate) fn scalar_field(
@@ -5116,14 +5154,14 @@ pub(crate) fn single_block_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<V
             parts.payload_sizes.push(quote!(8usize));
             let ctrl_ref = quote! {
                 unsafe {
-                    unsafe { ::bstack_raii::BStackRef::<
+                    ::bstack_raii::BStackRef::<
                         <#ty as ::bstack_raii::BStackWeakable>::Control
                     >::from_range(::bstack_raii::BStackRange::new(
                         ::bstack_raii::get_u64(&__pl),
                         ::core::mem::size_of::<
                             <#ty as ::bstack_raii::BStackWeakable>::Control
                         >() as u64,
-                    )) }
+                    ))
                 }
             };
             // A weak variant stores the child's CONTROL offset and holds

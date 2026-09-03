@@ -117,7 +117,7 @@ pub fn expand_struct(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenS
                     ));
                 } else {
                     let kind = classify(f)?;
-                    let shape = field_shape(&fname_str, f, &f.ty, kind)?;
+                    let shape = field_shape(&fname_str, &f.ty, kind)?;
                     rtti_fields.push(instance_field(&fname_str, &on_disk, &fname, shape));
                 }
             }
@@ -133,7 +133,7 @@ pub fn expand_struct(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenS
                 }
                 let fname = format_ident!("field{i}");
                 let kind = classify(f)?;
-                let shape = field_shape(&fname.to_string(), f, &f.ty, kind)?;
+                let shape = field_shape(&fname.to_string(), &f.ty, kind)?;
                 rtti_fields.push(instance_field(&i.to_string(), &on_disk, &fname, shape));
             }
         }
@@ -261,7 +261,7 @@ fn enum_variant(variant: &syn::Variant, value: i128) -> syn::Result<TokenStream>
                 .as_ref()
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "0".to_string());
-            let shape = field_shape(&fname, f, &f.ty, kind)?;
+            let shape = field_shape(&fname, &f.ty, kind)?;
             vec![quote! {
                 ::bstack_raii::rtti::RttiField {
                     name: ::std::string::String::from(#fname),
@@ -401,7 +401,7 @@ fn registration(name: &Ident, rtti_type: TokenStream) -> TokenStream {
 /// `rtti::Shape` at runtime. Recurses through `Option` / `[T; N]` / `Vec` / `String`
 /// down to a leaf (`Pod` or a block reference); the ownership `kind` applies to the
 /// leaf.
-fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
+fn field_shape(fname: &str, ty: &Type, kind: Kind) -> syn::Result<TokenStream> {
     // `Foreign` composes inside a `Vec` / array / tuple (its 16-byte `WidePtr`
     // is the container's element / member); the recursion below reaches the
     // `Foreign` leaf in each case.
@@ -419,8 +419,8 @@ fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::R
         // An un-annotated `Option<Vec<T>>` / `Option<String>` is *also* `Kind::Pod`, but
         // its on-disk form is a 16-byte `VecDesc` with the `data_off == 0` niche — the
         // offset-0 container niche, not an inline POD value. Exclude a container inner
-        // here so it falls through to the `Shape::Option(Shape::Vec(..))` lowering
-        //; the bytemuck in-place niche is only for a genuine scalar POD.
+        // here so it falls through to the `Shape::Option(Shape::Vec(..))` lowering —
+        // the bytemuck in-place niche is only for a genuine scalar POD.
         if kind == Kind::Pod && vec_info(inner).is_none() {
             return Ok(quote!(::bstack_raii::rtti::Shape::Pod {
                 width: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
@@ -432,7 +432,6 @@ fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::R
         );
     }
 
-    let _ = field;
     leaf_or_container_shape(fname, ty, ty, kind)
 }
 
@@ -447,9 +446,9 @@ fn vec_region_shape(
     ty: &Type,
     kind: Kind,
 ) -> Option<syn::Result<TokenStream>> {
-    let _vi = vec_info(ty)?;
+    let vi = vec_info(ty)?;
     Some((|| {
-        if _vi.is_string {
+        if vi.is_string {
             return Ok(quote!(::bstack_raii::rtti::Shape::Vec(
                 ::std::boxed::Box::new(::bstack_raii::rtti::Shape::Pod { width: 1 })
             )));

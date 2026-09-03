@@ -584,36 +584,15 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     // three stay consistent.
     let data_eightcc = quote!(#data_mixed.mix_str(::core::module_path!()));
 
-    // Control-block tag (rc, weak). Default: the data tag with a reserved hash bit
-    // toggled — same readable prefix, structurally distinct (`with_ctrl_bit` can't
-    // collide with the data tag regardless of the prefix, unlike the old
-    // prefix-lowercasing — issue 36). Explicit `ctrl_tag =` override: its own
-    // readable prefix, still module-path-folded.
-    let (ctrl_eightcc, ctrl_truncated) = match attr.ctrl_tag.as_ref() {
-        None => (quote!(#data_eightcc.with_ctrl_bit()), false),
-        Some(t) => {
-            let ctrl_prefix = t.bytes().collect::<Vec<u8>>();
-            let ctrl_tag = build_tag(hash, &ctrl_prefix);
-            // [BSTACK0006] An explicit `ctrl_tag` equal to the data tag collapses
-            // the data/control distinction — a control block would then pass every
-            // data-block identity check. The default derivation can't reach this
-            // (`with_ctrl_bit` guarantees a difference), so only the override is
-            // checked.
-            if ctrl_tag.bytes == data_tag.bytes {
-                return Err(Error::new_spanned(
-                    &input.ident,
-                    "[BSTACK0006] the explicit `ctrl_tag` equals the data tag — a \
-                     control block would then pass every data-block identity check; \
-                     choose a distinct `ctrl_tag` (or omit it to auto-derive one)",
-                ));
-            }
-            let ctrl_base = eightcc_expr(&ctrl_tag.bytes);
-            (
-                quote!(#ctrl_base.mix_str(::core::module_path!())),
-                ctrl_tag.truncated,
-            )
-        }
-    };
+    // Control-block tag (rc, weak): the data tag with a reserved hash bit toggled, or an
+    // explicit `ctrl_tag =` override (see `util::ctrl_eightcc`).
+    let (ctrl_eightcc, ctrl_truncated) = ctrl_eightcc(
+        attr.ctrl_tag.as_ref(),
+        hash,
+        &data_tag,
+        &data_eightcc,
+        &input.ident,
+    )?;
 
     // The warnings use the `deprecated` mechanism, so a real `#[allow(deprecated)]`
     // on the struct also silences them (in addition to the `allow(...)` args).
@@ -628,15 +607,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             "#[bstack_block] on `{type_name}`: a tag override longer than 8 bytes was truncated; \
              add `allow(overlong_tag)` to silence"
         );
-        quote! {
-            #[doc(hidden)]
-            #[allow(dead_code, non_snake_case)]
-            fn #warn_fn() {
-                #[deprecated(note = #msg)]
-                fn overlong_tag() {}
-                overlong_tag();
-            }
-        }
+        deprecation_warning(&warn_fn, &format_ident!("overlong_tag"), &msg)
     } else {
         quote!()
     };
@@ -649,15 +620,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
              (and `&str` to `String`); write the owned type directly, or add \
              `allow(coerced_ref)` to silence"
         );
-        quote! {
-            #[doc(hidden)]
-            #[allow(dead_code, non_snake_case)]
-            fn #warn_fn() {
-                #[deprecated(note = #msg)]
-                fn ref_coerced() {}
-                ref_coerced();
-            }
-        }
+        deprecation_warning(&warn_fn, &format_ident!("ref_coerced"), &msg)
     } else {
         quote!()
     };
@@ -794,27 +757,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         }
     };
     let clone_impl = if mode == Mode::Plain {
-        quote! {
-            impl #impl_g ::bstack_raii::TryCloneIn for #name #ty_g #where_g {
-                fn try_clone_in<__A: ::bstack_raii::BStackRaiiAllocator>(
-                    &self,
-                    allocator: &__A,
-                ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
-                    use ::bstack_raii::BStackBlock as _;
-                    // The clone strategy (single-pass intention-first, or two-pass
-                    // atomic bulk on a `BStackBulkAllocator`) is chosen inside
-                    // `run_clone`, which may run this descent twice (measure + build).
-                    let __dst = ::bstack_raii::ClonePlan::run_clone(allocator, |__plan| {
-                        self.__bstack_clone_into(allocator, __plan)
-                    })?;
-                    ::std::result::Result::Ok(unsafe {
-                        ::bstack_raii::BStackOwned::from_raw(
-                            unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__dst) },
-                        )
-                    })
-                }
-            }
-        }
+        try_clone_in_impl(&impl_g, name, &ty_g, &where_g)
     } else {
         quote!()
     };

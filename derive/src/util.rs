@@ -665,7 +665,6 @@ pub(crate) fn nested_consume_inner(
     quote!(for #cv in #val { #inner })
 }
 
-/// Generate the reader method for one field. `nullable` (an `Option<_>` field)
 /// Parsed `#[bstack_block(...)]` / `#[bstack_enum(...)]` arguments.
 pub(crate) struct Attr {
     pub(crate) mode: Mode,
@@ -938,6 +937,59 @@ pub(crate) fn auto_prefix(name: &str) -> Vec<u8> {
 pub(crate) fn eightcc_expr(bytes: &[u8; 8]) -> TokenStream {
     let bytes = bytes.iter();
     quote!(::bstack_raii::EightCC::new([#(#bytes),*]))
+}
+
+/// Derive the `(rc, weak)` **control-block tag** expression and its `truncated` flag,
+/// given the data tag. With no explicit `ctrl_tag`, it is the data tag with a reserved
+/// hash bit toggled (`with_ctrl_bit` — the same readable prefix, structurally distinct
+/// from the data tag regardless of prefix). An explicit `ctrl_tag =` override gets its
+/// own readable prefix (still module-path-folded) and is rejected with `[BSTACK0006]` if
+/// it collapses onto the data tag (which would let a control block pass every data-block
+/// identity check). Shared by the `bstack_block` and `bstack_enum` orchestrators.
+pub(crate) fn ctrl_eightcc(
+    ctrl_tag: Option<&String>,
+    hash: u64,
+    data_tag: &Tag,
+    data_eightcc: &TokenStream,
+    ident: &Ident,
+) -> syn::Result<(TokenStream, bool)> {
+    match ctrl_tag {
+        None => Ok((quote!(#data_eightcc.with_ctrl_bit()), false)),
+        Some(t) => {
+            let ctrl_prefix = t.bytes().collect::<Vec<u8>>();
+            let ctrl_tag = build_tag(hash, &ctrl_prefix);
+            if ctrl_tag.bytes == data_tag.bytes {
+                return Err(Error::new_spanned(
+                    ident,
+                    "[BSTACK0006] the explicit `ctrl_tag` equals the data tag — a \
+                     control block would then pass every data-block identity check; \
+                     choose a distinct `ctrl_tag` (or omit it to auto-derive one)",
+                ));
+            }
+            let ctrl_base = eightcc_expr(&ctrl_tag.bytes);
+            Ok((
+                quote!(#ctrl_base.mix_str(::core::module_path!())),
+                ctrl_tag.truncated,
+            ))
+        }
+    }
+}
+
+/// A compile-time **deprecation-warning** shim: a hidden dummy fn (`warn_fn`, named per
+/// type so it can't collide) that calls a `#[deprecated]`-annotated inner fn, so the
+/// warning fires at that call. A real `#[allow(deprecated)]` on the type silences it, as
+/// does `allow(<lint>)` where `lint` is the inner fn's name. Shared by the overlong-tag
+/// and `&T`-coercion warnings across `bstack_block` / `bstack_enum`.
+pub(crate) fn deprecation_warning(warn_fn: &Ident, lint: &Ident, msg: &str) -> TokenStream {
+    quote! {
+        #[doc(hidden)]
+        #[allow(dead_code, non_snake_case)]
+        fn #warn_fn() {
+            #[deprecated(note = #msg)]
+            fn #lint() {}
+            #lint();
+        }
+    }
 }
 
 /// Classify by ownership annotation among a set of attributes (a field's or an

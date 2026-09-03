@@ -299,32 +299,10 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     // the RTTI registry (both go through this `eightcc()`).
     let eightcc = quote!(#data_mixed.mix_str(::core::module_path!()));
 
-    // Control-block tag (rc, weak). Default: the data tag with a reserved hash bit
-    // toggled — same readable prefix, structurally distinct (issue 36). Explicit
-    // `ctrl_tag =` override: its own readable prefix, still module-path-folded.
-    let (ctrl_eightcc, ctrl_truncated) = match attr.ctrl_tag.as_ref() {
-        None => (quote!(#eightcc.with_ctrl_bit()), false),
-        Some(t) => {
-            let ctrl_prefix = t.bytes().collect::<Vec<u8>>();
-            let ctrl_tag = build_tag(hash, &ctrl_prefix);
-            // [BSTACK0006] An explicit `ctrl_tag` equal to the data tag collapses
-            // the data/control distinction. The default (`with_ctrl_bit`) can't
-            // reach this, so only the override is checked.
-            if ctrl_tag.bytes == tag.bytes {
-                return Err(Error::new_spanned(
-                    &input.ident,
-                    "[BSTACK0006] the explicit `ctrl_tag` equals the data tag — a \
-                     control block would then pass every data-block identity check; \
-                     choose a distinct `ctrl_tag` (or omit it to auto-derive one)",
-                ));
-            }
-            let ctrl_base = eightcc_expr(&ctrl_tag.bytes);
-            (
-                quote!(#ctrl_base.mix_str(::core::module_path!())),
-                ctrl_tag.truncated,
-            )
-        }
-    };
+    // Control-block tag (rc, weak): the data tag with a reserved hash bit toggled, or an
+    // explicit `ctrl_tag =` override (see `util::ctrl_eightcc`).
+    let (ctrl_eightcc, ctrl_truncated) =
+        ctrl_eightcc(attr.ctrl_tag.as_ref(), hash, &tag, &eightcc, &input.ident)?;
 
     // Refcount / control machinery, mirroring the struct rc modes: an injected
     // field after the header, `BStackShared` (rc / rc,weak), and (rc, weak) a
@@ -617,15 +595,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             "#[bstack_enum] on `{type_name}`: a tag override longer than 8 bytes was truncated; \
              add `allow(overlong_tag)` to silence"
         );
-        quote! {
-            #[doc(hidden)]
-            #[allow(dead_code, non_snake_case)]
-            fn #warn_fn() {
-                #[deprecated(note = #msg)]
-                fn overlong_tag() {}
-                overlong_tag();
-            }
-        }
+        deprecation_warning(&warn_fn, &format_ident!("overlong_tag"), &msg)
     } else {
         quote!()
     };
@@ -726,27 +696,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     };
     // The public `TryCloneIn` entry point, for plain enums only.
     let enum_clone_trait = if mode == Mode::Plain {
-        quote! {
-            impl #enum_impl_g ::bstack_raii::TryCloneIn for #name #enum_ty_g #enum_where {
-                fn try_clone_in<__A: ::bstack_raii::BStackRaiiAllocator>(
-                    &self,
-                    allocator: &__A,
-                ) -> ::std::io::Result<::bstack_raii::BStackOwned<Self>> {
-                    use ::bstack_raii::BStackBlock as _;
-                    // The clone strategy (single-pass intention-first, or two-pass
-                    // atomic bulk on a `BStackBulkAllocator`) is chosen inside
-                    // `run_clone`, which may run this descent twice (measure + build).
-                    let __dst = ::bstack_raii::ClonePlan::run_clone(allocator, |__plan| {
-                        self.__bstack_clone_into(allocator, __plan)
-                    })?;
-                    ::std::result::Result::Ok(unsafe {
-                        ::bstack_raii::BStackOwned::from_raw(
-                            unsafe { <Self as ::bstack_raii::BStackBlock>::from_range(__dst) },
-                        )
-                    })
-                }
-            }
-        }
+        try_clone_in_impl(&enum_impl_g, name, &enum_ty_g, &enum_where)
     } else {
         quote!()
     };

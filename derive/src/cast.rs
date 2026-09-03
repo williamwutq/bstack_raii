@@ -7,6 +7,8 @@
 //! * `expr as BStackOwnedSlice`     — owned upcast     → `BStackOwned::into_slice`
 //! * `expr as BStackOwned<X, _>`    — owned downcast   → `BStackCastInto::cast_into::<X>`
 //! * `slice as X` (a block type)    — borrowed downcast → `BStackCastAs::cast_as::<X>`
+//! * `slice as Foreign<X>`          — normal → foreign  → `Foreign::from_local`
+//! * `foreign as BStackRef<X>`      — foreign → normal  → `Foreign::into_local`
 //!
 //! The borrowed upcast (`X` → `BStackSlice`) needs a stack, so it is the
 //! generated `handle.as_slice(stack)` method rather than a `bstack_cast!` form.
