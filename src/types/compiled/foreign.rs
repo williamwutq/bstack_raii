@@ -253,7 +253,7 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
     /// allocator for a [`SELF`](FileId::SELF) target, else the target file's host).
     /// Infallible: a weak handle only names the control block.
     pub fn into_local<'t, A: BStackRaiiAllocator>(self, target: &'t A) -> BStackWeak<'t, T, A> {
-        let ctrl_off = self.ptr.offset();
+        let ctrl_off = self.ptr.offset().get();
         // SAFETY: a weak `Foreign` stores the target's control-block offset.
         let ctrl = unsafe {
             BStackRef::<T::Control>::from_range(BStackRange::new(

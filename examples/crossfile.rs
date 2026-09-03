@@ -109,7 +109,7 @@ fn main() -> io::Result<()> {
     // Deep-clone the card. The clone gets its *own* fresh copy of the document,
     // allocated in the store file — cross-file `TryCloneIn` follows the pointer.
     let card_copy = card.try_clone_in(&catalog)?;
-    let copy_off = card_copy.handle().get_body(catalog.stack())?.offset();
+    let copy_off = card_copy.handle().get_body(catalog.stack())?.offset().get();
     println!(
         "cloned card -> independent document at store offset {copy_off} (original at {doc_off})"
     );

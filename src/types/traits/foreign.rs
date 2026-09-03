@@ -93,9 +93,10 @@ impl<'a, T: 'static> Foreign<'a, T> {
         self.inner.wide()
     }
 
-    /// The target's address within its file.
-    pub fn offset(self) -> u64 {
-        self.inner.offset().get()
+    /// The target's address within its file, as a branded [`Offset`] (its null niche is
+    /// [`Offset::is_null`]). Call [`Offset::get`] for the raw `u64`.
+    pub fn offset(self) -> Offset {
+        self.inner.offset()
     }
 
     /// Whether this points into the *current* file ([`FileId::SELF`]).
@@ -151,7 +152,10 @@ impl<T: 'static> Foreign<'static, T> {
 impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     /// The target's range in its file (`address` + `size_of::<T::OnDisk>()`).
     pub fn range(self) -> BStackRange {
-        BStackRange::new(self.offset(), core::mem::size_of::<T::OnDisk>() as u64)
+        BStackRange::new(
+            self.offset().get(),
+            core::mem::size_of::<T::OnDisk>() as u64,
+        )
     }
 
     /// Resolve the pointer and run `f` with a `T` handle at the target plus the
@@ -172,7 +176,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     where
         A: BStackAllocator,
     {
-        if self.offset() == 0 {
+        if self.offset().is_null() {
             return Ok(None);
         }
         let t = unsafe { T::from_range(self.range()) };
@@ -216,7 +220,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     where
         A: BStackAllocator,
     {
-        if self.offset() == 0 {
+        if self.offset().is_null() {
             return Ok(None);
         }
         let t = unsafe { T::from_range(self.range()) };

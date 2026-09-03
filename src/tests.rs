@@ -7872,7 +7872,7 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
     let clone_link = c.handle().get_owned_link(hstack).unwrap();
     assert_eq!(clone_link.file_id(), fid);
     assert_ne!(
-        clone_link.offset(),
+        clone_link.offset().get(),
         off,
         "owned clone must be a fresh copy, not an alias"
     );
@@ -7957,7 +7957,7 @@ fn macro_foreign_owned_clone_on_bulk_home_copies_once() {
     let clone_link = c.handle().get_owned_link(hstack).unwrap();
     assert_eq!(clone_link.file_id(), fid);
     assert_ne!(
-        clone_link.offset(),
+        clone_link.offset().get(),
         off,
         "must be a fresh copy, not an alias"
     );
@@ -8568,7 +8568,7 @@ fn macro_foreign_generic_across_files() {
     // Deep clone copies the target on B (fresh offset, same value).
     let c = h.handle().try_clone_in(&home_alloc).unwrap();
     let clink = c.handle().get_link(hstack).unwrap();
-    assert_ne!(clink.offset(), off);
+    assert_ne!(clink.offset().get(), off);
     assert_eq!(
         clink
             .with(&home_alloc, |t, fs| t.get_val(fs).unwrap())
@@ -9317,7 +9317,7 @@ fn stdlib_foreign_collection_target_clone_and_teardown() {
     let clone_link = c.handle().get_dq(hstack).unwrap();
     assert_eq!(clone_link.file_id(), fid);
     assert_ne!(
-        clone_link.offset(),
+        clone_link.offset().get(),
         dq_off,
         "owned clone must be a fresh copy"
     );

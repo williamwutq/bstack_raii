@@ -25,11 +25,6 @@ use crate::util::io_errorfn;
 io_errorfn!(overflow_err, InvalidData, "refcount overflow");
 io_errorfn!(underflow_err, InvalidData, "refcount underflow");
 
-// A counter offset near `u64::MAX` (so the fixed 8-byte counter range can't be
-// formed) can only come from a corrupted/forged on-disk pointer — every caller
-// derives `offset` from a stored back-pointer, `Foreign` target, or field value.
-io_errorfn!(corrupt_offset_err, InvalidData, "refcount offset overflow");
-
 /// Compare-and-swap the counter at `offset`: set it to `new` iff it currently
 /// equals `expected`. Returns whether the swap happened. The atomic "try-unwrap"
 /// primitive behind [`crate::BStackRc::try_move`].
@@ -50,8 +45,9 @@ pub fn load(stack: &BStack, offset: NonNullOffset) -> io::Result<u64> {
 /// Atomically add `delta`, returning the previous value. Errors on overflow
 /// rather than wrapping (leaving the counter unchanged in that case).
 pub fn fetch_add(stack: &BStack, offset: NonNullOffset, delta: u64) -> io::Result<u64> {
+    // Branded `checked_add` on the non-null counter offset, then widen the pair.
+    let end = offset.checked_add(8)?.as_u64();
     let offset = offset.as_u64();
-    let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut prev = 0u64;
     let mut overflow = false;
     stack.process(offset, end, |buf| {
@@ -71,8 +67,9 @@ pub fn fetch_add(stack: &BStack, offset: NonNullOffset, delta: u64) -> io::Resul
 /// Atomically subtract `delta`, returning the previous value. Errors on
 /// underflow rather than wrapping (leaving the counter unchanged in that case).
 pub fn fetch_sub(stack: &BStack, offset: NonNullOffset, delta: u64) -> io::Result<u64> {
+    // Branded `checked_add` on the non-null counter offset, then widen the pair.
+    let end = offset.checked_add(8)?.as_u64();
     let offset = offset.as_u64();
-    let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut prev = 0u64;
     let mut underflow = false;
     stack.process(offset, end, |buf| {
@@ -103,8 +100,9 @@ pub fn increment_if_nonzero(stack: &BStack, offset: NonNullOffset) -> io::Result
     if load(stack, offset)? == 0 {
         return Ok(None);
     }
+    // Branded `checked_add` on the non-null counter offset, then widen the pair.
+    let end = offset.checked_add(8)?.as_u64();
     let offset = offset.as_u64();
-    let end = offset.checked_add(8).ok_or_else(corrupt_offset_err)?;
     let mut result = None;
     let mut overflow = false;
     stack.process(offset, end, |buf| {

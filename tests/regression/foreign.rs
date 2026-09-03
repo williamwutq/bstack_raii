@@ -69,12 +69,15 @@ mod brand {
             unsafe { ForeignOwned::from_foreign(Foreign::<Leaf>::new(FileId::SELF, spare)) };
         let escapee: ForeignOwned<'_, Leaf> = h1.handle().replace_link(&f1, replacement).unwrap();
         assert!(escapee.is_self());
-        assert_eq!(escapee.as_foreign().offset(), a_off);
+        assert_eq!(escapee.as_foreign().offset().get(), a_off);
 
         // --- Store it into a block in the OTHER file (safe; no `unsafe` here). --
         // The brand is supposed to make this impossible. It compiles.
         let displaced = h2.handle().replace_link(&f2, escapee).unwrap();
-        assert_eq!(h2.handle().get_link(f2.stack()).unwrap().offset(), a_off);
+        assert_eq!(
+            h2.handle().get_link(f2.stack()).unwrap().offset().get(),
+            a_off
+        );
 
         // --- Consequences, all from safe code. ----------------------------------
         // 1. F2's real target B is stranded: `displaced` is the only handle left.
@@ -173,7 +176,7 @@ mod intolocal {
         println!(
             "ForeignOwned names file {:?} offset {}",
             fo.as_foreign().file_id().as_u64(),
-            fo.as_foreign().offset()
+            fo.as_foreign().offset().get()
         );
 
         // The pointer names file B; resolving it against the HOME allocator must be

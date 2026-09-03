@@ -37,7 +37,13 @@ impl TypeId {
     /// If `ordinal == u32::MAX`, so `ordinal + 1` overflows. Unreachable for a real
     /// RTTI ordinal.
     pub const fn from_ordinal(ordinal: u32) -> Self {
-        TypeId(ordinal + 1)
+        // Explicit overflow panic (matching `ResolvedTypeId::from_ordinal`) — a bare
+        // `+ 1` would wrap to `0` (== `UNTYPED`) in release, silently dropping the type
+        // tag rather than upholding the documented panic.
+        match ordinal.checked_add(1) {
+            Some(v) => TypeId(v),
+            None => panic!("RTTI ordinal + 1 overflowed to zero"),
+        }
     }
 
     /// The pointee's RTTI ordinal, or `None` if this is [`UNTYPED`](Self::UNTYPED).
