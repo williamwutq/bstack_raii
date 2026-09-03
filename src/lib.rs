@@ -84,6 +84,13 @@ pub use io_core::registry;
 pub use io_core::{
     ForeignHostAllocator, FreeManyError, STD_WAL_ANCHOR, dealloc_range, finish, wal_teardown,
 };
+/// Checked field-offset arithmetic for generated accessors — `mod primitives` is
+/// private, so this doc-hidden crate-root alias gives `#[bstack_block]`-generated code a
+/// stable path (`checked_field_offset`) without exposing the whole module. A base read
+/// from an on-disk pointer can be corrupt/forged, so a bare `+` could panic under
+/// `overflow-checks` or silently wrap; this errors instead.
+#[doc(hidden)]
+pub use primitives::checked_off as checked_field_offset;
 pub use primitives::{EightCC, NonNullOffset, Offset, TryClone, WidePtr};
 pub use stdlib::{
     BStackBTreeMap, BStackBTreeSet, BStackBinaryHeap, BStackBox, BStackCountingBloomFilter,
@@ -116,31 +123,17 @@ pub use bytemuck;
 // Procedural macros, re-exported so downstream depends only on `bstack_raii`.
 pub use bstack_raii_derive::{bstack_block, bstack_cast, bstack_class, bstack_enum, bstack_move};
 
-/// Runtime support called by `#[bstack_block]` / `#[bstack_enum]`-generated code via
-/// fully-qualified `::bstack_raii::__private::…` paths. Not part of the public API —
-/// no stability guarantee, use directly at your own risk.
+/// The `#[embed]` marker trait, named by `#[bstack_block]` / `#[bstack_enum]`-generated
+/// bounds through `::bstack_raii::__private::BStackEmbeddable`. Not part of the public
+/// API. (Every other codegen dependency now resolves through a public path — the
+/// [`registry`] / [`rtti`] modules, the crate-root `checked_field_offset` alias, or a
+/// capability-trait method like [`BStackWeakable::build_control_payload`] — so this
+/// module holds only the marker.)
 #[doc(hidden)]
 pub mod __private {
     // A macro-only marker: `#[embed]` targets must be plain, self-contained blocks.
     // Only `#[bstack_block]`/`#[bstack_enum]`-generated code (and the stdlib) implement
     // it; no downstream code names it, so it lives here rather than in the prelude — the
     // `on_unimplemented` message fires regardless of visibility.
-    /// Add a compile-time field-offset constant to a block's base offset,
-    /// rejecting overflow. Generated accessors call this instead of a bare
-    /// `+`: the base (`self.0.start()` or similar) can originate from an
-    /// on-disk pointer that is corrupted or forged, and a bare `+` would
-    /// either panic under `overflow-checks` or silently wrap to an unrelated
-    /// in-bounds offset that the accessor would then read or write.
-    pub use crate::primitives::checked_off as checked_field_offset;
-    pub use crate::registry::{home_relative_repr, resolve_self_repr};
-    /// Narrow a layout quantity to the `u32` the RTTI wire format uses,
-    /// panicking with a clear diagnostic on overflow rather than silently
-    /// wrapping. Called from `#[bstack_class]`-generated schema builders.
-    pub use crate::rtti::rtti_narrow_u32;
-    /// Control-block image builder for `(rc, weak)` lowerings — plumbing kept out of
-    /// the prelude. (The `#[bstack_weak]` field operations and the cross-file
-    /// teardown / clone helpers are now methods on the capability traits
-    /// [`BStackBlock`] / [`BStackShared`] / [`BStackWeakable`].)
-    pub use crate::types::compiled::rc::build_control_payload;
     pub use crate::types::traits::BStackEmbeddable;
 }

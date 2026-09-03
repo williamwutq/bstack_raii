@@ -799,7 +799,6 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         &on_disk_ty,
         &on_disk_ctor,
         mode,
-        &ctrl_eightcc,
         &ctor_params,
         &ctor_preps,
         &ctor_inits,

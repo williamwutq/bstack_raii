@@ -200,7 +200,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                 // struct field. A `Vec<[T; N]>` stores its offsets FLAT (like the
                 // struct case), reshaped to `Vec<[[T;..];..]>` on read.
                 let payload_loc = quote! {
-                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64)?
+                    ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, __bstack_payload) as u64)?
                 };
                 if let Some(p) = vec_variant(&vctx, ty, &payload_loc)? {
                     vp.merge(p);
@@ -567,10 +567,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
                         __bstack_disc: __disc,
                         __bstack_payload: __payload,
                     };
-                    let __ctrl_payload = ::bstack_raii::__private::build_control_payload(
-                        #ctrl_eightcc,
-                        __data.start(),
-                    );
+                    let __ctrl_payload = <Self as ::bstack_raii::BStackWeakable>::build_control_payload(__data.start());
                     let __writes: [(u64, &[u8]); 2] = [
                         (
                             __data.start(),

@@ -289,14 +289,14 @@ fn enum_variant(variant: &syn::Variant, value: i128) -> syn::Result<TokenStream>
                     let sizes = preceding
                         .iter()
                         .map(|t| quote!(::core::mem::size_of::<#t>()));
-                    quote!(::bstack_raii::__private::rtti_narrow_u32(#(#sizes)+*, "field offset"))
+                    quote!(::bstack_raii::rtti::rtti_narrow_u32(#(#sizes)+*, "field offset"))
                 };
                 out.push(quote! {
                     ::bstack_raii::rtti::RttiField {
                         name: ::std::string::String::from(#fname),
                         offset: #offset,
                         shape: ::bstack_raii::rtti::Shape::Pod {
-                            width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
+                            width: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
                         },
                     }
                 });
@@ -334,7 +334,7 @@ fn instance_field(name: &str, on_disk: &Ident, fname: &Ident, shape: TokenStream
     quote! {
         ::bstack_raii::rtti::RttiField {
             name: ::std::string::String::from(#name),
-            offset: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::offset_of!(#on_disk, #fname), "field offset"),
+            offset: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::offset_of!(#on_disk, #fname), "field offset"),
             shape: #shape,
         }
     }
@@ -350,7 +350,7 @@ fn class_field(name: &str, ty: &Type, mutable: bool, expr: &syn::Expr) -> TokenS
             shape: ::bstack_raii::rtti::Shape::Class {
                 mutable: #mutable,
                 inner: ::std::boxed::Box::new(::bstack_raii::rtti::Shape::Pod {
-                    width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "class-variable width"),
+                    width: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "class-variable width"),
                 }),
                 value: {
                     let __v: #ty = #expr;
@@ -423,7 +423,7 @@ fn field_shape(fname: &str, field: &syn::Field, ty: &Type, kind: Kind) -> syn::R
         //; the bytemuck in-place niche is only for a genuine scalar POD.
         if kind == Kind::Pod && vec_info(inner).is_none() {
             return Ok(quote!(::bstack_raii::rtti::Shape::Pod {
-                width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
+                width: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
             }));
         }
         let inner_shape = leaf_or_container_shape(fname, ty, inner, kind)?;
@@ -489,7 +489,7 @@ fn leaf_or_container_shape(
         }
         for dim in dims.iter().rev() {
             acc = quote!(::bstack_raii::rtti::Shape::Array {
-                n: ::bstack_raii::__private::rtti_narrow_u32(#dim, "array length"),
+                n: ::bstack_raii::rtti::rtti_narrow_u32(#dim, "array length"),
                 inner: ::std::boxed::Box::new(#acc),
             });
         }
@@ -580,7 +580,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
                 // Opaque POD of the whole member type (an `Option<PodInOption>` keeps
                 // its bytemuck niche inline).
                 quote!(::bstack_raii::rtti::Shape::Pod {
-                    width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#e>(), "tuple element width"),
+                    width: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::size_of::<#e>(), "tuple element width"),
                 })
             };
             elems.push(es);
@@ -591,7 +591,7 @@ fn leaf_shape(fname: &str, orig: &Type, ty: &Type, kind: Kind) -> syn::Result<To
     }
     Ok(match kind {
         Kind::Pod => quote!(::bstack_raii::rtti::Shape::Pod {
-            width: ::bstack_raii::__private::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
+            width: ::bstack_raii::rtti::rtti_narrow_u32(::core::mem::size_of::<#ty>(), "POD field width"),
         }),
         other => {
             let variant = kind_variant(other).expect("non-POD kind");

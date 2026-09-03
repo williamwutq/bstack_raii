@@ -99,6 +99,18 @@ pub trait BStackWeakable: BStackBlock {
     /// its header, not only indirectly via its forward data pointer.
     fn control_eightcc() -> EightCC;
 
+    /// Build this `(rc, weak)` type's fixed-size **control-block image** — `strong = 1`,
+    /// `weak = 1`, `x = data_start`, tagged with [`control_eightcc`](Self::control_eightcc) —
+    /// for a batched constructor. The generated `new` writes the returned bytes (borrowed
+    /// as `&[u8]`) straight into its commit. A provided method so generated code names one
+    /// public trait method instead of `__private` plumbing (and needn't re-pass the tag).
+    #[doc(hidden)]
+    fn build_control_payload(
+        data_start: u64,
+    ) -> [u8; crate::types::compiled::rc::CONTROL_SIZE as usize] {
+        crate::types::compiled::rc::build_control_payload(Self::control_eightcc(), data_start)
+    }
+
     /// Cross-file **teardown** of a `#[bstack_weak] Foreign<Self>` target: decrement
     /// the weak count in the *control* block at `ctrl_offset`, freeing it at zero, in
     /// the file `alloc` addresses. The data block is never touched.

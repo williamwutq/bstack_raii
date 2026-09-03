@@ -9074,6 +9074,76 @@ fn macro_foreign_enum_container_variants() {
 }
 
 #[test]
+fn macro_foreign_enum_container_self_normalizes() {
+    // Regression: a SELF `Foreign` (pointing into the *home* file) stored in an enum
+    // `Vec<Foreign>` / `[Foreign; N]` variant must be re-encoded to SELF on write and
+    // resolved to the home file's explicit id on read — so it can never escape as a
+    // bare SELF (mis-storable into another file). The container-variant `new`/`read`
+    // paths had forgotten the `home_relative_repr` / `resolve_self_repr` normalization
+    // that every scalar/field foreign path applies; an unfixed read hands back
+    // `is_self() == true`.
+    use crate::Foreign;
+    use crate::registry::{self, FileId};
+    use std::sync::Arc;
+
+    let home = TempStack::new();
+    let home_alloc = Arc::new(home.allocator());
+    let reg_file = TempStack::new();
+    let _ = registry::init(&reg_file.path);
+    let reg = registry::get().unwrap();
+    let hid = reg.attach(&home.path, home_alloc.clone()).unwrap();
+    let self_to = |off: u64| unsafe { Foreign::<MacroLeaf>::new(FileId::SELF, off) };
+
+    // Vec variant: the read must resolve SELF → explicit-home, never `is_self()`.
+    let l1 = MacroLeaf::new(&*home_alloc, 5).unwrap().into_inner();
+    let e = ForeignContainerEnum::new(
+        &*home_alloc,
+        ForeignContainerEnumData::Many(vec![self_to(l1.range().start())]),
+    )
+    .unwrap();
+    match e.handle().read(&*home_alloc).unwrap() {
+        ForeignContainerEnumView::Many(v) => {
+            assert!(
+                !v[0].is_self(),
+                "vec variant: a stored SELF must resolve on read"
+            );
+            assert_eq!(v[0].file_id(), hid);
+            assert_eq!(
+                v[0].with(&*home_alloc, |x, fs| x.get_val(fs).unwrap())
+                    .unwrap()
+                    .unwrap(),
+                5
+            );
+        }
+        _ => panic!("wrong variant"),
+    }
+    e.bstack_drop(&*home_alloc).unwrap(); // `#[bstack_owned]`: frees l1
+
+    // Array variant: same normalization.
+    let l2 = MacroLeaf::new(&*home_alloc, 7).unwrap().into_inner();
+    let l3 = MacroLeaf::new(&*home_alloc, 8).unwrap().into_inner();
+    let e = ForeignContainerEnum::new(
+        &*home_alloc,
+        ForeignContainerEnumData::Fixed([self_to(l2.range().start()), self_to(l3.range().start())]),
+    )
+    .unwrap();
+    match e.handle().read(&*home_alloc).unwrap() {
+        ForeignContainerEnumView::Fixed(a) => {
+            assert!(
+                !a[0].is_self(),
+                "array variant: a stored SELF must resolve on read"
+            );
+            assert_eq!(a[0].file_id(), hid);
+            assert_eq!(a[1].file_id(), hid);
+        }
+        _ => panic!("wrong variant"),
+    }
+    e.bstack_drop(&*home_alloc).unwrap(); // frees l2, l3
+
+    reg.detach(hid);
+}
+
+#[test]
 fn macro_foreign_in_tuple_across_files() {
     // A tuple field mixing POD and (nullable) foreign elements: the POD parts store
     // inline, the foreign parts resolve / deep-clone / tear down cross-file.

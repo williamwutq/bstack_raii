@@ -38,7 +38,7 @@ pub(crate) fn vec_accessor(
     nullable: bool,
 ) -> TokenStream {
     let getter = format_ident!("get_{}", fname);
-    let field = quote!(::bstack_raii::__private::checked_field_offset(
+    let field = quote!(::bstack_raii::checked_field_offset(
         self.0.start(),
         ::core::mem::offset_of!(#on_disk, #fname) as u64
     )?);
@@ -241,7 +241,7 @@ pub(crate) fn block_vec_accessor(
     nullable: bool,
 ) -> TokenStream {
     let getter = format_ident!("get_{}", fname);
-    let field = quote!(::bstack_raii::__private::checked_field_offset(
+    let field = quote!(::bstack_raii::checked_field_offset(
         self.0.start(),
         ::core::mem::offset_of!(#on_disk, #fname) as u64
     )?);
@@ -515,7 +515,7 @@ pub(crate) fn accessor(
             ) -> ::std::io::Result<
                 ::core::option::Option<::bstack_raii::BStackRc<'__u, #inner_ty, __A>>
             > {
-                let __field = ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
+                let __field = ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
                 // SAFETY (emitted): `__field` is this block's own weak-field slot.
                 unsafe { ::bstack_raii::BStackWeakable::upgrade_weak_field(allocator, ::bstack_raii::NonNullOffset::from_field(__field)?) }
             }
@@ -602,7 +602,7 @@ pub(crate) fn raw_slice_accessor(
             &self,
             stack: &'__s ::bstack_raii::BStack,
         ) -> ::std::io::Result<::bstack_raii::BStackSlice<'__s>> {
-            let __off = ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
+            let __off = ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk, #fname) as u64)?;
             // SAFETY: `[__off, __off + #len)` is exactly this field's inline region
             // within the record, which is a live allocation of the backing stack.
             ::std::result::Result::Ok(unsafe {
@@ -629,7 +629,7 @@ pub(crate) fn set_accessor(
     nullable: bool,
 ) -> TokenStream {
     let setter = format_ident!("set_{}", fname);
-    let off = quote!(::bstack_raii::__private::checked_field_offset(
+    let off = quote!(::bstack_raii::checked_field_offset(
         self.0.start(),
         ::core::mem::offset_of!(#on_disk, #fname) as u64
     )?);
@@ -694,7 +694,7 @@ pub(crate) fn replace_accessor(
     // `replace_stack_method`, below) is inside a `Result<_, ReplaceError<_>>`
     // mutator, which must hand `value` back via `ReplaceError::recovered`
     // rather than propagate a bare `io::Error`.
-    let off = quote!(::bstack_raii::__private::checked_field_offset(
+    let off = quote!(::bstack_raii::checked_field_offset(
         self.0.start(),
         ::core::mem::offset_of!(#on_disk, #fname) as u64
     ));
@@ -1020,7 +1020,7 @@ pub(crate) fn array_mut_methods(
     // `io::Result` setters and `Result<_, ReplaceError<_>>` mutators, which
     // resolve a failed offset differently (the latter must hand `value` back
     // via `ReplaceError::recovered`, not just propagate the bare `io::Error`).
-    let base = quote!(::bstack_raii::__private::checked_field_offset(
+    let base = quote!(::bstack_raii::checked_field_offset(
         self.0.start(),
         ::core::mem::offset_of!(#on_disk, #fname) as u64
     ));
@@ -1398,7 +1398,7 @@ pub(crate) fn foreign_mut_methods(
     // Not `?`-terminated: reused inside both an `io::Result` setter and a
     // `Result<_, ReplaceError<_>>` mutator (see below), which resolve a
     // failed offset differently.
-    let off = quote!(::bstack_raii::__private::checked_field_offset(
+    let off = quote!(::bstack_raii::checked_field_offset(
         self.0.start(),
         ::core::mem::offset_of!(#on_disk, #fname) as u64
     ));
@@ -1462,7 +1462,7 @@ pub(crate) fn foreign_mut_methods(
         // Resolve a SELF old-pointer to this file's registered id before it is handed
         // back as a dual. Nothing is written yet, so on failure hand `value` back.
         let __old: ::bstack_raii::WidePtr =
-            match ::bstack_raii::__private::resolve_self_repr(__old_raw, __stack) {
+            match ::bstack_raii::registry::resolve_self_repr(__old_raw, __stack) {
                 ::std::result::Result::Ok(__r) => __r,
                 ::std::result::Result::Err(__e) =>
                     return ::core::result::Result::Err(
@@ -1483,7 +1483,7 @@ pub(crate) fn foreign_mut_methods(
                     let __r = #consume_some;
                     // Store the home-relative (SELF-re-encoded) form; keep the explicit
                     // `__r` to hand back untouched on a write failure.
-                    (::bstack_raii::__private::home_relative_repr(__r, __stack),
+                    (::bstack_raii::registry::home_relative_repr(__r, __stack),
                      ::core::option::Option::Some(__r))
                 }
                 ::core::option::Option::None =>
@@ -1514,7 +1514,7 @@ pub(crate) fn foreign_mut_methods(
             // Store the home-relative (SELF-re-encoded) form; hand the explicit value
             // back untouched on a write failure.
             let __new: ::bstack_raii::WidePtr =
-                ::bstack_raii::__private::home_relative_repr(__new_explicit, __stack);
+                ::bstack_raii::registry::home_relative_repr(__new_explicit, __stack);
             if let ::std::result::Result::Err(__e) =
                 __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
             {
@@ -1558,7 +1558,7 @@ pub(crate) fn foreign_mut_methods(
             ) -> ::std::io::Result<()> {
                 // Re-encode a pointer to the home file as SELF before storing.
                 let __new: ::bstack_raii::WidePtr =
-                    ::bstack_raii::__private::home_relative_repr(#new_repr, allocator.stack());
+                    ::bstack_raii::registry::home_relative_repr(#new_repr, allocator.stack());
                 allocator
                     .stack()
                     .set(#off?, ::bstack_raii::bytemuck::bytes_of(&__new))
@@ -1791,7 +1791,7 @@ pub(crate) fn weak_setter(
         > {
             // The offset is computed before `weak` is consumed, so on its failure
             // hand `weak` back unharmed.
-            let __field = match ::bstack_raii::__private::checked_field_offset(
+            let __field = match ::bstack_raii::checked_field_offset(
                 self.0.start(),
                 ::core::mem::offset_of!(#on_disk, #fname) as u64,
             ).and_then(::bstack_raii::NonNullOffset::from_field) {
@@ -1817,7 +1817,6 @@ pub(crate) fn constructor(
     // above is the plain *type* (`XOnDisk<T>`), for `size_of`.
     on_disk_ctor: &TokenStream,
     mode: Mode,
-    ctrl_eightcc: &TokenStream,
     params: &[TokenStream],
     preps: &[TokenStream],
     inits: &[TokenStream],
@@ -1992,10 +1991,7 @@ pub(crate) fn constructor(
                         __bstack_ctrl: __ctrl.start(),
                         #(#inits)*
                     };
-                    let __ctrl_payload = ::bstack_raii::__private::build_control_payload(
-                        #ctrl_eightcc,
-                        __data.start(),
-                    );
+                    let __ctrl_payload = <Self as ::bstack_raii::BStackWeakable>::build_control_payload(__data.start());
                     let __writes: [(u64, &[u8]); 2] = [
                         (
                             __data.start(),
@@ -2264,7 +2260,7 @@ pub(crate) fn foreign_field(
     // this file's registered id (`__stack` is the home stack, in scope in the
     // generated `bstack_move`) before the dual escapes, so it can't later be
     // re-stored into another file. Fallible — `bstack_move` returns `io::Result`.
-    let resolved_cap = quote!(::bstack_raii::__private::resolve_self_repr(#cap, __stack)?);
+    let resolved_cap = quote!(::bstack_raii::registry::resolve_self_repr(#cap, __stack)?);
     let (mv_leaf_ty, mv_leaf_expr) = match kind {
         Kind::Owned => (
             quote!(::bstack_raii::ForeignOwned<'__mv, #ftarget>),
@@ -2310,7 +2306,7 @@ pub(crate) fn foreign_field(
                     ::core::option::Option::None
                 } else {
                     // Resolve SELF to this file's registered id before it escapes.
-                    let __repr = ::bstack_raii::__private::resolve_self_repr(__p, stack)?;
+                    let __repr = ::bstack_raii::registry::resolve_self_repr(__p, stack)?;
                     // SAFETY: `__repr` names a valid `T` stored into this file.
                     ::core::option::Option::Some(unsafe {
                         ::bstack_raii::Foreign::from_repr(__repr)
@@ -2326,7 +2322,7 @@ pub(crate) fn foreign_field(
             let #fname: ::bstack_raii::WidePtr = match #fname {
                 // Re-encode a pointer to the home file as SELF.
                 ::core::option::Option::Some(__f) =>
-                    ::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack()),
+                    ::bstack_raii::registry::home_relative_repr(__f.repr(), allocator.stack()),
                 ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             };
         });
@@ -2354,7 +2350,7 @@ pub(crate) fn foreign_field(
                 let __od: #on_disk_ty = *__r.read_on_disk(stack, &mut __buf)?;
                 // Resolve a SELF pointer to this file's registered id before it
                 // escapes, so it can't be mis-stored into another file.
-                let __repr = ::bstack_raii::__private::resolve_self_repr(__od.#fname, stack)?;
+                let __repr = ::bstack_raii::registry::resolve_self_repr(__od.#fname, stack)?;
                 // SAFETY: `__repr` came from this block's stored field (SELF now an
                 // explicit registered id), so it names a valid `T`.
                 ::std::result::Result::Ok(unsafe {
@@ -2367,7 +2363,7 @@ pub(crate) fn foreign_field(
             // Re-encode a pointer to the home file as SELF, keeping the
             // on-disk form portable across re-attaches.
             let #fname: ::bstack_raii::WidePtr =
-                ::bstack_raii::__private::home_relative_repr(#fname.repr(), allocator.stack());
+                ::bstack_raii::registry::home_relative_repr(#fname.repr(), allocator.stack());
         ));
         parts.ctor_inits.push(quote!(#fname,));
         parts.mv_types.push(quote!(#mv_leaf_ty));
@@ -2640,7 +2636,7 @@ pub(crate) fn vec_field(
         )?;
 
         let store = quote!(::bstack_raii::BStackVec::<::bstack_raii::WidePtr, __A>);
-        let field_loc = quote!(::bstack_raii::__private::checked_field_offset(
+        let field_loc = quote!(::bstack_raii::checked_field_offset(
             self.0.start(),
             ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
         )?);
@@ -2667,7 +2663,7 @@ pub(crate) fn vec_field(
                     ::std::result::Result::Ok(::core::option::Option::None)
                 } else {
                     let __repr =
-                        ::bstack_raii::__private::resolve_self_repr(__p, allocator.stack())?;
+                        ::bstack_raii::registry::resolve_self_repr(__p, allocator.stack())?;
                     ::std::result::Result::Ok(::core::option::Option::Some(
                         unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }))
                 }
@@ -2676,7 +2672,7 @@ pub(crate) fn vec_field(
             quote!(|__p: ::bstack_raii::WidePtr|
                         -> ::std::io::Result<#acc_elem_ty> {
                 let __repr =
-                    ::bstack_raii::__private::resolve_self_repr(__p, allocator.stack())?;
+                    ::bstack_raii::registry::resolve_self_repr(__p, allocator.stack())?;
                 ::std::result::Result::Ok(
                     unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
             })
@@ -2684,12 +2680,12 @@ pub(crate) fn vec_field(
         let to_ptr = if elem_nullable {
             quote!(|__f: #field_ty| match __f {
                 ::core::option::Option::Some(__ff) =>
-                    ::bstack_raii::__private::home_relative_repr(__ff.repr(), allocator.stack()),
+                    ::bstack_raii::registry::home_relative_repr(__ff.repr(), allocator.stack()),
                 ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             })
         } else {
             quote!(|__f: #field_ty|
-                        ::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack()))
+                        ::bstack_raii::registry::home_relative_repr(__f.repr(), allocator.stack()))
         };
 
         // ---- Accessor: `Vec<Foreign<T>>` / `Vec<Option<Foreign<T>>>` (or `Option<..>`) ----
@@ -2832,13 +2828,13 @@ pub(crate) fn vec_field(
                     ::core::option::Option::None
                 } else {
                     let __repr =
-                        ::bstack_raii::__private::resolve_self_repr(__p, __alloc.stack())?;
+                        ::bstack_raii::registry::resolve_self_repr(__p, __alloc.stack())?;
                     ::core::option::Option::Some(unsafe { #wrap })
                 }
             }
         } else {
             quote! {{
-                let __repr = ::bstack_raii::__private::resolve_self_repr(__p, __alloc.stack())?;
+                let __repr = ::bstack_raii::registry::resolve_self_repr(__p, __alloc.stack())?;
                 unsafe { #wrap }
             }}
         };
@@ -2881,7 +2877,7 @@ pub(crate) fn vec_field(
         let size_elem = quote!(::core::mem::size_of::<
                     <#elem_ty as ::bstack_raii::BStackBlock>::OnDisk>() as u64);
         let store = quote!(::bstack_raii::BStackVec::<u64, __A>);
-        let field_loc = quote!(::bstack_raii::__private::checked_field_offset(
+        let field_loc = quote!(::bstack_raii::checked_field_offset(
             self.0.start(),
             ::core::mem::offset_of!(#on_disk_ty, #fname) as u64
         )?);
@@ -3370,7 +3366,7 @@ pub(crate) fn vec_array_field(
                 allocator: &'__v __A,
             ) -> ::std::io::Result<#acc_ret> {
                 let __base =
-                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
+                    ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 ::std::result::Result::Ok(#acc_body)
             }
         });
@@ -3609,7 +3605,7 @@ pub(crate) fn foreign_array_field(
                     if __p.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
-                        let __repr = ::bstack_raii::__private::resolve_self_repr(__p, stack)?;
+                        let __repr = ::bstack_raii::registry::resolve_self_repr(__p, stack)?;
                         ::core::option::Option::Some(
                             unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
                     }
@@ -3617,7 +3613,7 @@ pub(crate) fn foreign_array_field(
             } else {
                 quote!({
                     let __repr =
-                        ::bstack_raii::__private::resolve_self_repr(__arr[#k], stack)?;
+                        ::bstack_raii::registry::resolve_self_repr(__arr[#k], stack)?;
                     unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }
                 })
             }
@@ -3649,12 +3645,12 @@ pub(crate) fn foreign_array_field(
             if aleaf_nullable {
                 quote!(__slots[#k] = match #leaf {
                             ::core::option::Option::Some(__f) =>
-                                ::bstack_raii::__private::home_relative_repr(
+                                ::bstack_raii::registry::home_relative_repr(
                                     __f.repr(), allocator.stack()),
                             ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
                         };)
             } else {
-                quote!(__slots[#k] = ::bstack_raii::__private::home_relative_repr(
+                quote!(__slots[#k] = ::bstack_raii::registry::home_relative_repr(
                     #leaf.repr(), allocator.stack());)
             }
         };
@@ -3718,7 +3714,7 @@ pub(crate) fn foreign_array_field(
                         ::core::option::Option::None
                     } else {
                         let __repr =
-                            ::bstack_raii::__private::resolve_self_repr(__p, __stack)?;
+                            ::bstack_raii::registry::resolve_self_repr(__p, __stack)?;
                         ::core::option::Option::Some(
                             unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
                     }
@@ -3726,7 +3722,7 @@ pub(crate) fn foreign_array_field(
             } else {
                 quote!({
                     let __repr =
-                        ::bstack_raii::__private::resolve_self_repr(#cap[#k], __stack)?;
+                        ::bstack_raii::registry::resolve_self_repr(#cap[#k], __stack)?;
                     unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }
                 })
             }
@@ -3812,7 +3808,7 @@ pub(crate) fn block_array_field(
         parts.drop_stmts.push(quote! {
             {
                 let __base =
-                    ::bstack_raii::__private::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
+                    ::bstack_raii::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 for __k in 0usize..(#total) {
                     let __embed = ::bstack_raii::BStackRange::new(
@@ -3832,7 +3828,7 @@ pub(crate) fn block_array_field(
         parts.accessors.push(quote! {
             #vis fn #getter(&self) -> ::std::io::Result<#acc_ret> {
                 let __base =
-                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
+                    ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 ::std::result::Result::Ok(#acc_body)
             }
@@ -3866,7 +3862,7 @@ pub(crate) fn block_array_field(
         parts.ctor_post.push(quote! {
             {
                 let __base =
-                    ::bstack_raii::__private::checked_field_offset(__data.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
+                    ::bstack_raii::checked_field_offset(__data.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 for __k in 0usize..(#total) {
                     let __src = #src_id[__k];
@@ -3932,7 +3928,7 @@ pub(crate) fn block_array_field(
         parts.clone_stmts.push(quote! {
             {
                 let __base =
-                    ::bstack_raii::__private::checked_field_offset(__src.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
+                    ::bstack_raii::checked_field_offset(__src.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 let __step = ::core::mem::size_of::<#child_od>() as u64;
                 let mut __arr: [#child_od; #total] = __od.#fname;
                 for __k in 0usize..(#total) {
@@ -4014,7 +4010,7 @@ pub(crate) fn block_array_field(
                 allocator: &'__u __A,
             ) -> ::std::io::Result<#acc_ret> {
                 let __base =
-                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
+                    ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?;
                 ::std::result::Result::Ok(#acc_body)
             }
         });
@@ -4468,14 +4464,14 @@ pub(crate) fn foreign_tuple_field(
                         ::core::option::Option::None
                     } else {
                         let __repr =
-                            ::bstack_raii::__private::resolve_self_repr(__w.#ix, stack)?;
+                            ::bstack_raii::registry::resolve_self_repr(__w.#ix, stack)?;
                         ::core::option::Option::Some(
                             unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) })
                     })
                 } else {
                     quote!({
                         let __repr =
-                            ::bstack_raii::__private::resolve_self_repr(__w.#ix, stack)?;
+                            ::bstack_raii::registry::resolve_self_repr(__w.#ix, stack)?;
                         unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) }
                     })
                 }
@@ -4506,12 +4502,12 @@ pub(crate) fn foreign_tuple_field(
                 if nulls[i] {
                     quote!(match #fname.#ix {
                         ::core::option::Option::Some(__f) =>
-                            ::bstack_raii::__private::home_relative_repr(
+                            ::bstack_raii::registry::home_relative_repr(
                                 __f.repr(), allocator.stack()),
                         ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
                     })
                 } else {
-                    quote!(::bstack_raii::__private::home_relative_repr(
+                    quote!(::bstack_raii::registry::home_relative_repr(
                         #fname.#ix.repr(), allocator.stack()))
                 }
             } else {
@@ -4582,14 +4578,14 @@ pub(crate) fn foreign_tuple_field(
                         ::core::option::Option::None
                     } else {
                         let __repr =
-                            ::bstack_raii::__private::resolve_self_repr(#cap.#ix, __stack)?;
+                            ::bstack_raii::registry::resolve_self_repr(#cap.#ix, __stack)?;
                         ::core::option::Option::Some(
                             unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) })
                     })
                 } else {
                     quote!({
                         let __repr =
-                            ::bstack_raii::__private::resolve_self_repr(#cap.#ix, __stack)?;
+                            ::bstack_raii::registry::resolve_self_repr(#cap.#ix, __stack)?;
                         unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) }
                     })
                 }
@@ -4747,7 +4743,7 @@ pub(crate) fn embed_field(
     parts.drop_stmts.push(quote! {
         {
             let __embed = ::bstack_raii::BStackRange::new(
-                ::bstack_raii::__private::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
+                ::bstack_raii::checked_field_offset(__range.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                 ::core::mem::size_of::<#child_od>() as u64,
             );
             <#child>::__bstack_drop_children(allocator, __embed)?;
@@ -4759,7 +4755,7 @@ pub(crate) fn embed_field(
         #vis fn #getter(&self) -> ::std::io::Result<#child> {
             ::std::result::Result::Ok(unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                 ::bstack_raii::BStackRange::new(
-                    ::bstack_raii::__private::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
+                    ::bstack_raii::checked_field_offset(self.0.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                     ::core::mem::size_of::<#child_od>() as u64,
                 ),
             ) })
@@ -4786,7 +4782,7 @@ pub(crate) fn embed_field(
         {
             allocator.stack().copy(
                 #src_id.start(),
-                ::bstack_raii::__private::checked_field_offset(__data.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
+                ::bstack_raii::checked_field_offset(__data.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                 ::core::mem::size_of::<#child_od>() as u64,
             )?;
             unsafe { ::bstack_raii::dealloc_range(allocator, #src_id)?; }
@@ -4839,7 +4835,7 @@ pub(crate) fn embed_field(
         {
             let __child = unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(
                 ::bstack_raii::BStackRange::new(
-                    ::bstack_raii::__private::checked_field_offset(__src.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
+                    ::bstack_raii::checked_field_offset(__src.start(), ::core::mem::offset_of!(#on_disk_ty, #fname) as u64)?,
                     ::core::mem::size_of::<#child_od>() as u64,
                 ),
             ) };
@@ -5478,9 +5474,9 @@ pub(crate) fn foreign_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option
     // `bstack_move` / `replace` bind `__alloc`; both return `io::Result`, so the `?`
     // propagates cleanly.
     let read_resolved =
-        quote!(::bstack_raii::__private::resolve_self_repr(#read_fp, allocator.stack())?);
+        quote!(::bstack_raii::registry::resolve_self_repr(#read_fp, allocator.stack())?);
     let move_resolved =
-        quote!(::bstack_raii::__private::resolve_self_repr(#read_fp, __alloc.stack())?);
+        quote!(::bstack_raii::registry::resolve_self_repr(#read_fp, __alloc.stack())?);
     parts.data_variants.push(quote!(#vname(#fty),));
     parts.view_variants.push(quote!(#vname(#fty),));
     parts.new_arms.push(quote! {
@@ -5488,7 +5484,7 @@ pub(crate) fn foreign_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option
             let mut __pl = [0u8; #payload_const];
             // Re-encode a pointer to the home file as SELF before storing.
             __pl[..16].copy_from_slice(::bstack_raii::bytemuck::bytes_of(
-                &::bstack_raii::__private::home_relative_repr(__f.repr(), allocator.stack())));
+                &::bstack_raii::registry::home_relative_repr(__f.repr(), allocator.stack())));
             (#disc, __pl)
         }
     });
@@ -5623,13 +5619,13 @@ pub(crate) fn foreign_tuple_variant(
                 let to_fp = if nulls[i] {
                     quote!(match #b {
                         ::core::option::Option::Some(__x) =>
-                            ::bstack_raii::__private::home_relative_repr(
+                            ::bstack_raii::registry::home_relative_repr(
                                 __x.repr(), allocator.stack()),
                         ::core::option::Option::None =>
                             ::bstack_raii::WidePtr::NULL,
                     })
                 } else {
-                    quote!(::bstack_raii::__private::home_relative_repr(
+                    quote!(::bstack_raii::registry::home_relative_repr(
                         #b.repr(), allocator.stack()))
                 };
                 quote!(__pl[(#off)..(#off) + 16].copy_from_slice(
@@ -5669,7 +5665,7 @@ pub(crate) fn foreign_tuple_variant(
                                 ::core::option::Option::None
                             } else {
                                 let __repr =
-                                    ::bstack_raii::__private::resolve_self_repr(__p, #stack)?;
+                                    ::bstack_raii::registry::resolve_self_repr(__p, #stack)?;
                                 ::core::option::Option::Some(
                                     unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) })
                             }
@@ -5677,7 +5673,7 @@ pub(crate) fn foreign_tuple_variant(
                     } else {
                         quote!({
                             let __repr =
-                                ::bstack_raii::__private::resolve_self_repr(#fp, #stack)?;
+                                ::bstack_raii::registry::resolve_self_repr(#fp, #stack)?;
                             unsafe { ::bstack_raii::Foreign::<#ft>::from_repr(__repr) }
                         })
                     }
@@ -5791,15 +5787,19 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
         parts.view_variants.push(quote!(#vname(#nested),));
 
         // new: flatten nested handles → `[ForeignPtr; TOTAL]` in `__pl`.
+        // Re-encode a pointer to the home file as SELF before storing.
         let leaf_write = |k: &Ident, leaf: &Ident| {
             let to_fp = if elem_nullable {
                 quote!(match #leaf {
-                    ::core::option::Option::Some(__f) => __f.repr(),
+                    ::core::option::Option::Some(__f) =>
+                        ::bstack_raii::registry::home_relative_repr(
+                            __f.repr(), allocator.stack()),
                     ::core::option::Option::None =>
                         ::bstack_raii::WidePtr::NULL,
                 })
             } else {
-                quote!(#leaf.repr())
+                quote!(::bstack_raii::registry::home_relative_repr(
+                    #leaf.repr(), allocator.stack()))
             };
             quote!(__pl[(#k) * 16..(#k) * 16 + 16].copy_from_slice(
                                 ::bstack_raii::bytemuck::bytes_of(&(#to_fp)));)
@@ -5813,11 +5813,12 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
             }
         });
 
-        // read / move: reshape `[WidePtr; TOTAL]` → nested handles.
-        // SAFETY: each repr was stored into this file; the returned
-        // `Foreign`s are lifetime-bound by the read (`'__e`) / move
-        // (`'__mv`) signature via the variant type.
-        let leaf_read = |k: &Ident| {
+        // read / move: reshape `[WidePtr; TOTAL]` → nested handles. Each SELF slot is
+        // resolved to this file's registered id before it escapes, so it cannot be
+        // mis-stored into another file. `resolve_self_repr` is fallible; the `?`
+        // propagates to the read / move fn (`nested_build` emits plain blocks). The
+        // `Foreign`s are lifetime-bound by the read (`'__e`) / move (`'__mv`) signature.
+        let leaf_read = |stk: &TokenStream, k: &Ident| {
             let fp = quote!(::bstack_raii::bytemuck::pod_read_unaligned::<
                                 ::bstack_raii::WidePtr,
                             >(&__pl[(#k) * 16..(#k) * 16 + 16]));
@@ -5827,16 +5828,20 @@ pub(crate) fn array_variant(ctx: &VariantCtx, ty: &Type) -> syn::Result<Option<V
                     if __p.offset().get() == 0 {
                         ::core::option::Option::None
                     } else {
+                        let __repr = ::bstack_raii::registry::resolve_self_repr(__p, #stk)?;
                         ::core::option::Option::Some(
-                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
                     }
                 })
             } else {
-                quote!(unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(#fp) })
+                quote!({
+                    let __repr = ::bstack_raii::registry::resolve_self_repr(#fp, #stk)?;
+                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }
+                })
             }
         };
-        let build_e = nested_build(&dims, &fty, &leaf_read);
-        let build_mv = nested_build(&dims, &fty_mv, &leaf_read);
+        let build_e = nested_build(&dims, &fty, &|k| leaf_read(&quote!(allocator.stack()), k));
+        let build_mv = nested_build(&dims, &fty_mv, &|k| leaf_read(&quote!(__alloc.stack()), k));
         parts
             .read_arms
             .push(quote!(#disc => #view::#vname(#build_e),));
@@ -6363,26 +6368,41 @@ pub(crate) fn vec_variant(
         } else {
             quote!(::bstack_raii::Foreign<'__mv, #ftarget>)
         };
-        // SAFETY: each repr was stored into this file; the returned
-        // `Foreign`s are lifetime-bound by the read / move signature.
-        let from_ptr = if elem_nullable {
-            quote!(|__p: ::bstack_raii::WidePtr| if __p.offset().get() == 0 {
-                ::core::option::Option::None
+        // Re-encode a home pointer to SELF on store; resolve SELF back to this file's
+        // registered id on read/move before a `Foreign` escapes — so it cannot be
+        // mis-stored into another file. `resolve_self_repr` is fallible; the `?`
+        // propagates through the `collect::<Result<_>>()`. Read borrows `'__e`, move
+        // `'__mv`, so `from_ptr` is built per-context with the matching return type.
+        let make_from_ptr = |ret: &TokenStream, stk: &TokenStream| {
+            if elem_nullable {
+                quote!(|__p: ::bstack_raii::WidePtr| -> ::std::io::Result<#ret> {
+                    if __p.offset().get() == 0 {
+                        ::std::result::Result::Ok(::core::option::Option::None)
+                    } else {
+                        let __repr = ::bstack_raii::registry::resolve_self_repr(__p, #stk)?;
+                        ::std::result::Result::Ok(::core::option::Option::Some(
+                            unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) }))
+                    }
+                })
             } else {
-                ::core::option::Option::Some(
-                    unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
-            })
-        } else {
-            quote!(|__p: ::bstack_raii::WidePtr|
-                                unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__p) })
+                quote!(|__p: ::bstack_raii::WidePtr| -> ::std::io::Result<#ret> {
+                    let __repr = ::bstack_raii::registry::resolve_self_repr(__p, #stk)?;
+                    ::std::result::Result::Ok(
+                        unsafe { ::bstack_raii::Foreign::<#ftarget>::from_repr(__repr) })
+                })
+            }
         };
+        let from_ptr_e = make_from_ptr(&fty, &quote!(allocator.stack()));
+        let from_ptr_mv = make_from_ptr(&fty_mv, &quote!(__alloc.stack()));
         let to_ptr = if elem_nullable {
             quote!(|__f: #fty| match __f {
-                ::core::option::Option::Some(__ff) => __ff.repr(),
+                ::core::option::Option::Some(__ff) =>
+                    ::bstack_raii::registry::home_relative_repr(__ff.repr(), allocator.stack()),
                 ::core::option::Option::None => ::bstack_raii::WidePtr::NULL,
             })
         } else {
-            quote!(|__f: #fty| __f.repr())
+            quote!(|__f: #fty|
+                ::bstack_raii::registry::home_relative_repr(__f.repr(), allocator.stack()))
         };
         parts
             .data_variants
@@ -6404,13 +6424,15 @@ pub(crate) fn vec_variant(
         parts.read_arms.push(quote! {
             #disc => #view::#vname(
                 unsafe { #store::from_desc(#read_desc, allocator) }
-                    .to_vec()?.into_iter().map(#from_ptr).collect()),
+                    .to_vec()?.into_iter().map(#from_ptr_e)
+                    .collect::<::std::io::Result<::std::vec::Vec<_>>>()?),
         });
         parts.move_arms.push(quote! {
             #disc => {
                 let __out: ::std::vec::Vec<#fty_mv> =
                     unsafe { #store::from_desc(#read_desc, __alloc) }
-                        .to_vec()?.into_iter().map(#from_ptr).collect();
+                        .to_vec()?.into_iter().map(#from_ptr_mv)
+                        .collect::<::std::io::Result<::std::vec::Vec<_>>>()?;
                 unsafe { #store::from_desc(#read_desc, __alloc) }.bstack_drop()?;
                 #data::#vname(__out)
             }
