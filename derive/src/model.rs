@@ -147,7 +147,6 @@ impl VariantParts {
 /// it lands in. A shape-lowering `emit::*` function fills the relevant fields and
 /// leaves the rest empty; the orchestrator [`merge`](FieldParts::merge)s them.
 #[derive(Default)]
-#[allow(dead_code)] // fields/merge fill in as more branches are extracted
 pub(crate) struct FieldParts {
     /// `XOnDisk` struct field(s) (`name: Ty,`).
     pub on_disk_fields: Vec<TokenStream>,
@@ -193,7 +192,6 @@ pub(crate) struct FieldParts {
 }
 
 impl FieldParts {
-    #[allow(dead_code)]
     /// Fold another field's parts into this one.
     pub fn merge(&mut self, other: FieldParts) {
         self.on_disk_fields.extend(other.on_disk_fields);

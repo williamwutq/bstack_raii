@@ -15,7 +15,7 @@ use quote::{format_ident, quote};
 use syn::{Error, Fields, Ident, ItemStruct, Type};
 
 use crate::emit::*;
-use crate::model::FieldCtx;
+use crate::model::{FieldCtx, FieldParts};
 use crate::util::*;
 
 pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> {
@@ -311,41 +311,16 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             )
         };
 
-    // On-disk fields: header, then the injected refcount/ctrl (if any), then user
-    // fields lowered per annotation.
-    let mut on_disk_fields = Vec::new();
+    // Everything the fields contribute, folded per field through `FieldParts::merge`
+    // (see [`model::FieldParts`] for the sections). Merging every field's parts
+    // uniformly means a branch can never silently drop a section it forgot to forward.
+    // On-disk fields lead with the header's injected refcount / ctrl (if any).
+    let mut parts = FieldParts::default();
     match mode {
         Mode::Plain => {}
-        Mode::Rc => on_disk_fields.push(quote!(__bstack_refcount: u64,)),
-        Mode::RcWeak => on_disk_fields.push(quote!(__bstack_ctrl: u64,)),
+        Mode::Rc => parts.on_disk_fields.push(quote!(__bstack_refcount: u64,)),
+        Mode::RcWeak => parts.on_disk_fields.push(quote!(__bstack_ctrl: u64,)),
     }
-
-    let mut drop_stmts = Vec::new();
-    // `TryCloneIn` deep-clone statements for user fields, mirroring `drop_stmts`
-    // in reverse (owned → recurse, strong/weak → refcount bump, embed → fold
-    // inline, vec → per-element; POD / ref are byte-copied so emit nothing).
-    let mut clone_stmts = Vec::new();
-    let mut pod_types: Vec<Type> = Vec::new();
-    let mut accessors = Vec::new();
-    let mut setters = Vec::new();
-    let mut ctor_params = Vec::new();
-    let mut ctor_preps = Vec::new();
-    let mut ctor_inits = Vec::new();
-    // Per-owning-child hand-back on a failed construction: the
-    // reconstruction expression and its `Self::Fields` element type.
-    let mut ctor_handback: Vec<TokenStream> = Vec::new();
-    let mut ctor_handback_ty: Vec<TokenStream> = Vec::new();
-    // Post-write construction steps (`#[embed]` `BStack::copy`s the child into its
-    // inline slot after the block's OnDisk is written).
-    let mut ctor_post: Vec<TokenStream> = Vec::new();
-    // `bstack_move!` support (owned/ref/pod fields only, plain blocks only).
-    let mut mv_caps = Vec::new();
-    let mut mv_types = Vec::new();
-    let mut mv_recon = Vec::new();
-    // Generated `#[repr(C, packed)]` Pod wrappers for POD tuple fields.
-    let mut wrapper_defs = Vec::new();
-    // Whether any field was written `&T` (coerced to owned `T`, with a warning).
-    let mut ref_coerced = false;
 
     for (fname, field) in &field_list {
         let kind = classify(field)?;
@@ -371,7 +346,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             other => other,
         };
         if matches!(&field.ty, Type::Reference(_)) {
-            ref_coerced = true;
+            parts.ref_coerced = true;
         }
 
         // Peek through `Option<Inner>` (which makes a *reference* field nullable,
@@ -432,20 +407,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // slot, lifetime-bound accessor, ctor wiring, per-kind cross-file teardown /
         // deep-clone, `bstack_move!` RAII duals, and `#[bstack_mut]` mutators).
         if let Some(ftarget) = foreign_inner(opt_inner) {
-            let fp = foreign_field(&fctx, ftarget, nullable)?;
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(foreign_field(&fctx, ftarget, nullable)?);
             continue;
         }
 
@@ -461,20 +423,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
             vec_info(opt_inner)
         };
         if let Some(vinfo) = vinfo {
-            let fp = vec_field(&fctx, opt_inner, vinfo, nullable)?;
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(vec_field(&fctx, opt_inner, vinfo, nullable)?);
             continue;
         }
 
@@ -486,18 +435,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // must NOT fall through to the plain POD path. The element annotation names
         // the inner vectors' element ownership, exactly like a scalar `Vec<T>`.
         if let Some(fp) = vec_array_field(&fctx, opt_inner, nullable)? {
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
+            parts.merge(fp);
             continue;
         }
 
@@ -507,19 +445,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // slot's teardown / clone dispatches cross-file exactly like a scalar `Foreign`.
         // A null/unset slot is a `Foreign` whose offset is `0`. Must be annotated.
         if let Some(fp) = foreign_array_field(&fctx, opt_inner, nullable)? {
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(fp);
             continue;
         }
 
@@ -529,21 +455,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // (no data block), one offset per leaf, with per-element ownership; the
         // accessor / ctor / move traffic in the nested `[[Handle; ..]; ..]` shape.
         if let Some(fp) = block_array_field(&fctx, opt_inner, nullable)? {
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            setters.extend(fp.setters);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            ctor_post.extend(fp.ctor_post);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(fp);
             continue;
         }
 
@@ -568,20 +480,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // their own files at teardown / clone. `Option<Foreign<T>>` elements use the
         // offset-0 niche. (Concrete element types only for now — no generic params.)
         if let Some(fp) = foreign_tuple_field(&fctx, inner_ty, nullable)? {
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            pod_types.extend(fp.pod_types);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(fp);
             continue;
         }
 
@@ -590,18 +489,7 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // — so store it through a generated wrapper and rebuild the tuple on read.
         // `bstack_move!` hands back the tuple as one element (not flattened).
         if let Some(fp) = pod_tuple_field(&fctx, inner_ty)? {
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            pod_types.extend(fp.pod_types);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(fp);
             continue;
         }
 
@@ -609,41 +497,36 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
         // (`<Child as BStackBlock>::OnDisk`, header and all) instead of a `u64`
         // offset — an exclusively-owned inline block.
         if let Some(fp) = embed_field(&fctx, inner_ty, nullable)? {
-            on_disk_fields.extend(fp.on_disk_fields);
-            accessors.extend(fp.accessors);
-            ctor_params.extend(fp.ctor_params);
-            ctor_preps.extend(fp.ctor_preps);
-            ctor_inits.extend(fp.ctor_inits);
-            ctor_handback.extend(fp.ctor_handback);
-            ctor_handback_ty.extend(fp.ctor_handback_ty);
-            ctor_post.extend(fp.ctor_post);
-            drop_stmts.extend(fp.drop_stmts);
-            clone_stmts.extend(fp.clone_stmts);
-            mv_caps.extend(fp.mv_caps);
-            mv_types.extend(fp.mv_types);
-            mv_recon.extend(fp.mv_recon);
-            wrapper_defs.extend(fp.wrapper_defs);
+            parts.merge(fp);
             continue;
         }
 
         // Scalar fall-through (POD inline, or a single owned/strong/weak/ref block
         // reference): reader / mutators / ctor / teardown / clone / move.
-        let fp = scalar_field(&fctx, inner_ty, nullable)?;
-        on_disk_fields.extend(fp.on_disk_fields);
-        accessors.extend(fp.accessors);
-        setters.extend(fp.setters);
-        ctor_params.extend(fp.ctor_params);
-        ctor_preps.extend(fp.ctor_preps);
-        ctor_inits.extend(fp.ctor_inits);
-        ctor_handback.extend(fp.ctor_handback);
-        ctor_handback_ty.extend(fp.ctor_handback_ty);
-        drop_stmts.extend(fp.drop_stmts);
-        clone_stmts.extend(fp.clone_stmts);
-        mv_caps.extend(fp.mv_caps);
-        mv_types.extend(fp.mv_types);
-        mv_recon.extend(fp.mv_recon);
-        pod_types.extend(fp.pod_types);
+        parts.merge(scalar_field(&fctx, inner_ty, nullable)?);
     }
+
+    // Split the accumulated parts back into the named sections the rest of `expand`
+    // wires into the generated impls.
+    let FieldParts {
+        on_disk_fields,
+        accessors,
+        setters,
+        ctor_params,
+        ctor_preps,
+        ctor_inits,
+        ctor_handback,
+        ctor_handback_ty,
+        ctor_post,
+        drop_stmts,
+        clone_stmts,
+        mv_caps,
+        mv_types,
+        mv_recon,
+        wrapper_defs,
+        pod_types,
+        ref_coerced,
+    } = parts;
 
     // EightCC tags: a readable prefix over a hash of `crate ++ type_name`, with
     // the type's `module_path!()` folded into the hash tail at runtime. The

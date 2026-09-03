@@ -2377,189 +2377,32 @@ pub(crate) fn foreign_field(
     // `ForeignHostAllocator` (over the live host) for a cross-file one. Frees
     // are tagged (via `wal_file_id`) with the target's file so the home WAL
     // reclaims them there. `#[bstack_ref]` owns nothing → no teardown.
-    let foreign_drop_helper = match kind {
-        Kind::Owned => Some(quote!(<#ftarget as ::bstack_raii::BStackBlock>::foreign_drop)),
-        Kind::Strong => {
-            Some(quote!(<#ftarget as ::bstack_raii::BStackShared>::foreign_drop_strong))
-        }
-        Kind::Weak => Some(quote!(<#ftarget as ::bstack_raii::BStackWeakable>::foreign_drop_weak)),
-        // Ref: non-owning. Pod / Embed: already rejected above.
-        Kind::Ref | Kind::Pod | Kind::Embed => None,
-    };
-    if let Some(helper) = foreign_drop_helper {
+    // `#[bstack_ref]` owns nothing → no teardown; owned/strong/weak dispatch the
+    // per-element cross-file teardown through the shared helper (given `__fp` in scope).
+    if !matches!(kind, Kind::Ref | Kind::Pod | Kind::Embed) {
+        let elem_drop = foreign_elem_drop(kind, ftarget);
         parts.drop_stmts.push(quote! {
             {
                 let __fp: ::bstack_raii::WidePtr = __on_disk.#fname;
-                // A `0` offset is the null / unset niche (nullable field, or a
-                // never-set pointer) — nothing to free.
-                let __off = __fp.offset().get();
-                if __off != 0 {
-                    let __fid = __fp.file_id();
-                    if __fid == 0 {
-                        // `SELF`: the target is in this same file.
-                        unsafe { #helper::<_>(allocator, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
-                    } else if let ::core::option::Option::Some(__id) =
-                        ::bstack_raii::registry::FileId::from_u64(__fid)
-                    {
-                        // Foreign: adapt the live host to an allocator and run
-                        // the same teardown against the other file. If that
-                        // file isn't currently attached, the target is
-                        // unreachable and leaks (permitted).
-                        if let ::core::option::Option::Some(__host) =
-                            ::bstack_raii::registry::host_arc(__id)
-                        {
-                            let __adapter =
-                                ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                            unsafe { #helper::<_>(&__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?)?; }
-                        }
-                    }
-                    // A malformed id (does not fit the `FileId` space) is
-                    // unreachable → leak (skip), not an error.
-                }
+                #elem_drop
             }
         });
     }
 
-    // Deep clone: per-kind, acting on the target *in its own file*. `owned`
-    // deep-copies the target (a fresh block, the pointer repointed); `strong`
-    // / `weak` share it and bump its count; `ref` aliases (byte-copied — no
-    // clone_stmt). A `SELF` pointer folds into the *home* plan (atomic with the
-    // home commit); a foreign one acts eagerly via the adapter (best-effort,
-    // over-provisioning ⇒ leak, never under ⇒ double-free). A detached target
-    // file makes the clone error (aliasing an owner would double-free later).
-    let target_od_size = quote! {
-        ::core::mem::size_of::<<#ftarget as ::bstack_raii::BStackBlock>::OnDisk>() as u64
-    };
-    let foreign_clone_stmt = match kind {
-        Kind::Owned => Some(quote! {
+    // Deep clone through the shared per-element helper: `owned` deep-copies the target
+    // (a `SELF` pointer folds into the home plan, a foreign one acts eagerly via the
+    // adapter, a detached target errors), `strong` / `weak` bump its count in its own
+    // file, `ref` aliases (byte-copied — nothing to do). The helper binds `__newfp`
+    // (the repointed pointer, unchanged for strong/weak), which we write back.
+    if !matches!(kind, Kind::Ref | Kind::Pod | Kind::Embed) {
+        let elem_clone = foreign_elem_clone(kind, ftarget);
+        parts.clone_stmts.push(quote! {
             {
                 let __fp: ::bstack_raii::WidePtr = __od.#fname;
-                let __off = __fp.offset().get();
-                if __off != 0 {
-                    let __fid = __fp.file_id();
-                    if __fid == 0 {
-                        // SELF: deep-clone into the home plan (one atomic commit).
-                        let __child = unsafe { <#ftarget as ::bstack_raii::BStackBlock>::from_range(
-                            ::bstack_raii::BStackRange::new(__off, #target_od_size),
-                        ) };
-                        let __new = __child.__bstack_clone_into(allocator, __plan)?;
-                        __od.#fname = ::bstack_raii::WidePtr::from_raw(0, __fp.type_index(), __new.start());
-                    } else if __plan.is_measuring() {
-                        // Foreign deep-clone is eager cross-file work; the
-                        // measure pass (home-file sizes only) skips it, so it
-                        // runs exactly once in the build pass.
-                    } else if let ::core::option::Option::Some(__id) =
-                        ::bstack_raii::registry::FileId::from_u64(__fid)
-                    {
-                        let __host = ::bstack_raii::registry::host_arc(__id)
-                            .ok_or_else(|| ::std::io::Error::new(
-                                ::std::io::ErrorKind::NotFound,
-                                "cannot deep-clone `#[bstack_owned] Foreign<T>`: \
-                                 target file not attached",
-                            ))?;
-                        let __adapter =
-                            ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                        let __new_off = unsafe {
-                            <#ftarget as ::bstack_raii::BStackBlock>::foreign_clone::<_>(
-                                &__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?,
-                            )?
-                        };
-                        __od.#fname = ::bstack_raii::WidePtr::from_raw(__fid, __fp.type_index(), __new_off);
-                    } else {
-                        return ::std::result::Result::Err(::std::io::Error::new(
-                            ::std::io::ErrorKind::InvalidData,
-                            "cannot clone `Foreign<T>`: malformed file id",
-                        ));
-                    }
-                }
+                #elem_clone
+                __od.#fname = __newfp;
             }
-        }),
-        Kind::Strong => Some(quote! {
-            {
-                let __fp: ::bstack_raii::WidePtr = __od.#fname;
-                let __off = __fp.offset().get();
-                if __off != 0 {
-                    let __fid = __fp.file_id();
-                    if __fid == 0 {
-                        // SELF: bump the strong count via the home plan (atomic).
-                        let __data = unsafe {
-                            ::bstack_raii::BStackRef::<#ftarget>::from_range(
-                                ::bstack_raii::BStackRange::new(__off, #target_od_size),
-                            )
-                        };
-                        __plan.bump_strong(__data, allocator)?;
-                    } else if __plan.is_measuring() {
-                        // Foreign refcount bump is eager cross-file work; done
-                        // once, in the build pass (measure skips it).
-                    } else if let ::core::option::Option::Some(__id) =
-                        ::bstack_raii::registry::FileId::from_u64(__fid)
-                    {
-                        let __host = ::bstack_raii::registry::host_arc(__id)
-                            .ok_or_else(|| ::std::io::Error::new(
-                                ::std::io::ErrorKind::NotFound,
-                                "cannot clone `#[bstack_strong] Foreign<T>`: \
-                                 target file not attached",
-                            ))?;
-                        let __adapter =
-                            ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                        unsafe {
-                            <#ftarget as ::bstack_raii::BStackShared>::foreign_clone_strong::<_>(
-                                &__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?,
-                            )?;
-                        }
-                        // The pointer is unchanged (shares the same target).
-                    } else {
-                        return ::std::result::Result::Err(::std::io::Error::new(
-                            ::std::io::ErrorKind::InvalidData,
-                            "cannot clone `Foreign<T>`: malformed file id",
-                        ));
-                    }
-                }
-            }
-        }),
-        Kind::Weak => Some(quote! {
-            {
-                let __fp: ::bstack_raii::WidePtr = __od.#fname;
-                // For a weak pointer, the offset is the target's control block.
-                let __off = __fp.offset().get();
-                if __off != 0 {
-                    let __fid = __fp.file_id();
-                    if __fid == 0 {
-                        // SELF: bump the weak count via the home plan (atomic).
-                        __plan.bump_weak(__off)?;
-                    } else if __plan.is_measuring() {
-                        // Foreign refcount bump is eager cross-file work; done
-                        // once, in the build pass (measure skips it).
-                    } else if let ::core::option::Option::Some(__id) =
-                        ::bstack_raii::registry::FileId::from_u64(__fid)
-                    {
-                        let __host = ::bstack_raii::registry::host_arc(__id)
-                            .ok_or_else(|| ::std::io::Error::new(
-                                ::std::io::ErrorKind::NotFound,
-                                "cannot clone `#[bstack_weak] Foreign<T>`: \
-                                 target file not attached",
-                            ))?;
-                        let __adapter =
-                            ::bstack_raii::ForeignHostAllocator::new(__host, __id);
-                        unsafe {
-                            <#ftarget as ::bstack_raii::BStackWeakable>::foreign_clone_weak::<_>(
-                                &__adapter, ::bstack_raii::NonNullOffset::from_field(__off)?,
-                            )?;
-                        }
-                    } else {
-                        return ::std::result::Result::Err(::std::io::Error::new(
-                            ::std::io::ErrorKind::InvalidData,
-                            "cannot clone `Foreign<T>`: malformed file id",
-                        ));
-                    }
-                }
-            }
-        }),
-        // Ref aliases (byte-copied verbatim); Pod / Embed already rejected.
-        Kind::Ref | Kind::Pod | Kind::Embed => None,
-    };
-    if let Some(cs) = foreign_clone_stmt {
-        parts.clone_stmts.push(cs);
+        });
     }
 
     // `#[bstack_mut]`: `replace_<f>` (owned/strong/weak — moves the old
