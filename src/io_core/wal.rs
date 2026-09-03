@@ -86,6 +86,9 @@ const WAL_MIN_CAP: u64 = 8;
 /// transaction logs anywhere near this many allocations.
 const WAL_MAX_CAP: u64 = 1 << 20;
 
+/// Offset of the header `txn_status` byte (the byte right after the `u64` magic).
+const WAL_STATUS_OFFSET: u64 = 8;
+
 /// Offset of the header `count` field (the `u64` after the magic + `txn_status`).
 const WAL_COUNT_OFFSET: u64 = 16;
 
@@ -656,10 +659,9 @@ impl HeldLock {
         allocator: &A,
         block_off: u64,
     ) -> io::Result<()> {
-        // `txn_status` is the byte right after the u64 magic (offset 8).
         allocator
             .stack()
-            .set(block_off + 8, [WalStatus::None as u8])
+            .set(block_off + WAL_STATUS_OFFSET, [WalStatus::None as u8])
     }
 
     /// Flip the block's `txn_status` to `Complete` in one [`inplace_gen`](bstack::BStack)
@@ -686,10 +688,10 @@ impl HeldLock {
             } else {
                 done = true;
                 // SAFETY: `flip` outlives the call; the `txn_status` byte follows the
-                // u64 magic at offset 8 in `WalHeader`.
+                // u64 magic at `WAL_STATUS_OFFSET` in `WalHeader`.
                 let data: &[u8] = unsafe { core::mem::transmute::<&[u8], _>(&flip[..]) };
                 Some(BStackGenOp::Write {
-                    offset: block_off + 8,
+                    offset: block_off + WAL_STATUS_OFFSET,
                     data,
                 })
             }
@@ -922,7 +924,7 @@ impl WalTxn {
     /// Byte offset of the block's `txn_status` marker (right after the u64 magic) —
     /// where a commit flips the transaction `Pending → Complete`.
     pub(crate) fn commit_marker_off(&self) -> u64 {
-        self.block_off + 8
+        self.block_off + WAL_STATUS_OFFSET
     }
 
     /// Mark the block idle — a committed transaction keeps its block for reuse.

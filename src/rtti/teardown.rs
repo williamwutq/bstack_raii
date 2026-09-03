@@ -10,15 +10,12 @@ use crate::BStackRaiiAllocator;
 use crate::io_core::refcount;
 use crate::primitives::{EightCC, NonNullOffset, Offset, OwnershipKind, WidePtr};
 use crate::registry::{FileId, ForeignHostAllocator};
-use crate::types::compiled::rc::{
-    CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
-};
 use crate::util::read_u64;
 
-use super::walk::{DepthGuard, checked_vec_len, commit_weak_release};
+use super::walk::{DepthGuard, checked_vec_len, commit_weak_release, strong_counter_slot};
 use super::{
-    BYTEVEC_HEADER, CONTROL_SIZE, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, add_off,
-    mul_off, unknown_tag,
+    BYTEVEC_HEADER, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape, add_off, mul_off,
+    unknown_tag,
 };
 use super::{RttiResult, rtti_err};
 
@@ -85,7 +82,7 @@ impl RttiRegistry {
         // `to_free` is the home-file owned ranges; these are the shared / cross-file
         // mutations that a mid-walk abort must not have started.
         let mut strong_releases: Vec<(EightCC, NonNullOffset)> = Vec::new(); // (tag, data offset)
-        let mut weak_releases: Vec<u64> = Vec::new(); // control offsets
+        let mut weak_releases: Vec<NonNullOffset> = Vec::new(); // control offsets
         let mut foreign_releases: Vec<(EightCC, OwnershipKind, u64, u64)> = Vec::new();
         let mut budget: u64 = 4_000_000;
 
@@ -165,9 +162,11 @@ impl RttiRegistry {
                         }
                     }
                     Shape::Weak(_) => {
-                        // A weak field's slot holds the *control* offset directly.
-                        let ctrl_off = read_u64(data, offset)?;
-                        if ctrl_off != 0 {
+                        // A weak field's slot holds the *control* offset directly; a null
+                        // is an absent handle. Refine once here.
+                        if let Some(ctrl_off) =
+                            Offset::from_raw(read_u64(data, offset)?).to_non_null()
+                        {
                             weak_releases.push(ctrl_off);
                         }
                     }
@@ -264,7 +263,7 @@ impl RttiRegistry {
                                     for i in 0..len {
                                         let c =
                                             read_u64(data, add_off(base, mul_off(i, stride)?)?)?;
-                                        if c != 0 {
+                                        if let Some(c) = Offset::from_raw(c).to_non_null() {
                                             weak_releases.push(c);
                                         }
                                     }
@@ -349,33 +348,18 @@ impl RttiRegistry {
         data_off: NonNullOffset,
     ) -> RttiResult<()> {
         let data = alloc.stack();
-        if self.load_type(ord)?.weak {
-            // `data_off` is proven non-null, so the control back-pointer address stays
-            // branded through `checked_add`; the `ctrl_off` read *from disk* is the one
-            // value that can be null (a corrupt back-pointer), so it re-validates.
-            let ctrl_off = read_u64(data, data_off.checked_add(CTRL_BACKPTR_OFFSET)?.as_u64())?;
-            if refcount::fetch_sub(
-                data,
-                NonNullOffset::from_field(add_off(ctrl_off, CTRL_STRONG_OFFSET)?)?,
-                1,
-            )? == 1
-            {
-                // SAFETY: last strong owner (the fetch_sub hit zero); `data_off` is the
-                // caller's slot-derived block offset.
-                unsafe { self.teardown(alloc, ord, data_off.as_u64())? };
-                if refcount::fetch_sub(
-                    data,
-                    NonNullOffset::from_field(add_off(ctrl_off, CTRL_WEAK_OFFSET)?)?,
-                    1,
-                )? == 1
-                {
-                    // SAFETY: last weak released — the control block is unreferenced.
-                    unsafe { alloc.free_many([BStackRange::new(ctrl_off, CONTROL_SIZE)])? };
-                }
-            }
-        } else if refcount::fetch_sub(data, data_off.checked_add(RC_REFCOUNT_OFFSET)?, 1)? == 1 {
-            // SAFETY: as above — sole owner, slot-derived offset.
+        // Inline `rc` refcount, or the `(rc, weak)` control block's `strong` (with its
+        // `ctrl` offset returned for the phantom-weak release below).
+        let (strong_slot, ctrl) = strong_counter_slot(data, self.load_type(ord)?.weak, data_off)?;
+        if refcount::fetch_sub(data, strong_slot, 1)? == 1 {
+            // SAFETY: last strong owner (the fetch_sub hit zero); `data_off` is the
+            // caller's slot-derived block offset.
             unsafe { self.teardown(alloc, ord, data_off.as_u64())? };
+            // For `(rc, weak)`, release the phantom weak too — frees the control block
+            // if it was the last handle.
+            if let Some(ctrl) = ctrl {
+                commit_weak_release(alloc, ctrl)?;
+            }
         }
         Ok(())
     }
@@ -441,7 +425,6 @@ impl RttiRegistry {
         offset: NonNullOffset,
     ) -> RttiResult<()> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
-        let data = target.stack();
         match kind {
             OwnershipKind::Ref => Ok(()),
             // SAFETY: `offset` came from the owning foreign slot being torn down;
@@ -450,14 +433,9 @@ impl RttiRegistry {
             // SAFETY: `offset` is the target's data offset, from the owning foreign
             // slot being torn down; ownership transfers with the slot.
             OwnershipKind::Strong => self.release_strong(target, ord, offset),
-            OwnershipKind::Weak => {
-                // A weak foreign's offset is the control offset (proven non-null).
-                if refcount::fetch_sub(data, offset.checked_add(CTRL_WEAK_OFFSET)?, 1)? == 1 {
-                    // SAFETY: last weak released — control block unreferenced.
-                    unsafe { target.free_many([BStackRange::new(offset.as_u64(), CONTROL_SIZE)])? };
-                }
-                Ok(())
-            }
+            // A weak foreign's `offset` is the control offset (proven non-null) — the
+            // same last-weak release as the deferred in-file path.
+            OwnershipKind::Weak => commit_weak_release(target, offset),
         }
     }
 }

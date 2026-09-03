@@ -42,6 +42,12 @@ use crate::registry::FileRegistry;
 use crate::registry::{self, FileId};
 use crate::util::io_error;
 
+/// A **typed cross-file pointer** to a `T` block in another `bstack` file — the
+/// self-qualifying counterpart of [`BStackRef`](super::BStackRef) (an in-file offset with
+/// no file identity); see the [module docs](self) for its on-disk wire form.
+///
+/// It is one of two kinds: an **explicit** pointer (carries the target's
+/// [`FileId`](crate::registry::FileId), so it resolves through the
 /// process-wide [registry](crate::registry), borrow-free, deref fallible) or
 /// [`SELF`](FileId::SELF) (an address in the file it was read from, bound to that file's
 /// borrow `'a`).

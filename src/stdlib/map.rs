@@ -47,7 +47,7 @@ use super::util::{
 };
 use crate::handback::ReplaceError;
 use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
-use crate::primitives::EightCC;
+use crate::primitives::{EightCC, checked_off, checked_off_mul};
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
 use crate::util::{SmallBuf, get_u64, io_error, read_u64};
@@ -110,10 +110,7 @@ fn new_bucket_writes(
     img.extend_from_slice(&e.val_ref.to_le_bytes());
 
     // `m.table` is an on-disk pointer that can be corrupted/forged.
-    let off = target
-        .checked_mul(e.stride)
-        .and_then(|d| m.table.checked_add(d))
-        .ok_or_else(|| io_error!("corrupt bucket table offset"))?;
+    let off = checked_off_mul(m.table, target, e.stride)?;
     let mut w = vec![
         (off, SmallBuf::Heap(img.into_boxed_slice())),
         w8(e.handle + LEN_OFF, m.len + 1),
@@ -221,8 +218,11 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
 
         let outcome: io::Result<Option<BStackOwned<V>>> = (|| loop {
             // Proactively keep the load factor under 3/4 (also clears tombstones).
+            // `cap`/`used` are untrusted on-disk fields, so widen to `u128` for the
+            // load-factor multiply — a forged huge `cap` must not overflow-panic here
+            // (it is rejected by the stack bound in `grow`).
             let [cap, _len, used] = read_fields::<3>(allocator.stack(), handle + CAP_OFF)?;
-            if cap == 0 || (used + 1) * 4 > cap * 3 {
+            if cap == 0 || (used as u128 + 1) * 4 > cap as u128 * 3 {
                 self.grow(allocator)?;
                 continue;
             }
@@ -249,11 +249,8 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                         old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                         is_new.set(false);
                         // `m.table` is an on-disk pointer that can be corrupted/forged.
-                        let step = idx
-                            .checked_mul(stride)
-                            .and_then(|d| m.table.checked_add(d))
-                            .and_then(|b| b.checked_add(8 + ksz as u64))
-                            .ok_or_else(|| io_error!("corrupt bucket table offset"))
+                        let step = checked_off_mul(m.table, idx, stride)
+                            .and_then(|b| checked_off(b, 8 + ksz as u64))
                             .map(|value_off| vec![w8(value_off, val_ref)]);
                         ProbeStep::Stop(step)
                     } else {
@@ -320,10 +317,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
                     found.set(true);
                     old_value.set(get_u64(&buf[8 + ksz..8 + ksz + 8]));
                     // `m.table` is an on-disk pointer that can be corrupted/forged.
-                    let step = idx
-                        .checked_mul(stride)
-                        .and_then(|d| m.table.checked_add(d))
-                        .ok_or_else(|| io_error!("corrupt bucket table offset"))
+                    let step = checked_off_mul(m.table, idx, stride)
                         .map(|off| vec![w8(off, TOMBSTONE), w8(handle + LEN_OFF, m.len - 1)]);
                     ProbeStep::Stop(step)
                 } else {
@@ -363,10 +357,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
         let mut scratch = Scratch::new();
         for _ in 0..cap {
             // `table` is an on-disk pointer that can be corrupted/forged.
-            let bucket = idx
-                .checked_mul(stride)
-                .and_then(|d| table.checked_add(d))
-                .ok_or_else(|| io_error!("corrupt bucket table offset"))?;
+            let bucket = checked_off_mul(table, idx, stride)?;
             let buf = scratch.buf(stride as usize);
             stack.get_into(bucket, buf)?;
             let state = get_u64(&buf[0..8]);
@@ -600,21 +591,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
     }
 }
 
-impl<K: Pod, V: BStackBlock> TryCloneIn for BStackHashMap<K, V> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<K: Pod, V: BStackBlock> TryCloneIn for BStackHashMap<K, V> {}
 
 /// An unordered iterator over a [`BStackHashMap`]'s live entries, yielding
 /// `io::Result<(K, V)>`. Created by [`BStackHashMap::iter`]; scans the buckets.

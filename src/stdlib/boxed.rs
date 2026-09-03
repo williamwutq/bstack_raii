@@ -24,7 +24,7 @@ use crate::BStackRaiiAllocator;
 use bstack::{BStack, BStackRange};
 use bytemuck::{Pod, Zeroable};
 
-use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
+use crate::io_core::{TryCloneIn, dealloc_range};
 use crate::primitives::EightCC;
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackMove, BStackRef};
@@ -141,23 +141,7 @@ impl<T: Pod> BStackBlock for BStackBox<T> {
     // exactly correct, so they are deliberately not overridden.
 }
 
-impl<T: Pod> TryCloneIn for BStackBox<T> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        // Mirror the generated `try_clone_in`: build the plan (a byte copy, via
-        // the childless `__bstack_clone_into` default), then commit atomically.
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<T: Pod> TryCloneIn for BStackBox<T> {}
 
 impl<T: Pod> BStackMove for BStackBox<T> {
     /// Moving a box out yields the plain value.

@@ -65,11 +65,14 @@ impl<'a> Reader<'a> {
         Some(EightCC(self.take(8)?.try_into().unwrap()))
     }
 
-    /// Skip zero-padding up to the next `a`-byte boundary. Returns `false` — leaving
-    /// the cursor unmoved — when that boundary lies past the end of the buffer.
+    /// Skip zero-padding up to the next `a`-byte boundary (`a` a power of two). Returns
+    /// `false` — leaving the cursor unmoved — when that boundary lies past the end of
+    /// the buffer, or when rounding up would overflow.
     #[inline(always)]
     pub(crate) fn skip_pad(&mut self, a: usize) -> bool {
-        let aligned = (self.pos + a - 1) & !(a - 1);
+        let Some(aligned) = self.pos.checked_add(a - 1).map(|p| p & !(a - 1)) else {
+            return false;
+        };
         if aligned > self.buf.len() {
             return false;
         }

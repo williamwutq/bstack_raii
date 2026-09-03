@@ -23,8 +23,8 @@ use bstack::BStackRange;
 
 use crate::BStackRaiiAllocator;
 use crate::io_core::{TryCloneIn, refcount};
-use crate::primitives::{NonNullOffset, checked_off};
-use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
+use crate::primitives::NonNullOffset;
+use crate::types::compiled::rc::{CTRL_WEAK_OFFSET, strong_counter_off};
 use crate::types::compiled::{OwnedRef, WeakRef};
 use crate::types::traits::{BStackBlock, BStackDrop, BStackRef, BStackShared, BStackWeakable};
 
@@ -135,10 +135,7 @@ pub(crate) unsafe fn foreign_clone_strong<T: BStackShared, A: BStackRaiiAllocato
     // SAFETY: `range` is the caller-asserted live data block of a shared `T`.
     let data = unsafe { BStackRef::<T>::from_range(range) };
     let (data_ref, ctrl) = <T as BStackShared>::strong_parts(data, alloc)?;
-    let off = match ctrl {
-        None => checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
-        Some(c) => checked_off(c.start(), CTRL_STRONG_OFFSET)?,
-    };
+    let off = strong_counter_off(data_ref.into_range().start(), ctrl)?;
     refcount::fetch_add(alloc.stack(), NonNullOffset::from_field(off)?, 1)?;
     Ok(())
 }

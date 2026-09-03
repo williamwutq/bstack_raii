@@ -37,7 +37,7 @@ use bytemuck::{Pod, Zeroable};
 use super::util::{alloc_image, read_fields, w8};
 use crate::handback::ReplaceError;
 use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
-use crate::primitives::EightCC;
+use crate::primitives::{EightCC, checked_off_mul};
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
 use crate::util::{SmallBuf, get_u64, io_error, read_u64};
@@ -83,11 +83,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
     /// against the array's real allocated size, so an unchecked `data + i*stride`
     /// could wrap to an unrelated in-file offset that a write then corrupts.
     fn slot_off(data: u64, i: u64) -> io::Result<u64> {
-        let delta = i
-            .checked_mul(Self::stride())
-            .ok_or_else(|| io_error!("heap slot overflow"))?;
-        data.checked_add(delta)
-            .ok_or_else(|| io_error!("heap slot overflow"))
+        checked_off_mul(data, i, Self::stride())
     }
 
     fn value_size() -> u64 {
@@ -129,14 +125,18 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBinaryHeap<K, V> {
         if cap == 0 {
             return Self::new(allocator);
         }
-        let data = allocator.alloc(cap * Self::stride())?.as_range().start();
+        // `cap` is caller-supplied: check the multiply once (a wrap would under-size the
+        // allocation while the descriptor records the full `cap`, so later slot writes
+        // would land outside the array) and reuse it for the rollback dealloc.
+        let size = cap
+            .checked_mul(Self::stride())
+            .ok_or_else(|| io_error!("heap capacity overflow"))?;
+        let data = allocator.alloc(size)?.as_range().start();
         match Self::with_image(allocator, data, cap) {
             Ok(o) => Ok(o),
             Err(e) => {
                 // SAFETY: the array was just allocated, linked to nothing.
-                let _ = unsafe {
-                    dealloc_range(allocator, BStackRange::new(data, cap * Self::stride()))
-                };
+                let _ = unsafe { dealloc_range(allocator, BStackRange::new(data, size)) };
                 Err(e)
             }
         }
@@ -477,18 +477,4 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
     }
 }
 
-impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBinaryHeap<K, V> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBinaryHeap<K, V> {}

@@ -13,6 +13,7 @@ use bstack::{BStack, BStackGenOp, BStackRange};
 
 use super::hash::fnv1a;
 use crate::io_core::dealloc_range;
+use crate::primitives::checked_off_mul;
 use crate::types::compiled::HEADER_SIZE;
 use crate::util::{SmallBuf, get_u64, io_error, read_u64};
 
@@ -390,13 +391,10 @@ where
                 probe_pending = true;
                 probed += 1;
                 cur = (cur + 1) & mask;
-                let off = match idx_at_read
-                    .checked_mul(stride)
-                    .and_then(|d| m.table.checked_add(d))
-                {
-                    Some(off) => off,
-                    None => {
-                        probe_err = Some(io_error!("corrupt bucket table offset"));
+                let off = match checked_off_mul(m.table, idx_at_read, stride) {
+                    Ok(off) => off,
+                    Err(e) => {
+                        probe_err = Some(e);
                         return None; // abort: commit nothing
                     }
                 };
@@ -534,10 +532,10 @@ pub(super) fn grow_table<A: BStackRaiiAllocator>(
                 grow_err = Some(io_error!("bucket table capacity changed during grow"));
                 return None;
             }
-            let off = match i.checked_mul(stride).and_then(|d| m.table.checked_add(d)) {
-                Some(off) => off,
-                None => {
-                    grow_err = Some(io_error!("corrupt bucket table offset"));
+            let off = match checked_off_mul(m.table, i, stride) {
+                Ok(off) => off,
+                Err(e) => {
+                    grow_err = Some(e);
                     return None; // abort: commit nothing
                 }
             };

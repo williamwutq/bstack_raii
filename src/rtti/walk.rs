@@ -12,7 +12,10 @@ use bstack::{BStack, BStackRange};
 use crate::BStackRaiiAllocator;
 use crate::io_core::refcount;
 use crate::primitives::{EightCC, NonNullOffset, Offset};
-use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
+use crate::types::compiled::rc::{
+    CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
+};
+use crate::util::read_u64;
 
 use super::{AnyRef, BYTEVEC_HEADER, CONTROL_SIZE, RttiEnum, RttiVariant, Value, add_off};
 use super::{RttiResult, rtti_err};
@@ -125,22 +128,48 @@ pub(in crate::rtti) fn checked_vec_len(
     Ok(byte_len.checked_div(stride).unwrap_or(0))
 }
 
+/// Resolve a reference-counted block's **strong counter** slot from its data offset.
+/// For an inline `rc` (`weak == false`) that is `data_off + RC_REFCOUNT_OFFSET`; for an
+/// `(rc, weak)` block it is the control block's `strong` counter, reached through the
+/// data block's back-pointer — which is also returned (`Some(ctrl)`) so the caller can
+/// release the phantom weak. A weak block must have a control block, so a **null**
+/// back-pointer is corrupt and errors here rather than resolving a counter at a garbage
+/// absolute offset. Shared by the strong-release (teardown) and strong-bump (clone) and
+/// try-unwrap (move) paths, whose offset math must stay in lockstep with the rc layout.
+pub(in crate::rtti) fn strong_counter_slot(
+    data: &BStack,
+    weak: bool,
+    data_off: NonNullOffset,
+) -> RttiResult<(NonNullOffset, Option<NonNullOffset>)> {
+    if weak {
+        let ctrl = Offset::from_raw(read_u64(
+            data,
+            data_off.checked_add(CTRL_BACKPTR_OFFSET)?.as_u64(),
+        )?)
+        .to_non_null()
+        .ok_or_else(|| {
+            rtti_err!(
+                Malformed,
+                "RTTI: weak block has a null control back-pointer"
+            )
+        })?;
+        Ok((ctrl.checked_add(CTRL_STRONG_OFFSET)?, Some(ctrl)))
+    } else {
+        Ok((data_off.checked_add(RC_REFCOUNT_OFFSET)?, None))
+    }
+}
+
 /// Release one deferred `weak` reference (commit phase of teardown) whose control
 /// block is at `ctrl_off`: decrement `ctrl.weak`; the last weak handle (or phantom)
 /// frees the control block. The data block is never touched by a weak drop.
 pub(in crate::rtti) fn commit_weak_release<A: BStackRaiiAllocator>(
     alloc: &A,
-    ctrl_off: u64,
+    ctrl_off: NonNullOffset,
 ) -> RttiResult<()> {
     let data = alloc.stack();
-    if refcount::fetch_sub(
-        data,
-        NonNullOffset::from_field(add_off(ctrl_off, CTRL_WEAK_OFFSET)?)?,
-        1,
-    )? == 1
-    {
+    if refcount::fetch_sub(data, ctrl_off.checked_add(CTRL_WEAK_OFFSET)?, 1)? == 1 {
         // SAFETY: last weak released — the control block is unreferenced.
-        unsafe { alloc.free_many([BStackRange::new(ctrl_off, CONTROL_SIZE)])? };
+        unsafe { alloc.free_many([BStackRange::new(ctrl_off.as_u64(), CONTROL_SIZE)])? };
     }
     Ok(())
 }

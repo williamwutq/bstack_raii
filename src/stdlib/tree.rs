@@ -1115,21 +1115,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBTreeMap<K, V> {
     }
 }
 
-impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBTreeMap<K, V> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<K: Pod + Ord, V: BStackBlock> TryCloneIn for BStackBTreeMap<K, V> {}
 
 /// A lazy in-order iterator over a [`BStackBTreeMap`], yielding
 /// `io::Result<(K, V)>` in ascending key order. Created by

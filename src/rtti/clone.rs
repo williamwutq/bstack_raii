@@ -11,12 +11,10 @@ use crate::BStackRaiiAllocator;
 use crate::io_core::{WalTxn, alloc_logged, refcount};
 use crate::primitives::{EightCC, NonNullOffset, Offset, OwnershipKind, WidePtr};
 use crate::registry::{FileId, ForeignHostAllocator};
-use crate::types::compiled::rc::{
-    CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
-};
+use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
 use crate::util::read_u64;
 
-use super::walk::{DepthGuard, checked_vec_len};
+use super::walk::{DepthGuard, checked_vec_len, strong_counter_slot};
 use super::{
     BYTEVEC_HEADER, FOREIGN_REPR_LEN, RttiBody, RttiOrdinal, RttiRegistry, RttiType, Shape,
     add_off, mul_off, unknown_tag,
@@ -140,18 +138,9 @@ impl RttiRegistry {
                     .map_err(Into::into)
             }
             OwnershipKind::Strong => {
-                // `src_target` is proven non-null, so `strong`'s inline counter offset
-                // stays branded through `checked_add`; only the `(rc, weak)` control
-                // offset — read from disk — needs re-validating against null.
-                let slot = if self.load_type(ord)?.weak {
-                    let ctrl = read_u64(
-                        tstack,
-                        src_target.checked_add(CTRL_BACKPTR_OFFSET)?.as_u64(),
-                    )?;
-                    NonNullOffset::from_field(add_off(ctrl, CTRL_STRONG_OFFSET)?)?
-                } else {
-                    src_target.checked_add(RC_REFCOUNT_OFFSET)?
-                };
+                // The strong counter is `src_target`'s inline `rc` slot, or the control
+                // block's `strong` reached via its backptr — the shared resolver.
+                let (slot, _) = strong_counter_slot(tstack, self.load_type(ord)?.weak, src_target)?;
                 refcount::fetch_add(tstack, slot, 1)?;
                 Ok(())
             }
@@ -495,18 +484,7 @@ impl RttiRegistry {
     ) -> RttiResult<NonNullOffset> {
         let ord = self.ordinal_of(tag).ok_or_else(unknown_tag)?;
         self.ensure_type(ord, st)?;
-        if st.cache[&ord].weak {
-            // `data_child` is proven non-null, so the back-pointer address stays branded
-            // through `checked_add`; the `ctrl` read *from disk* is the one value that can
-            // be null (a corrupt back-pointer), so it re-validates via `from_field`.
-            let ctrl = read_u64(data, data_child.checked_add(CTRL_BACKPTR_OFFSET)?.as_u64())?;
-            Ok(NonNullOffset::from_field(add_off(
-                ctrl,
-                CTRL_STRONG_OFFSET,
-            )?)?)
-        } else {
-            Ok(data_child.checked_add(RC_REFCOUNT_OFFSET)?)
-        }
+        Ok(strong_counter_slot(data, st.cache[&ord].weak, data_child)?.0)
     }
 
     /// Push a [`CloneOp::Field`] for every field of `ty` — a struct's fields, or the

@@ -55,7 +55,7 @@ use crate::io_core::bulk::seq_free_many;
 use crate::io_core::{WalStatus, WalTxn};
 use crate::primitives::{Offset, checked_off};
 use crate::types::compiled::owned::BStackOwned;
-use crate::types::compiled::rc::{CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET};
+use crate::types::compiled::rc::{CTRL_WEAK_OFFSET, strong_counter_off};
 use crate::types::compiled::vec::{BYTEVEC_HEADER, VecDesc};
 use crate::types::traits::{BStackBlock, BStackRef, BStackShared};
 use crate::util::io_error;
@@ -75,7 +75,26 @@ use crate::util::io_error;
 /// [`TryClone`](crate::TryClone) for why (in particular, why a weak reference can
 /// only ever be cloned as another weak reference).
 pub trait TryCloneIn: BStackBlock + Sized {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>>;
+    /// Deep-clone `self` into a fresh, detached [`BStackOwned`] block: stage the copy
+    /// through a [`ClonePlan`] (rolled back on any failure, then committed atomically).
+    ///
+    /// The default drives the plan; an implementor supplies only the type-specific
+    /// [`__bstack_clone_into`](BStackBlock::__bstack_clone_into) walk it calls. Every
+    /// deep-clonable block wants this exact driver, so overriding it is almost never
+    /// right.
+    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
+        let mut plan = ClonePlan::new();
+        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
+            Ok(range) => range,
+            Err(e) => {
+                plan.rollback(allocator);
+                return Err(e);
+            }
+        };
+        plan.commit(allocator)?;
+        // SAFETY: `dst` is a fresh block owned by nobody else.
+        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
+    }
 }
 
 /// Accumulates a deep clone's allocations, payload writes, and refcount bumps so
@@ -132,9 +151,6 @@ enum Mode {
     Build,
 }
 
-/// The in-flight intention-first WAL transaction of a [`ClonePlan`]: the file's
-/// WAL lock held for the descent, plus the persistent block's offset, entry-slot
-/// capacity, and how many entries have been published so far.
 impl Default for ClonePlan {
     fn default() -> Self {
         Self::new()
@@ -251,16 +267,6 @@ impl ClonePlan {
         }
     }
 
-    /// Register an already-allocated range for rollback — for allocations made
-    /// outside [`alloc_raw`](Self::alloc_raw). Only meaningful in the single-pass
-    /// [`Direct`](Mode::Direct) mode; the two-pass path allocates everything through
-    /// [`alloc_raw`](Self::alloc_raw). (Currently unused by generated code.)
-    pub fn track_alloc(&mut self, range: BStackRange) {
-        if matches!(self.mode, Mode::Direct) {
-            self.allocated.push(range);
-        }
-    }
-
     /// Stage a fresh `BStackByteVec` data block holding `data` into the plan:
     /// allocate the block (`[len | cap | data]`, `16`-byte header) via
     /// [`alloc_raw`](Self::alloc_raw), stage its full on-disk image into the
@@ -304,10 +310,7 @@ impl ClonePlan {
             return Ok(());
         }
         let (data_ref, ctrl) = T::strong_parts(data, allocator)?;
-        let off = match ctrl {
-            None => checked_off(data_ref.into_range().start(), RC_REFCOUNT_OFFSET)?,
-            Some(c) => checked_off(c.start(), CTRL_STRONG_OFFSET)?,
-        };
+        let off = strong_counter_off(data_ref.into_range().start(), ctrl)?;
         self.bumps.push(off);
         Ok(())
     }

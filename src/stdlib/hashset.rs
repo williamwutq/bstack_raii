@@ -43,7 +43,7 @@ use super::util::{
     Meta, ProbeStep, Scratch, alloc_image, grow_table, probe_commit, read_fields, w8,
 };
 use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
-use crate::primitives::EightCC;
+use crate::primitives::{EightCC, checked_off_mul};
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
 use crate::util::{SmallBuf, get_u64, io_error, read_u64};
@@ -99,10 +99,7 @@ fn place_writes(
     img.extend_from_slice(&OCCUPIED.to_le_bytes());
     img.extend_from_slice(key_bytes);
     // `m.table` is an on-disk pointer that can be corrupted/forged.
-    let off = target
-        .checked_mul(stride)
-        .and_then(|d| m.table.checked_add(d))
-        .ok_or_else(|| io_error!("corrupt bucket table offset"))?;
+    let off = checked_off_mul(m.table, target, stride)?;
     let mut w = vec![
         (off, SmallBuf::Heap(img.into_boxed_slice())),
         w8(handle + LEN_OFF, m.len + 1),
@@ -344,10 +341,7 @@ impl<K: Pod> BStackHashSet<K> {
                 } else if state == OCCUPIED && buf[8..8 + ksz] == *key_bytes {
                     found.set(true);
                     // `m.table` is an on-disk pointer that can be corrupted/forged.
-                    let step = idx
-                        .checked_mul(stride)
-                        .and_then(|d| m.table.checked_add(d))
-                        .ok_or_else(|| io_error!("corrupt bucket table offset"))
+                    let step = checked_off_mul(m.table, idx, stride)
                         .map(|off| vec![w8(off, TOMBSTONE), w8(handle + LEN_OFF, m.len - 1)]);
                     ProbeStep::Stop(step)
                 } else {
@@ -373,10 +367,7 @@ impl<K: Pod> BStackHashSet<K> {
         let mut scratch = Scratch::new();
         for _ in 0..cap {
             // `table` is an on-disk pointer that can be corrupted/forged.
-            let bucket = idx
-                .checked_mul(stride)
-                .and_then(|d| table.checked_add(d))
-                .ok_or_else(|| io_error!("corrupt bucket table offset"))?;
+            let bucket = checked_off_mul(table, idx, stride)?;
             let buf = scratch.buf(stride as usize);
             stack.get_into(bucket, buf)?;
             let state = get_u64(&buf[0..8]);
@@ -506,21 +497,7 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
     }
 }
 
-impl<K: Pod> TryCloneIn for BStackHashSet<K> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<K: Pod> TryCloneIn for BStackHashSet<K> {}
 
 /// An unordered iterator over a [`BStackHashSet`]'s keys, yielding
 /// `io::Result<K>`. Created by [`BStackHashSet::iter`]; scans the buckets.

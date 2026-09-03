@@ -240,3 +240,14 @@ pub fn checked_off(base: u64, delta: u64) -> io::Result<u64> {
     base.checked_add(delta)
         .ok_or_else(|| io_error!("block offset overflow"))
 }
+
+/// Address the `index`-th element of an array/table at `base` with element `stride`
+/// bytes — `base + index * stride`, rejecting overflow in either the multiply or the
+/// add. The raw-`u64` twin of [`Offset::checked_add_mul`], for the many collection call
+/// sites that compute an element/bucket address from a raw base and an untrusted index.
+#[inline(always)]
+pub fn checked_off_mul(base: u64, index: u64, stride: u64) -> io::Result<u64> {
+    Offset::from_raw(base)
+        .checked_add_mul(index, stride)
+        .map(Offset::get)
+}

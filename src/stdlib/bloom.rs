@@ -425,18 +425,4 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
     }
 }
 
-impl<K: Pod> TryCloneIn for BStackCountingBloomFilter<K> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<K: Pod> TryCloneIn for BStackCountingBloomFilter<K> {}

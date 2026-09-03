@@ -69,6 +69,28 @@ pub(crate) const CONTROL_SIZE: u64 = CTRL_DATA_OFFSET + 8;
 // Guard the hand-derived offsets against a header size change.
 const _: () = assert!(HEADER_SIZE == 16);
 
+/// Resolve an rc counter/control field offset from a base: `checked_off` (overflow-safe)
+/// refined to [`NonNullOffset`] (a non-null base plus a positive field const is never
+/// null; only a corrupt base could yield `0`, which errors). The one idiom every rc
+/// counter read/write in this file uses.
+fn counter_off(base: u64, field: u64) -> io::Result<NonNullOffset> {
+    NonNullOffset::from_field(checked_off(base, field)?)
+}
+
+/// The **strong counter** offset for a reference-counted block: its inline `rc` refcount
+/// (`data_start + RC_REFCOUNT_OFFSET`) when there is no separate control block, or the
+/// control block's `strong` field (`ctrl + CTRL_STRONG_OFFSET`) for an `(rc, weak)`
+/// block. Raw `u64` (the compiled clone plan's bump list is raw); wrap in
+/// [`NonNullOffset`] via [`counter_off`] where a branded counter is needed. Shared by the
+/// compiled clone / foreign-clone / `BStackRc` paths, whose offset math must stay in
+/// lockstep with the block layout.
+pub(crate) fn strong_counter_off(data_start: u64, ctrl: Option<BStackRange>) -> io::Result<u64> {
+    match ctrl {
+        None => checked_off(data_start, RC_REFCOUNT_OFFSET),
+        Some(c) => checked_off(c.start(), CTRL_STRONG_OFFSET),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Without-allocator drop cores for the `rc` / `weak` field annotations.
 //
@@ -103,7 +125,7 @@ impl<T: BStackBlock> BStackDrop for StrongRef<T> {
         // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
         let _depth = TeardownDepthGuard::enter()?;
         let data_range = self.0.into_range();
-        let off = NonNullOffset::from_field(checked_off(data_range.start(), RC_REFCOUNT_OFFSET)?)?;
+        let off = counter_off(data_range.start(), RC_REFCOUNT_OFFSET)?;
         // Decrement the inline refcount; only the last owner frees the block.
         if refcount::fetch_sub(allocator.stack(), off, 1)? == 1 {
             // SAFETY: last strong owner (the fetch_sub hit 1) of a live block.
@@ -226,7 +248,7 @@ impl<T: BStackWeakable> BStackDrop for WeakRef<T> {
 /// count being paid — both call sites do (a consumed `WeakRef`, or the last
 /// strong owner's phantom).
 fn release_weak<A: BStackRaiiAllocator>(allocator: &A, ctrl_range: BStackRange) -> io::Result<()> {
-    let weak_off = NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?)?;
+    let weak_off = counter_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?;
     if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {
         // SAFETY: last weak holder of a live control block; nothing else frees it.
         unsafe { dealloc_range(allocator, ctrl_range)? };
@@ -247,8 +269,7 @@ pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
 ) -> io::Result<()> {
     // Bound the recursion a last-owner free re-enters (see `OwnedRef`).
     let _depth = TeardownDepthGuard::enter()?;
-    let strong_off =
-        NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?)?;
+    let strong_off = counter_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?;
     // Phase 1: last strong owner frees the data block (children + shell), then
     // releases the phantom weak the strong owners collectively held — which is
     // exactly a weak-handle drop on the control block ([`release_weak`], the same
@@ -361,11 +382,10 @@ impl<'a, T: BStackBlock, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
 
     /// Byte offset of the strong counter for this handle's block kind.
     fn strong_offset(&self) -> io::Result<NonNullOffset> {
-        let off = match self.ctrl() {
-            None => checked_off(self.data().into_range().start(), RC_REFCOUNT_OFFSET)?,
-            Some(ctrl) => checked_off(ctrl.start(), CTRL_STRONG_OFFSET)?,
-        };
-        NonNullOffset::from_field(off)
+        NonNullOffset::from_field(strong_counter_off(
+            self.data().into_range().start(),
+            self.ctrl(),
+        )?)
     }
 }
 
@@ -404,8 +424,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
         let ctrl_range = self
             .ctrl()
             .expect("BStackRc<T: BStackWeakable> always has a control block");
-        let weak_off =
-            NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?)?;
+        let weak_off = counter_off(ctrl_range.start(), CTRL_WEAK_OFFSET)?;
         refcount::fetch_add(self.allocator().stack(), weak_off, 1)?;
         let ctrl = unsafe { BStackRef::<T::Control>::from_range(ctrl_range) };
         // SAFETY: the fetch_add above established the weak count this handle holds.
@@ -443,7 +462,7 @@ impl<'a, T: BStackMove, A: BStackRaiiAllocator> BStackRc<'a, T, A> {
 
         // `(rc, weak)`: release the phantom weak; free the control block at zero.
         if let Some(ctrl) = ctrl {
-            let weak_off = NonNullOffset::from_field(checked_off(ctrl.start(), CTRL_WEAK_OFFSET)?)?;
+            let weak_off = counter_off(ctrl.start(), CTRL_WEAK_OFFSET)?;
             if refcount::fetch_sub(allocator.stack(), weak_off, 1)? == 1 {
                 unsafe { dealloc_range(allocator, ctrl)? };
             }
@@ -506,8 +525,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
         // Both offsets are computed (and can fail) up front, before any mutation —
         // so an overflowing `ctrl_range.start()` never leaves a claimed strong
         // count with nothing to release it.
-        let strong_off =
-            NonNullOffset::from_field(checked_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?)?;
+        let strong_off = counter_off(ctrl_range.start(), CTRL_STRONG_OFFSET)?;
         let data_pos = checked_off(ctrl_range.start(), CTRL_DATA_OFFSET)?;
         if refcount::increment_if_nonzero(stack, strong_off)?.is_none() {
             return Ok(None);
@@ -549,10 +567,7 @@ impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> BStackWeak<'a, T, A> {
 /// than deep-copying — there is no `TryCloneIn` for a weak reference.
 impl<'a, T: BStackWeakable, A: BStackRaiiAllocator> TryClone for BStackWeak<'a, T, A> {
     fn try_clone(&self) -> io::Result<Self> {
-        let weak_off = NonNullOffset::from_field(checked_off(
-            self.ctrl().into_range().start(),
-            CTRL_WEAK_OFFSET,
-        )?)?;
+        let weak_off = counter_off(self.ctrl().into_range().start(), CTRL_WEAK_OFFSET)?;
         refcount::fetch_add(self.allocator().stack(), weak_off, 1)?;
         // SAFETY: the fetch_add above established the weak count this clone holds.
         Ok(unsafe { Self::from_raw(self.ctrl(), self.allocator()) })

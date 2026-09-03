@@ -43,7 +43,7 @@ use bytemuck::{Pod, Zeroable};
 use super::util::{WriteBuf, alloc_image, atomic_update, read_fields, w8};
 use crate::handback::ReplaceError;
 use crate::io_core::{ClonePlan, TryCloneIn, dealloc_range};
-use crate::primitives::EightCC;
+use crate::primitives::{EightCC, checked_off_mul};
 use crate::types::compiled::{BStackOwned, BlockHeader, HEADER_SIZE};
 use crate::types::traits::{BStackBlock, BStackCast, BStackDrop};
 use crate::util::{SmallBuf, io_error, read_u64};
@@ -128,11 +128,7 @@ impl<T: BStackBlock> BStackDeque<T> {
     /// rejecting overflow — `data` can originate from a corrupted on-disk
     /// pointer.
     fn slot_addr(data: u64, idx: u64) -> io::Result<u64> {
-        let delta = idx
-            .checked_mul(8)
-            .ok_or_else(|| io_error!("deque offset overflow"))?;
-        data.checked_add(delta)
-            .ok_or_else(|| io_error!("deque offset overflow"))
+        checked_off_mul(data, idx, 8)
     }
 
     /// Allocate an empty deque (no ring is allocated until the first push).
@@ -662,21 +658,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
     }
 }
 
-impl<T: BStackBlock> TryCloneIn for BStackDeque<T> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<T: BStackBlock> TryCloneIn for BStackDeque<T> {}
 
 /// A front-to-back iterator over a [`BStackDeque`], yielding `io::Result<T>`
 /// value handles. Created by [`BStackDeque::iter`].

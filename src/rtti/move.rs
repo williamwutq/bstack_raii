@@ -9,11 +9,10 @@ use bstack::{BStack, BStackRange};
 use crate::BStackRaiiAllocator;
 use crate::io_core::refcount;
 use crate::primitives::{NonNullOffset, WidePtr};
-use crate::types::compiled::rc::{
-    CTRL_BACKPTR_OFFSET, CTRL_STRONG_OFFSET, CTRL_WEAK_OFFSET, RC_REFCOUNT_OFFSET,
-};
+use crate::types::compiled::rc::CTRL_WEAK_OFFSET;
 use crate::util::{SmallStringMap, read_u64};
 
+use super::walk::strong_counter_slot;
 use super::{
     AnyRef, CONTROL_SIZE, FOREIGN_REPR_LEN, ForeignPtr, Moved, RttiBody, RttiField, RttiOrdinal,
     RttiRegistry, RttiType, Shape, VecRef, add_off, mul_off, unknown_tag,
@@ -76,21 +75,20 @@ impl RttiRegistry {
         if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(ordinal) {
             e.insert(self.load_type(ordinal)?);
         }
-        let (strong_slot, ctrl_off) = {
+        let (strong_slot, ctrl_off): (Option<NonNullOffset>, Option<NonNullOffset>) = {
             let root = &cache[&ordinal];
             if root.rc {
-                let (strong_slot, ctrl) = if root.weak {
-                    let c = read_u64(data, add_off(block_off, CTRL_BACKPTR_OFFSET)?)?;
-                    (add_off(c, CTRL_STRONG_OFFSET)?, Some(c))
-                } else {
-                    (add_off(block_off, RC_REFCOUNT_OFFSET)?, None)
-                };
+                // The strong counter slot (inline `rc`, or the control block's `strong`
+                // via the data backptr) — branded once, with `ctrl` for the weak release
+                // below. `block_off` is the caller-owned live root, hence non-null.
+                let (strong_slot, ctrl) =
+                    strong_counter_slot(data, root.weak, NonNullOffset::from_field(block_off)?)?;
                 // Atomic try-unwrap, exactly as `BStackRc::try_move`: claim sole
                 // ownership by CAS `strong: 1 -> 0`, so a concurrent clone/upgrade
                 // either beats the move (the CAS fails cleanly) or is refused by
                 // the zero count for the whole field walk — never both succeeding.
-                if !refcount::cas(data, NonNullOffset::from_field(strong_slot)?, 1, 0)? {
-                    let strong = read_u64(data, strong_slot)?;
+                if !refcount::cas(data, strong_slot, 1, 0)? {
+                    let strong = read_u64(data, strong_slot.as_u64())?;
                     return Err(rtti_err!(
                         SharedMove,
                         "RTTI move_out of a shared reference-counted block \
@@ -116,10 +114,9 @@ impl RttiRegistry {
             Err(e) => {
                 // Object untouched; only orphaned embed copies (if any) are reclaimed.
                 // Restore the strong count the CAS took, so the still-intact object
-                // keeps its sole owner.
-                if let Some(slot) = strong_slot
-                    && let Ok(slot) = NonNullOffset::from_field(slot)
-                {
+                // keeps its sole owner. `strong_slot` was branded non-null at the CAS, so
+                // the restore is unconditional — no re-check that could silently skip it.
+                if let Some(slot) = strong_slot {
                     let _ = refcount::fetch_add(data, slot, 1);
                 }
                 // SAFETY: `materialized` are this call's own embed copies.
@@ -135,13 +132,9 @@ impl RttiRegistry {
         // strong == 0 refusing any upgrade).
         let mut to_free = vec![BStackRange::new(block_off, cache[&ordinal].ondisk_size)];
         if let Some(ctrl_off) = ctrl_off
-            && refcount::fetch_sub(
-                data,
-                NonNullOffset::from_field(add_off(ctrl_off, CTRL_WEAK_OFFSET)?)?,
-                1,
-            )? == 1
+            && refcount::fetch_sub(data, ctrl_off.checked_add(CTRL_WEAK_OFFSET)?, 1)? == 1
         {
-            to_free.push(BStackRange::new(ctrl_off, CONTROL_SIZE));
+            to_free.push(BStackRange::new(ctrl_off.as_u64(), CONTROL_SIZE));
         }
         // Route through the WAL (or the allocator's atomic bulk free) like the
         // static `bstack_move!` shell teardown, so a crash after the fields moved

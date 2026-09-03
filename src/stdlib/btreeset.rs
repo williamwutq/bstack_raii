@@ -306,10 +306,10 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     /// Insert `key`; returns `true` if newly added, `false` if already present.
     pub fn insert<A: BStackRaiiAllocator>(&self, allocator: &A, key: K) -> io::Result<bool> {
         // Exact check first, so the filter is only touched for genuinely new keys.
-        let key_bytes = bytemuck::bytes_of(&key).to_vec();
-        if self.tree_contains(allocator.stack(), &key, &key_bytes)? {
+        if self.tree_contains(allocator.stack(), &key)? {
             return Ok(false);
         }
+        let key_bytes = bytemuck::bytes_of(&key).to_vec();
         self.bloom(allocator.stack())?.insert(allocator, &key)?;
 
         let handle = self.range.start();
@@ -389,11 +389,11 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
         if !self.bloom(stack)?.contains(stack, key)? {
             return Ok(false);
         }
-        self.tree_contains(stack, key, bytemuck::bytes_of(key))
+        self.tree_contains(stack, key)
     }
 
     /// Exact membership descent (no Bloom fast-reject).
-    fn tree_contains(&self, stack: &BStack, key: &K, _key_bytes: &[u8]) -> io::Result<bool> {
+    fn tree_contains(&self, stack: &BStack, key: &K) -> io::Result<bool> {
         let mut off = read_u64(stack, self.range.start() + ROOT_OFF)?;
         let ksize = Self::ksize();
         let children_off = Self::children_off();
@@ -613,8 +613,7 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     pub fn remove<A: BStackRaiiAllocator>(&self, allocator: &A, key: &K) -> io::Result<bool> {
         let handle = self.range.start();
         let stack = allocator.stack();
-        let key_bytes = bytemuck::bytes_of(key).to_vec();
-        if !self.tree_contains(stack, key, &key_bytes)? {
+        if !self.tree_contains(stack, key)? {
             return Ok(false);
         }
         let [root, len] = read_fields::<2>(stack, handle + ROOT_OFF)?;
@@ -944,21 +943,7 @@ impl<K: Pod + Ord> BStackBlock for BStackBTreeSet<K> {
     }
 }
 
-impl<K: Pod + Ord> TryCloneIn for BStackBTreeSet<K> {
-    fn try_clone_in<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<BStackOwned<Self>> {
-        let mut plan = ClonePlan::new();
-        let dst = match self.__bstack_clone_into(allocator, &mut plan) {
-            Ok(range) => range,
-            Err(e) => {
-                plan.rollback(allocator);
-                return Err(e);
-            }
-        };
-        plan.commit(allocator)?;
-        // SAFETY: `dst` is a fresh block owned by nobody else.
-        Ok(unsafe { BStackOwned::from_raw(Self::from_range(dst)) })
-    }
-}
+impl<K: Pod + Ord> TryCloneIn for BStackBTreeSet<K> {}
 
 /// A lazy in-order iterator over a [`BStackBTreeSet`], yielding `io::Result<K>`
 /// in ascending order. Created by [`BStackBTreeSet::iter`] /
