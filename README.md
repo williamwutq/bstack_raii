@@ -36,7 +36,7 @@ It layers on the mainline `bstack` allocator (`BStackRange` / `BStackSlice` /
 single-ownership primitives underneath.
 
 > **Status:** feature-complete and tested, but the on-disk ABI is not yet
-> stable. Not yet published to crates.io.
+> stable (pre-1.0).
 
 ## Contents
 
@@ -74,7 +74,7 @@ layer):
 
 ```toml
 [dependencies]
-bstack_raii = { git = "https://github.com/williamwutq/bstack_raii" }
+bstack_raii = "0.1"
 bstack = "0.4"
 ```
 

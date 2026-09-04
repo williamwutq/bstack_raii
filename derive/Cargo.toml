@@ -9,7 +9,8 @@ description = "Procedural macros for bstack_raii (#[bstack_block], bstack_move!,
 repository = "https://github.com/williamwutq/bstack_raii"
 keywords = ["raii", "ownership", "proc-macro", "derive", "bstack"]
 categories = ["memory-management", "rust-patterns"]
-publish = false
+documentation = "https://docs.rs/bstack_raii_derive"
+include = ["src/**/*", "Cargo.toml"]
 
 [lib]
 proc-macro = true

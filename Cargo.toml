@@ -9,7 +9,21 @@ description = "Typed, RAII-style ownership and lifetime layer over the bstack al
 repository = "https://github.com/williamwutq/bstack_raii"
 keywords = ["raii", "ownership", "allocator", "arena", "bstack"]
 categories = ["memory-management", "data-structures"]
-publish = false
+readme = "README.md"
+documentation = "https://docs.rs/bstack_raii"
+# Whitelist what ships to crates.io: the library, its manifest/license, the README
+# and the two docs it links (ERRORS.md / BYTECODE.md), and the runnable examples.
+# Deliberately omits `tests/`, internal dev docs (FUZZ/PLANNED/GUIDELINES/
+# FAILPATTERNS), and CI config.
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "ERRORS.md",
+    "BYTECODE.md",
+    "examples/**/*.rs",
+]
 
 # A standalone Cargo workspace: the `bstack_raii` library plus its `derive`
 # proc-macro crate. Extracted from the `bstack` monorepo; it depends on `bstack`
@@ -26,12 +40,12 @@ fault-injection = ["bstack/fault-injection"]
 [dependencies]
 # RAII requires `alloc` + `set`; `atomic` is needed for the on-disk refcount RMW
 # (control blocks, strong/weak counters).
-bstack = { version = "=0.4", features = ["alloc", "set", "atomic"] }
+bstack = { version = "0.4.4", features = ["alloc", "set", "atomic"] }
 bstack_raii_derive = { path = "derive", version = "0.1.0" }
 
 # Gate for POD (plain-old-data) inline fields: any `bytemuck::Pod` type is safe
 # to store inline in an on-disk block and receives the blanket no-op BStackDrop.
-bytemuck = { version = "=1.25", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive"] }
 parking_lot = "0.12.5"
 
 # RTTI type registration: `#[bstack_class]` emits a link-time entry per type into

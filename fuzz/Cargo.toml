@@ -19,7 +19,7 @@ arbitrary = { version = "1", features = ["derive"] }
 # op in the fuzz loop pays a real disk sync, 1-2 orders of magnitude slower.
 # Feature unification means this also switches off syncing for the `bstack`
 # instance `bstack_raii` itself links against in this build.
-bstack = { version = "=0.4", features = ["alloc", "set", "atomic", "debug-no-sync"] }
+bstack = { version = "0.4.4", features = ["alloc", "set", "atomic", "debug-no-sync"] }
 
 [dependencies.bstack_raii]
 path = ".."
