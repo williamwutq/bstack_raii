@@ -20,6 +20,7 @@ use bstack::{BStack, BStackAllocator, BStackRange};
 use super::super::traits::{BStackBlock, BStackRef, BStackShared, BStackWeakable, Foreign};
 use super::{BStackOwned, BStackRc, BStackWeak};
 use crate::BStackRaiiAllocator;
+use crate::handback::IntoLocalError;
 use crate::io_core::foreign::{foreign_drop_owned, foreign_drop_strong, foreign_drop_weak};
 use crate::primitives::WidePtr;
 use crate::registry::{self, FileId};
@@ -145,10 +146,16 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
     /// only meaningful in the file it was read from — pass that file's allocator);
     /// the caller keeps that obligation, exactly as for a cast-produced
     /// [`BStackRef`].
-    pub fn into_local<A: BStackRaiiAllocator>(self, target: &A) -> io::Result<BStackOwned<T>> {
+    pub fn into_local<A: BStackRaiiAllocator>(
+        self,
+        target: &A,
+    ) -> Result<BStackOwned<T>, IntoLocalError<Self>> {
         // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file, else
-        // the returned handle's safe `bstack_drop` would free in the wrong file.
-        ensure_target_file(self.ptr.repr(), target)?;
+        // the returned handle's safe `bstack_drop` would free in the wrong file. On a
+        // mismatch, hand `self` back intact (its owned block is never released here).
+        if let Err(e) = ensure_target_file(self.ptr.repr(), target) {
+            return Err(IntoLocalError::recovered(e, self));
+        }
         // SAFETY: `self` was the sole owner (its `from_foreign` contract) and is
         // consumed here, so the returned `BStackOwned` becomes the sole owner of the
         // same live block, in the target's own file.
@@ -211,14 +218,21 @@ impl<'a, T: BStackShared + 'static> ForeignRc<'a, T> {
     pub fn into_local<'t, A: BStackRaiiAllocator>(
         self,
         target: &'t A,
-    ) -> io::Result<BStackRc<'t, T, A>> {
+    ) -> Result<BStackRc<'t, T, A>, IntoLocalError<Self>> {
         // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file, else
         // the returned `BStackRc`'s drop would decrement/free the strong count in the
         // wrong file. (Also avoids reading a bogus control block from that file below.)
-        ensure_target_file(self.ptr.repr(), target)?;
+        // On either failure hand `self` back — the strong reference is never released
+        // here, so the caller keeps a recoverable handle instead of an orphan.
+        if let Err(e) = ensure_target_file(self.ptr.repr(), target) {
+            return Err(IntoLocalError::recovered(e, self));
+        }
         // SAFETY: the stored offset is the target's live shared data block.
         let data = unsafe { BStackRef::<T>::from_range(self.ptr.range()) };
-        let (data, ctrl) = <T as BStackShared>::strong_parts(data, target)?;
+        let (data, ctrl) = match <T as BStackShared>::strong_parts(data, target) {
+            Ok(dc) => dc,
+            Err(e) => return Err(IntoLocalError::recovered(e, self)),
+        };
         // SAFETY: `self` held one strong ref (its `from_foreign` contract) and is
         // consumed, so the returned handle accounts for exactly that count.
         Ok(unsafe { BStackRc::from_raw(data, ctrl, target) })
@@ -273,10 +287,13 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
     pub fn into_local<'t, A: BStackRaiiAllocator>(
         self,
         target: &'t A,
-    ) -> io::Result<BStackWeak<'t, T, A>> {
+    ) -> Result<BStackWeak<'t, T, A>, IntoLocalError<Self>> {
         // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file, else
-        // the returned `BStackWeak`'s drop would decrement/free in the wrong file.
-        ensure_target_file(self.ptr.repr(), target)?;
+        // the returned `BStackWeak`'s drop would decrement/free in the wrong file. On a
+        // mismatch, hand `self` back — the weak reference is never released here.
+        if let Err(e) = ensure_target_file(self.ptr.repr(), target) {
+            return Err(IntoLocalError::recovered(e, self));
+        }
         let ctrl_off = self.ptr.offset().get();
         // SAFETY: a weak `Foreign` stores the target's control-block offset.
         let ctrl = unsafe {

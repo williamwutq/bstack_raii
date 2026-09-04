@@ -183,7 +183,14 @@ mod intolocal {
         // rejected rather than handing back a handle that would free A's block.
         match fo.into_local(&home) {
             Ok(_) => panic!("into_local accepted a mismatched target file"),
-            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            Err(e) => {
+                assert_eq!(e.source.kind(), std::io::ErrorKind::InvalidInput);
+                // The owning handle is handed back intact (not orphaned): recover it and
+                // confirm it still names file B, then relinquish it (it owns B's block).
+                let recovered: ForeignOwned<'_, Leaf> = e.into_handle();
+                assert_eq!(recovered.as_foreign().file_id().as_u64(), fid.as_u64());
+                let _ = recovered.into_foreign();
+            }
         }
 
         // File A's victim is untouched and still readable / freeable.

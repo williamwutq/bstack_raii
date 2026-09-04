@@ -27,10 +27,12 @@ use std::io;
 
 mod cast;
 mod construct;
+mod into_local;
 mod replace;
 
 pub use cast::CastError;
 pub use construct::ConstructError;
+pub use into_local::IntoLocalError;
 pub use replace::ReplaceError;
 
 /// The common surface of a hand-back error: it wraps an underlying [`io::Error`].

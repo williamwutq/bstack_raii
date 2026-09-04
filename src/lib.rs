@@ -17,7 +17,7 @@
 //! | [`layout`]     | On-disk primitives: [`EightCC`], [`BlockHeader`] (both Pod). |
 //! | [`reference`]  | [`BStackRef`]: typed range wrapper + buffered `OnDisk` read. |
 //! | [`teardown`]   | [`BStackDrop`] trait, [`AutoDrop`] RAII guard, [`dealloc_range`]. |
-//! | `handback`     | The hand-back error family: [`ConstructError`], [`ReplaceError`], [`CastError`] + the [`HandBack`] trait. |
+//! | `handback`     | The hand-back error family: [`ConstructError`], [`ReplaceError`], [`CastError`], [`IntoLocalError`] + the [`HandBack`] trait. |
 //! | [`block`]      | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
 //! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
 //! | `bulk`         | Sequential fallbacks for [`BStackRaiiAllocator::alloc_many`] / [`free_many`](BStackRaiiAllocator::free_many); bulk allocators override those trait methods. |
@@ -68,7 +68,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-pub use handback::{CastError, ConstructError, HandBack, ReplaceError};
+pub use handback::{CastError, ConstructError, HandBack, IntoLocalError, ReplaceError};
 /// Codegen plumbing, re-exported for `#[bstack_block]`-generated code only. It is
 /// named in [`BStackBlock`]'s (hidden) trait-method signatures, so the type must
 /// stay `pub`; the supported way to clone is [`TryClone`] / [`TryCloneIn`].
