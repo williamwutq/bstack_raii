@@ -1483,7 +1483,9 @@ pub(crate) fn foreign_mut_methods(
 
     // ---- replace_<field>(&alloc, new) -> old ----
     let replace = format_ident!("replace_{}", fname);
-    let read_old = quote! {
+    // Resolve the field offset and bind the stack; a bad offset hands `value` back
+    // untouched (nothing is written).
+    let setup = quote! {
         let __stack = allocator.stack();
         let __off = match #off {
             ::std::result::Result::Ok(__o) => __o,
@@ -1491,20 +1493,19 @@ pub(crate) fn foreign_mut_methods(
                 return ::core::result::Result::Err(
                     ::bstack_raii::ReplaceError::recovered(__e, value)),
         };
-        let mut __b = [0u8; 16];
-        if let ::std::result::Result::Err(__e) = __stack.get_into(__off, &mut __b) {
-            return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, value));
-        }
+    };
+    // Decode the displaced old 16-byte pointer from the bytes `swap` returned and
+    // SELF-resolve it for hand-back. `resolve_self_repr` is infallible; the `Err` arm is
+    // defensive (the swap has already committed, so it hands the old back `lost` rather
+    // than as a typed dual).
+    let take_old = quote! {
         let __old_raw: ::bstack_raii::WidePtr =
-            ::bstack_raii::bytemuck::pod_read_unaligned(&__b);
-        // Resolve a SELF old-pointer to this file's registered id before it is handed
-        // back as a dual. Nothing is written yet, so on failure hand `value` back.
+            ::bstack_raii::bytemuck::pod_read_unaligned(&__old_bytes[..16]);
         let __old: ::bstack_raii::WidePtr =
             match ::bstack_raii::registry::resolve_self_repr(__old_raw, __stack) {
                 ::std::result::Result::Ok(__r) => __r,
                 ::std::result::Result::Err(__e) =>
-                    return ::core::result::Result::Err(
-                        ::bstack_raii::ReplaceError::recovered(__e, value)),
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e)),
             };
     };
     let replace_body = if nullable {
@@ -1512,7 +1513,7 @@ pub(crate) fn foreign_mut_methods(
         let rb_new = rebuild(quote!(__r));
         let rb_old = rebuild(quote!(__old));
         quote! {
-            #read_old
+            #setup
             let (__new, __back): (
                 ::bstack_raii::WidePtr,
                 ::core::option::Option<::bstack_raii::WidePtr>,
@@ -1527,18 +1528,32 @@ pub(crate) fn foreign_mut_methods(
                 ::core::option::Option::None =>
                     (::bstack_raii::WidePtr::NULL, ::core::option::Option::None),
             };
-            if let ::std::result::Result::Err(__e) =
-                __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
-            {
-                let __hb: #val_ty = match __back {
-                    ::core::option::Option::Some(__r) => ::core::option::Option::Some(#rb_new),
-                    ::core::option::Option::None => ::core::option::Option::None,
-                };
-                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
-            }
-            if __old.offset().get() == 0 {
+            // Atomic exchange: install the new pointer and take the displaced old one in
+            // ONE locked step, so two concurrent `replace_`s each take the distinct old
+            // they displaced — never both hand back a dual to the same target (which a
+            // read-then-write would allow, a cross-file double-free). On a failed swap
+            // nothing is committed: the field still holds the old value; hand the new back.
+            let __old_bytes = match __stack.swap(__off, ::bstack_raii::bytemuck::bytes_of(&__new)) {
+                ::std::result::Result::Ok(__b) => __b,
+                ::std::result::Result::Err(__e) => {
+                    let __hb: #val_ty = match __back {
+                        ::core::option::Option::Some(__r) => ::core::option::Option::Some(#rb_new),
+                        ::core::option::Option::None => ::core::option::Option::None,
+                    };
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, __hb));
+                }
+            };
+            let __old_raw: ::bstack_raii::WidePtr =
+                ::bstack_raii::bytemuck::pod_read_unaligned(&__old_bytes[..16]);
+            if __old_raw.offset().get() == 0 {
                 ::core::result::Result::Ok(::core::option::Option::None)
             } else {
+                let __old: ::bstack_raii::WidePtr =
+                    match ::bstack_raii::registry::resolve_self_repr(__old_raw, __stack) {
+                        ::std::result::Result::Ok(__r) => __r,
+                        ::std::result::Result::Err(__e) =>
+                            return ::core::result::Result::Err(::bstack_raii::ReplaceError::lost(__e)),
+                    };
                 ::core::result::Result::Ok(::core::option::Option::Some(#rb_old))
             }
         }
@@ -1547,25 +1562,30 @@ pub(crate) fn foreign_mut_methods(
         let rb_new = rebuild(quote!(__new_explicit));
         let rb_old = rebuild(quote!(__old));
         quote! {
-            #read_old
+            #setup
             let __new_explicit: ::bstack_raii::WidePtr = #consume_v;
             // Store the home-relative (SELF-re-encoded) form; hand the explicit value
-            // back untouched on a write failure.
+            // back untouched on a failed swap.
             let __new: ::bstack_raii::WidePtr =
                 ::bstack_raii::registry::home_relative_repr(__new_explicit, __stack);
-            if let ::std::result::Result::Err(__e) =
-                __stack.set(__off, ::bstack_raii::bytemuck::bytes_of(&__new))
-            {
-                return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, #rb_new));
-            }
+            // Atomic exchange (see the nullable arm): concurrent `replace_`s each take the
+            // distinct old they displaced, never a shared dual → no cross-file double-free.
+            let __old_bytes = match __stack.swap(__off, ::bstack_raii::bytemuck::bytes_of(&__new)) {
+                ::std::result::Result::Ok(__b) => __b,
+                ::std::result::Result::Err(__e) =>
+                    return ::core::result::Result::Err(::bstack_raii::ReplaceError::recovered(__e, #rb_new)),
+            };
+            #take_old
             ::core::result::Result::Ok(#rb_old)
         }
     };
     out.push(quote! {
         /// Install `value` and move the previous cross-file target out as its RAII
         /// handle (free / decrement it with `bstack_drop(&home)`, or re-store it).
-        /// One crash-atomic 16-byte `set`; on I/O failure the *new* value is handed
-        /// back through [`ReplaceError`](::bstack_raii::ReplaceError).
+        /// One crash-atomic 16-byte `swap`, so concurrent callers each take the distinct
+        /// old target they displaced (never both a dual to the same one — a cross-file
+        /// double-free); on I/O failure the *new* value is handed back through
+        /// [`ReplaceError`](::bstack_raii::ReplaceError).
         #vis fn #replace<'__m, __A: ::bstack_raii::BStackRaiiAllocator>(
             &self,
             allocator: &'__m __A,
