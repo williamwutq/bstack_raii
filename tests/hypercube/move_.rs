@@ -48,3 +48,27 @@ fn enum_move_transfers_payload() {
         _ => panic!("expected Owned"),
     }
 }
+
+// Move-out under DebugCheckingAllocator (a live double-free oracle): `bstack_move!` frees
+// only the container shell and hands each child back; the test then frees each. If the
+// shell teardown wrongly freed a moved-out child (double), the oracle panics — whereas on
+// FirstFit the defused teardown would swallow the resulting dealloc error.
+#[test]
+fn dbg_move_out_no_double_free() {
+    let tmp = TempStack::new();
+    let a = tmp.debug_checking_allocator();
+
+    let h = mut_sink(&a).unwrap();
+    let (_pod, _tuple, owned, strong, arr) = bstack_move!(h, &a).unwrap();
+    owned.bstack_drop(&a).unwrap();
+    drop(strong);
+    for o in arr {
+        o.bstack_drop(&a).unwrap();
+    }
+
+    let e = enum_owned(&a).unwrap();
+    match bstack_move!(e, &a).unwrap() {
+        EnumSinkData::Owned(o) => o.bstack_drop(&a).unwrap(),
+        _ => panic!("expected Owned"),
+    }
+}

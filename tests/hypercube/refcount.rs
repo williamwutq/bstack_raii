@@ -50,3 +50,33 @@ fn shared_container_clone_shares() {
     assert_eq!(rc2.handle().get_pod(stack).unwrap(), 7); // still alive
     drop(rc2);
 }
+
+// Refcount teardown under DebugCheckingAllocator (a live double-free oracle): the strong
+// path frees the data (and, for `rc, weak`, the control only once the last weak is also
+// gone); the weak path frees the control when last. A control block freed by BOTH the
+// last strong and the last weak — the classic rc/weak double-free — panics here, where a
+// plain FirstFit run's swallowed teardown error would hide it.
+#[test]
+fn dbg_refcount_teardown_no_double_free() {
+    let tmp = TempStack::new();
+    let a = tmp.debug_checking_allocator();
+
+    // Strong share, drop both: the block is freed exactly once at strong 0.
+    let rc = Shared::new(&a, 5).unwrap();
+    let rc2 = rc.try_clone().unwrap();
+    drop(rc);
+    drop(rc2);
+
+    // rc + weak: last strong frees the data and keeps the control (a weak is alive);
+    // the last weak then frees the control. Neither block may be freed twice.
+    let rc = Shared::new(&a, 7).unwrap();
+    let w = rc.downgrade().unwrap();
+    drop(rc);
+    drop(w);
+
+    // A shared block carrying its own children, freed at strong 0.
+    let s = rc_sink(&a).unwrap();
+    let s2 = s.try_clone().unwrap();
+    drop(s);
+    drop(s2);
+}

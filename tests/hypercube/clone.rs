@@ -45,6 +45,53 @@ fn block_sink_clone_reclaims() {
     src.bstack_drop(&a).unwrap();
 }
 
+// The richest interaction fixture (owned / strong / embed + vec / array + nested arrays
+// + vec-of-arr + arr-of-vec + strong vec/arr) under DebugCheckingAllocator, which PANICS
+// in-line on a double-free / overlapping free. This is a strictly stronger check than the
+// FirstFit tests above: teardown SWALLOWS dealloc errors, so on plain FirstFit a
+// double-free (an aliasing clone that shares a leaf with the original) returns an Err
+// that never reaches `bstack_drop().unwrap()` — only this oracle surfaces it. Clone, then
+// tear down BOTH copies: any leaf the clone failed to deep-copy double-frees here.
+#[test]
+fn block_sink_clone_and_teardown_no_double_free() {
+    let tmp = TempStack::new();
+    let a = tmp.debug_checking_allocator();
+    let h = block_sink(&a).unwrap();
+    let c = h.try_clone_in(&a).unwrap();
+    c.bstack_drop(&a).unwrap();
+    h.bstack_drop(&a).unwrap();
+}
+
+// The same double-free oracle applied to the OTHER codegen paths (embed, foreign-SELF,
+// enum, whole-value-mut), each with its own drop/clone token stream — an aliasing clone
+// or a teardown that visits a child twice panics in-line here where a FirstFit run would
+// swallow it.
+#[test]
+fn dbg_sinks_clone_and_teardown_no_double_free() {
+    let tmp = TempStack::new();
+    let a = tmp.debug_checking_allocator();
+
+    let c1 = embed_sink(&a).unwrap();
+    let c1c = c1.try_clone_in(&a).unwrap();
+    c1c.bstack_drop(&a).unwrap();
+    c1.bstack_drop(&a).unwrap();
+
+    let cf = foreign_self_sink(&a).unwrap();
+    let cfc = cf.try_clone_in(&a).unwrap();
+    cfc.bstack_drop(&a).unwrap();
+    cf.bstack_drop(&a).unwrap();
+
+    let ce = enum_owned(&a).unwrap();
+    let cec = ce.try_clone_in(&a).unwrap();
+    cec.bstack_drop(&a).unwrap();
+    ce.bstack_drop(&a).unwrap();
+
+    let cm = mut_sink(&a).unwrap();
+    let cmc = cm.try_clone_in(&a).unwrap();
+    cmc.bstack_drop(&a).unwrap();
+    cm.bstack_drop(&a).unwrap();
+}
+
 #[test]
 fn embed_sink_clone_is_independent() {
     let tmp = TempStack::new();
