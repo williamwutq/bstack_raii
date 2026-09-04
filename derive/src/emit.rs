@@ -3774,16 +3774,22 @@ pub(crate) fn block_array_field(
             }
         });
 
-        // Move: re-home each embedded child to a fresh standalone allocation.
+        // Move: re-home each embedded child to a fresh standalone allocation. As the
+        // scalar-embed path, the (fallible) re-home runs in the pre-free capture phase
+        // — *before* the parent shell is deallocated — so an allocation failure partway
+        // leaves the shell intact and the object recoverable, rather than freeing the
+        // shell first and losing the not-yet-re-homed children (mirrors the RTTI move
+        // interpreter's materialize-then-free ordering). `mv_recon` hands back the
+        // already-built nested handle array (infallibly), after the shell free.
         let cap = format_ident!("__cap_{}", fname);
-        parts.mv_caps.push(quote!(let #cap = __od.#fname;));
-        parts.mv_types.push(nested_ty(
-            &dims,
-            &quote!(::bstack_raii::BStackOwned<#child>),
-        ));
+        let src = format_ident!("__embed_mv_src_{}", fname);
+        let leaf_ty = quote!(::bstack_raii::BStackOwned<#child>);
+        let nested = nested_ty(&dims, &leaf_ty);
+        // `__od.#fname` is the flat `[#child_od; #total]` inline storage; `nested_build`
+        // reads it flat, row-major, into the nested handle array.
         let mv_read = |k: &Ident| {
             quote! {{
-                let __cod = #cap[#k];
+                let __cod = #src[#k];
                 let mut __slice =
                     __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
                 let __r = __slice.as_range();
@@ -3799,11 +3805,13 @@ pub(crate) fn block_array_field(
                 }
             }}
         };
-        parts.mv_recon.push(nested_build(
-            &dims,
-            &quote!(::bstack_raii::BStackOwned<#child>),
-            &mv_read,
-        ));
+        let build = nested_build(&dims, &leaf_ty, &mv_read);
+        parts.mv_caps.push(quote! {
+            let #src = __od.#fname;
+            let #cap: #nested = #build;
+        });
+        parts.mv_types.push(nested_ty(&dims, &leaf_ty));
+        parts.mv_recon.push(quote!(#cap));
 
         // Failed-construction hand-back: before the post-write copy runs,
         // each embedded child is still its own standalone block at `#src_id[k]`, so
@@ -4690,19 +4698,21 @@ pub(crate) fn embed_field(
         }
     });
 
-    // Move: re-home the embedded child to a fresh standalone allocation.
+    // Move: re-home the embedded child to a fresh standalone allocation. The
+    // (fallible) re-home runs in the pre-free capture phase — *before* the parent
+    // shell is deallocated — mirroring the RTTI move interpreter: on an allocation
+    // failure the shell is still intact, so the object is left recoverable rather
+    // than freed with the embedded child's storage lost. `mv_recon` then just hands
+    // back the already-built handle (infallibly), after the shell free.
     let cap = format_ident!("__cap_{}", fname);
-    parts.mv_caps.push(quote!(let #cap = __od.#fname;));
-    parts
-        .mv_types
-        .push(quote!(::bstack_raii::BStackOwned<#child>));
-    parts.mv_recon.push(quote! {
-        {
+    parts.mv_caps.push(quote! {
+        let #cap: ::bstack_raii::BStackOwned<#child> = {
+            let __cod = __od.#fname;
             let mut __slice =
                 __alloc.alloc(::core::mem::size_of::<#child_od>() as u64)?;
             let __r = __slice.as_range();
             if let ::std::result::Result::Err(__e) =
-                __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&#cap))
+                __slice.write_range(0, ::bstack_raii::bytemuck::bytes_of(&__cod))
             {
                 let _ = __alloc.dealloc(__slice);
                 return ::std::result::Result::Err(__e);
@@ -4712,8 +4722,12 @@ pub(crate) fn embed_field(
                     unsafe { <#child as ::bstack_raii::BStackBlock>::from_range(__r) },
                 )
             }
-        }
+        };
     });
+    parts
+        .mv_types
+        .push(quote!(::bstack_raii::BStackOwned<#child>));
+    parts.mv_recon.push(quote!(#cap));
     // Failed-construction hand-back: before the post-write copy runs, the
     // embedded child is still its own standalone block at `#src_id`, so hand it
     // straight back as a `BStackOwned` — no re-home, infallibly. (`#src_id` is a
