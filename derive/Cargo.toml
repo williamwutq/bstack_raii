@@ -1,11 +1,14 @@
 [package]
 name = "bstack_raii_derive"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
 license = "MIT"
 description = "Procedural macros for bstack_raii (#[bstack_block], bstack_move!, bstack_cast!)"
-repository = "https://github.com/williamwutq/bstack"
+repository = "https://github.com/williamwutq/bstack_raii"
+keywords = ["raii", "ownership", "proc-macro", "derive", "bstack"]
+categories = ["memory-management", "rust-patterns"]
 publish = false
 
 [lib]

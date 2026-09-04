@@ -1,11 +1,14 @@
 [package]
 name = "bstack_raii"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"]
 license = "MIT"
 description = "Typed, RAII-style ownership and lifetime layer over the bstack allocation primitives"
 repository = "https://github.com/williamwutq/bstack_raii"
+keywords = ["raii", "ownership", "allocator", "arena", "bstack"]
+categories = ["memory-management", "data-structures"]
 publish = false
 
 # A standalone Cargo workspace: the `bstack_raii` library plus its `derive`
@@ -24,7 +27,7 @@ fault-injection = ["bstack/fault-injection"]
 # RAII requires `alloc` + `set`; `atomic` is needed for the on-disk refcount RMW
 # (control blocks, strong/weak counters).
 bstack = { version = "=0.4", features = ["alloc", "set", "atomic"] }
-bstack_raii_derive = { path = "derive", version = "0.0.0" }
+bstack_raii_derive = { path = "derive", version = "0.1.0" }
 
 # Gate for POD (plain-old-data) inline fields: any `bytemuck::Pod` type is safe
 # to store inline in an on-disk block and receives the blanket no-op BStackDrop.
