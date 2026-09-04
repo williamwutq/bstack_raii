@@ -1,0 +1,6 @@
+error: [BSTACK0206] `#[default]` on a `#[bstack_enum]` must be a unit variant — the generated `Default for <Enum>Data` takes no allocator, so it cannot build a variant with a payload (construct those with `<Enum>::new`)
+ --> tests/hypercube/ui/enum_default_non_unit.rs:6:5
+  |
+6 | /     #[default]
+7 | |     Num(u32),
+  | |____________^

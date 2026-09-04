@@ -143,6 +143,34 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let data = format_ident!("{}Data", name);
     let view = format_ident!("{}View", name);
 
+    // A `#[default]` variant (at most one, and it must be a **unit** variant) generates
+    // an `impl Default for <Enum>Data` returning that variant. The macro replaces the
+    // source enum, so rustc's own `#[derive(Default)]` cannot see the marker — parse and
+    // enforce it here. A non-unit default is rejected: the generated `Default::default()`
+    // takes no allocator, so it cannot build a variant that owns a child or holds a POD
+    // payload (that is `<Enum>::new(alloc, ..)`).
+    let mut default_variant: Option<&Ident> = None;
+    for variant in &input.variants {
+        if !is_default_variant(&variant.attrs) {
+            continue;
+        }
+        if default_variant.is_some() {
+            return Err(Error::new_spanned(
+                variant,
+                "[BSTACK0207] multiple `#[default]` variants in a `#[bstack_enum]`; mark exactly one",
+            ));
+        }
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(Error::new_spanned(
+                variant,
+                "[BSTACK0206] `#[default]` on a `#[bstack_enum]` must be a unit variant — the \
+                 generated `Default for <Enum>Data` takes no allocator, so it cannot build a \
+                 variant with a payload (construct those with `<Enum>::new`)",
+            ));
+        }
+        default_variant = Some(&variant.ident);
+    }
+
     // Every variant's contributions accumulate here (the enum's Slot IR bundle):
     // the `EData` / `EView` variant decls, the `new` / `read` / `move` / `drop` /
     // `clone` match arms, per-variant payload sizes, POD / embed assertion types, and
@@ -697,6 +725,19 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
     let data_generics = comp_decl(&quote!('__e), has_shared || has_foreign, has_shared);
     let view_generics = comp_decl(&quote!('__e), has_weak || has_foreign, has_weak);
     let view_ty = comp_ty(&view, &quote!('__e), has_weak || has_foreign, has_weak);
+
+    // `impl Default for <Enum>Data` for a `#[default]` unit variant (reusing `EData`'s
+    // own decl generics + type so it handles the generic `<'__e, __A, ..>` form too).
+    let default_impl = match default_variant {
+        Some(vname) => quote! {
+            impl #data_generics ::core::default::Default for #data_ty {
+                fn default() -> Self {
+                    #data::#vname
+                }
+            }
+        },
+        None => quote!(),
+    };
     // `bstack_move!` yields the same `EData` (owned handles); `Fields` just names
     // it with the move lifetime.
     let move_fields_ty = comp_ty(&data, &quote!('__mv), has_shared || has_foreign, has_shared);
@@ -907,6 +948,8 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
         #vis enum #view #view_generics {
             #(#view_variants)*
         }
+
+        #default_impl
 
         impl #enum_impl_g ::bstack_raii::BStackCast for #name #enum_ty_g #enum_where {
             fn eightcc() -> ::bstack_raii::EightCC {

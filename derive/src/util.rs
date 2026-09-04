@@ -1065,6 +1065,17 @@ pub(crate) fn is_bstack_mut(attrs: &[syn::Attribute]) -> bool {
         .any(|id| id == "bstack_mut")
 }
 
+/// Whether a variant carries `#[default]` — the marker selecting a `#[bstack_enum]`'s
+/// default variant. Since the macro replaces the source enum, rustc's own
+/// `#[derive(Default)]` never sees this; the enum expander parses it and emits
+/// `impl Default for <Enum>Data` for the marked (unit) variant.
+pub(crate) fn is_default_variant(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .filter_map(|a| a.path().get_ident())
+        .any(|id| id == "default")
+}
+
 /// Whether a field is annotated `#[bstack_static]`, marking it a class variable
 /// (RTTI-only, stored inline in the schema record, not a per-instance field).
 pub(crate) fn is_bstack_static(attrs: &[syn::Attribute]) -> bool {

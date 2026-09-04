@@ -1,0 +1,6 @@
+error: [BSTACK0207] multiple `#[default]` variants in a `#[bstack_enum]`; mark exactly one
+ --> tests/hypercube/ui/enum_default_multiple.rs:7:5
+  |
+7 | /     #[default]
+8 | |     B,
+  | |_____^

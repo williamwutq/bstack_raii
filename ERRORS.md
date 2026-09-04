@@ -164,6 +164,16 @@ An ownership annotation was placed on a unit, multi-field tuple, or struct varia
 Only a single-field tuple variant may be annotated. **Fix:** e.g. `#[bstack_owned] V(T)`;
 unit / multi-field / struct variants are POD aggregates and take no annotation.
 
+### BSTACK0206 — `#[default]` on a non-unit variant
+`#[default]` is on a variant that carries a payload. The generated
+`impl Default for <Enum>Data` takes no allocator, so it can only return a **unit**
+variant. **Fix:** move `#[default]` to a unit variant, or construct the payload-bearing
+variant with `<Enum>::new(allocator, ..)`.
+
+### BSTACK0207 — multiple `#[default]` variants
+More than one variant of a `#[bstack_enum]` is marked `#[default]`. **Fix:** mark exactly
+one variant (the one `<Enum>Data::default()` should return).
+
 ---
 
 ## Cross-file pointers — `Foreign<T>` (`03xx`)

@@ -2400,6 +2400,79 @@ fn macro_enum_rc_weak() {
 }
 
 // --------------------------------------------------------------------------
+// #[default] on a #[bstack_enum] unit variant -> generated impl Default for
+// <Enum>Data (the owned sum type), selecting that variant.
+// --------------------------------------------------------------------------
+
+#[bstack_enum]
+enum DefKind {
+    Num(u32),
+    #[default]
+    Nothing,
+    #[bstack_owned]
+    Child(MacroLeaf),
+}
+
+// A strong variant makes `<Enum>Data` generic (`<'e, A>`); a unit `#[default]` must
+// still yield a clean `impl Default` there.
+#[bstack_enum]
+enum DefKindRc {
+    #[default]
+    Nil,
+    #[bstack_strong]
+    Shared(MacroStrongChild),
+}
+
+#[test]
+fn macro_enum_default_variant() {
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
+
+    // Non-generic `<Enum>Data`: `Default::default()` is the marked unit variant, and it
+    // constructs + reads back as that variant.
+    assert!(matches!(DefKindData::default(), DefKindData::Nothing));
+    let e = DefKind::new(&alloc, DefKindData::default()).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        DefKindView::Nothing
+    ));
+    e.bstack_drop(&alloc).unwrap();
+
+    // The enum's other variants are unaffected (POD + owned still construct/read).
+    let e = DefKind::new(&alloc, DefKindData::Num(7)).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        DefKindView::Num(7)
+    ));
+    e.bstack_drop(&alloc).unwrap();
+    let leaf = MacroLeaf::new(&alloc, 3).unwrap();
+    let e = DefKind::new(&alloc, DefKindData::Child(leaf)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        DefKindView::Child(c) => assert_eq!(c.get_val(stack).unwrap(), 3),
+        _ => panic!("expected Child"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+
+    // Generic `<Enum>Data<'e, A>` (a strong variant is present): `Default` still works,
+    // with `A` inferred through `new`'s allocator.
+    let e = DefKindRc::new(&alloc, Default::default()).unwrap();
+    assert!(matches!(
+        e.handle().read(&alloc).unwrap(),
+        DefKindRcView::Nil
+    ));
+    e.bstack_drop(&alloc).unwrap();
+    // ...and the strong variant still works.
+    let child = MacroStrongChild::new(&alloc, 11).unwrap();
+    let e = DefKindRc::new(&alloc, DefKindRcData::Shared(child)).unwrap();
+    match e.handle().read(&alloc).unwrap() {
+        DefKindRcView::Shared(c) => assert_eq!(c.get_val(stack).unwrap(), 11),
+        _ => panic!("expected Shared"),
+    }
+    e.bstack_drop(&alloc).unwrap();
+}
+
+// --------------------------------------------------------------------------
 // #[bstack_strong] / #[bstack_weak] enum variants — a variant holding a shared
 // or weak reference (MacroStrongChild is #[bstack_block(rc, weak)]).
 // --------------------------------------------------------------------------

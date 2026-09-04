@@ -625,6 +625,24 @@ Enums take the same tag controls as structs: `tag = "…"`, `ctrl_tag = "…"` (
 `(rc, weak)`), and `allow(overlong_tag)` — e.g.
 `#[bstack_enum(repr(u64), rc, weak, tag = "NODE")]`.
 
+#### Default variant
+
+Mark one **unit** variant `#[default]` to generate `impl Default for <Enum>Data` (the
+owned sum type) returning it — the analog of `#[derive(Default)]` on a plain enum. Since
+the macro replaces the `enum`, rustc's own derive can't see the marker, so the macro
+emits the impl itself. `Default::default()` takes no allocator, so only a **unit** variant
+qualifies (`[BSTACK0206]` otherwise), and at most one may be marked (`[BSTACK0207]`):
+
+```rust
+#[bstack_enum]
+enum Node {
+    #[default]
+    Empty,
+    Num(u32),
+}
+let node = Node::new(&alloc, NodeData::default())?; // NodeData::Empty
+```
+
 ### Field types
 
 `Vec<T>`, `String`, and `Option<…>` in a field are **recognized spellings**, not
