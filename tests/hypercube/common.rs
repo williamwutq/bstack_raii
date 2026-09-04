@@ -85,10 +85,10 @@ where
     T: BStackDrop,
 {
     build().bstack_drop(alloc).unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     build().bstack_drop(alloc).unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "teardown leaked (non-recursive?)"
     );

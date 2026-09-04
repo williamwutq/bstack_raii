@@ -145,7 +145,7 @@ fn build_fixture() -> Fixture {
         ord_of::<RcHolder>(&reg),
         ord_of::<WeakHolder>(&reg),
     ];
-    let file_len = alloc.stack().len().unwrap();
+    let file_len = alloc.len().unwrap();
 
     Fixture {
         reg,

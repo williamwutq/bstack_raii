@@ -245,6 +245,10 @@ impl<'a, T, A: BStackRaiiAllocator> BStackVec<'a, T, A> {
 
     /// Reconstruct the `BStackByteVec` over the current data block.
     fn bytes(&self) -> io::Result<BStackByteVec<'a, A>> {
+        // SAFETY: `self.data` is this vector's own live data block (its `from_field` /
+        // `from_desc` construction contract). `from_raw_range` wraps that range as an
+        // owned-slice handle over `self.allocator`'s file, and `from_raw_block` rewraps
+        // it as the non-owning byte view — no new liveness/ownership claim is minted.
         let block = unsafe { BStackOwnedSlice::from_raw_range(self.allocator, self.data) };
         Ok(unsafe { BStackByteVec::from_raw_block(block) })
     }

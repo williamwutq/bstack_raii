@@ -451,12 +451,19 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
     fn edge_key(stack: &BStack, off: u64, rightmost: bool) -> io::Result<Vec<u8>> {
         let mut nb = Self::read_node(stack, off)?;
         while !nb.leaf {
+            // Corrupt data (an internal node with no children) errors here rather than
+            // panicking past the caller's node-reclaim path.
             let c = if rightmost {
-                *nb.children.last().unwrap()
+                nb.children.last()
             } else {
-                nb.children[0]
-            };
+                nb.children.first()
+            }
+            .copied()
+            .ok_or_else(|| io_error!("corrupt B-tree: internal node has no children"))?;
             nb = Self::read_node(stack, c)?;
+        }
+        if nb.keys.is_empty() {
+            return Err(io_error!("corrupt B-tree: empty leaf node"));
         }
         let i = if rightmost { nb.keys.len() - 1 } else { 0 };
         Ok(nb.keys[i].clone())
@@ -632,7 +639,16 @@ impl<K: Pod + Ord> BStackBTreeSet<K> {
             build.freed.push(root);
             let (root_nb, _) = Self::delete_bnode(&mut build, stack, nb, key)?;
             let new_root = if root_nb.keys.is_empty() {
-                if root_nb.leaf { 0 } else { root_nb.children[0] }
+                if root_nb.leaf {
+                    0
+                } else {
+                    // Corrupt data errors (reclaimed by the `Err` arm) rather than
+                    // panicking past it and leaking the path-copied nodes.
+                    *root_nb
+                        .children
+                        .first()
+                        .ok_or_else(|| io_error!("corrupt B-tree: internal node has no children"))?
+                }
             } else {
                 build.emit(&root_nb)?
             };

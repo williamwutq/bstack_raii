@@ -618,7 +618,7 @@ mod rtti_wal {
         let src_off = parent.handle().range().start();
         let _ = parent.into_inner();
 
-        let base = alloc.stack().len().unwrap();
+        let base = alloc.len().unwrap();
 
         // Crash the clone as soon as it copies its first freshly-allocated block, and keep
         // failing so the in-process abandon (`finish_at_locked`) cannot reclaim either.
@@ -634,7 +634,7 @@ mod rtti_wal {
 
         // The clone allocated at least one block before the crash; it grew the file and was
         // left orphaned (the in-process cleanup was also crashed).
-        let grown = alloc.stack().len().unwrap();
+        let grown = alloc.len().unwrap();
         assert!(grown > base, "the clone never allocated a block to orphan");
 
         // Reopen and complete the crash-left transaction: the orphaned clone block(s) are

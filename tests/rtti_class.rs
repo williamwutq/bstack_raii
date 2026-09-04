@@ -584,9 +584,9 @@ fn interpret_teardown_reclaims_owned_tree() {
     // identical build + RTTI teardown and assert the stack returned to baseline —
     // so teardown reclaimed the root *and* the owned child, with nothing leaked.
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    assert_eq!(alloc.stack().len().unwrap(), base, "RTTI teardown leaked");
+    assert_eq!(alloc.len().unwrap(), base, "RTTI teardown leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -609,10 +609,10 @@ fn interpret_teardown_strong_rc() {
     };
 
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "strong(rc) teardown leaked"
     );
@@ -638,10 +638,10 @@ fn interpret_teardown_strong_rc_weak() {
     };
 
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "strong(rc,weak) teardown leaked"
     );
@@ -677,10 +677,10 @@ fn interpret_teardown_weak_field() {
     };
 
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "weak-field teardown leaked"
     );
@@ -710,9 +710,9 @@ fn interpret_teardown_reclaims_vec_array_and_option() {
     };
 
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    assert_eq!(alloc.stack().len().unwrap(), base, "RTTI teardown leaked");
+    assert_eq!(alloc.len().unwrap(), base, "RTTI teardown leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -812,9 +812,9 @@ fn interpret_clone_then_teardown_reclaims() {
     };
 
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
-    assert_eq!(alloc.stack().len().unwrap(), base, "clone/teardown leaked");
+    assert_eq!(alloc.len().unwrap(), base, "clone/teardown leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -848,9 +848,9 @@ fn interpret_clone_shares_strong() {
     };
 
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
-    assert_eq!(alloc.stack().len().unwrap(), base, "strong clone leaked");
+    assert_eq!(alloc.len().unwrap(), base, "strong clone leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -1057,9 +1057,9 @@ fn interpret_move_out_owned() {
         unsafe { reg.teardown(&alloc, pord, inner.offset()) }.unwrap();
     };
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
-    assert_eq!(alloc.stack().len().unwrap(), base, "move_out leaked");
+    assert_eq!(alloc.len().unwrap(), base, "move_out leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -1100,9 +1100,9 @@ fn interpret_move_out_embed_materializes() {
         unsafe { reg.teardown(&alloc, pord, e.offset()) }.unwrap();
     };
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
-    assert_eq!(alloc.stack().len().unwrap(), base, "embed move_out leaked");
+    assert_eq!(alloc.len().unwrap(), base, "embed move_out leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -1385,12 +1385,12 @@ fn interpret_teardown_foreign_owned_across_files() {
         .unwrap()
         .bstack_drop(&foreign)
         .unwrap();
-    let base = foreign.stack().len().unwrap();
+    let base = foreign.len().unwrap();
     let leaf = Point::new(&foreign, 88, 99).unwrap();
     let leaf_off = BStackBlock::range(leaf.handle()).start();
     // The leaf reuses the slot the WAL warmup above freed, so the file need not
     // grow past `base`; it must not shrink.
-    assert!(foreign.stack().len().unwrap() >= base);
+    assert!(foreign.len().unwrap() >= base);
 
     // Attach the foreign file to the process-wide registry (tolerant of a prior init).
     let reg_file = temp_path("ftd_reg");
@@ -1446,13 +1446,13 @@ fn interpret_teardown_foreign_strong_across_files() {
         .unwrap()
         .bstack_drop(&foreign)
         .unwrap();
-    let base = foreign.stack().len().unwrap();
+    let base = foreign.len().unwrap();
     let cell = RCell::new(&foreign, 88).unwrap();
     let cell_off = cell.handle().range().start();
     std::mem::forget(cell);
     // The leaf reuses the slot the WAL warmup above freed, so the file need not
     // grow past `base`; it must not shrink.
-    assert!(foreign.stack().len().unwrap() >= base);
+    assert!(foreign.len().unwrap() >= base);
 
     let reg_file = temp_path("fst_reg");
     let _ = registry::init(&reg_file);
@@ -1726,7 +1726,7 @@ fn interpret_foreign_vec_teardown_across_files() {
         .unwrap()
         .bstack_drop(&foreign)
         .unwrap();
-    let base = foreign.stack().len().unwrap();
+    let base = foreign.len().unwrap();
     let mut offs = Vec::new();
     for i in 0..3u32 {
         let p = Point::new(&foreign, 10 + i, 20 + i).unwrap();
@@ -1734,7 +1734,7 @@ fn interpret_foreign_vec_teardown_across_files() {
     }
     // The leaf reuses the slot the WAL warmup above freed, so the file need not
     // grow past `base`; it must not shrink.
-    assert!(foreign.stack().len().unwrap() >= base);
+    assert!(foreign.len().unwrap() >= base);
 
     let reg_file = temp_path("fvect_reg");
     let _ = registry::init(&reg_file);
@@ -1930,7 +1930,7 @@ fn interpret_foreign_tuple_across_files() {
         .unwrap()
         .bstack_drop(&foreign)
         .unwrap();
-    let base = foreign.stack().len().unwrap();
+    let base = foreign.len().unwrap();
     let p = Point::new(&foreign, 5, 6).unwrap();
     let po = BStackBlock::range(p.handle()).start();
 
@@ -2097,10 +2097,10 @@ fn interpret_enum_owned_vec_variant() {
         unsafe { reg.teardown(&alloc, ord, o) }.unwrap();
     };
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "owned-vec enum variant teardown leaked"
     );
@@ -2128,7 +2128,7 @@ fn interpret_enum_foreign_vec_variant_across_files() {
         .unwrap()
         .bstack_drop(&foreign)
         .unwrap();
-    let base = foreign.stack().len().unwrap();
+    let base = foreign.len().unwrap();
     let mut offs = Vec::new();
     for i in 0..3u32 {
         let p = Point::new(&foreign, 10 + i, 20 + i).unwrap();
@@ -2334,10 +2334,10 @@ fn interpret_move_out_rc_try_unwrap() {
         std::mem::forget(c);
     };
     cycle(&alloc); // warm
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle(&alloc);
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "(rc,weak) move_out leaked the control block"
     );
@@ -2511,10 +2511,10 @@ fn interpret_option_foreign_self_niche() {
         unsafe { reg.teardown(&alloc, ord, o) }.unwrap();
     };
     cycle();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     cycle();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "present Option<Foreign> target leaked on teardown"
     );

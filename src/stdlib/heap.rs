@@ -442,7 +442,7 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBlock for BStackBinaryHeap<K, V> {
             let arr_size = len
                 .checked_mul(stride)
                 .ok_or_else(|| io_error!("heap length overflow"))?;
-            if arr_size > allocator.stack().len()? {
+            if arr_size > allocator.len()? {
                 return Err(io_error!("heap element array larger than the stack"));
             }
             let mut image = vec![0u8; arr_size as usize];

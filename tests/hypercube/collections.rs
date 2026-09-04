@@ -2242,10 +2242,10 @@ fn stdlib_in_block_fields_on_bulk_allocator() {
 
     // Warm, baseline, then build + tear the identical structure twice.
     build_collection_fields(&alloc).bstack_drop(&alloc).unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     build_collection_fields(&alloc).bstack_drop(&alloc).unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "bulk teardown leaked a collection's block"
     );
@@ -2611,7 +2611,7 @@ fn embed_collection_move_rehomes() {
         let (m, _) = bstack_move!(build_emb_collection_holder(&alloc), &alloc).unwrap();
         m.bstack_drop(&alloc).unwrap();
     }
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
 
     // bstack_move! re-homes the descriptor to a fresh standalone deque block;
     // the parent shell is freed, so nothing is double-freed later.
@@ -2622,7 +2622,7 @@ fn embed_collection_move_rehomes() {
     // them (build -> move -> drop the moved child must return to baseline).
     moved.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "move re-homed the embedded deque but leaked its ring or elements"
     );
@@ -2682,7 +2682,7 @@ fn embed_list_clone_is_independent() {
         let g = MacroLeaf::new(&alloc, 0).unwrap();
         g.bstack_drop(&alloc).unwrap();
     }
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
 
     let h = {
         let l = BStackLinkedList::<MacroLeaf>::new(&alloc).unwrap();
@@ -2698,7 +2698,7 @@ fn embed_list_clone_is_independent() {
     h.bstack_drop(&alloc).unwrap();
     c.bstack_drop(&alloc).unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "embedded list clone aliased the source's out-of-line nodes/elements"
     );

@@ -142,7 +142,7 @@ fn main() -> io::Result<()> {
 
     // --- cross-file teardown reclaims the store -----------------------------
 
-    let frontier = store.stack().len()?; // the store's high-water mark right now
+    let frontier = store.len()?; // the store's high-water mark right now
 
     // Tear everything down. Each owned foreign pointer frees its target back in
     // the store file — the catalog never touches the store's bytes directly.

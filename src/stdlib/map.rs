@@ -513,7 +513,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
         let table_size = cap
             .checked_mul(stride)
             .ok_or_else(|| io_error!("hash map capacity overflow"))?;
-        if table_size > allocator.stack().len()? {
+        if table_size > allocator.len()? {
             return Err(io_error!("hash map bucket block larger than the stack"));
         }
         let mut image = vec![0u8; table_size as usize];
@@ -556,7 +556,7 @@ impl<K: Pod, V: BStackBlock> BStackBlock for BStackHashMap<K, V> {
             let table_size = cap
                 .checked_mul(stride)
                 .ok_or_else(|| io_error!("hash map capacity overflow"))?;
-            if table_size > allocator.stack().len()? {
+            if table_size > allocator.len()? {
                 return Err(io_error!("hash map bucket block larger than the stack"));
             }
             let mut image = vec![0u8; table_size as usize];
@@ -642,7 +642,16 @@ impl<'a, K: Pod, V: BStackBlock> Iterator for HashMapIter<'a, K, V> {
             let i = self.idx;
             self.idx += 1;
             let buf = self.scratch.buf(self.stride as usize);
-            if let Err(e) = self.stack.get_into(self.table + i * self.stride, buf) {
+            // Checked bucket address (matches every other table access); a wrap on a
+            // corrupt `cap`/`stride` snapshot errors rather than reading a stray offset.
+            let bucket = match checked_off_mul(self.table, i, self.stride) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.idx = self.cap;
+                    return Some(Err(e));
+                }
+            };
+            if let Err(e) = self.stack.get_into(bucket, buf) {
                 self.idx = self.cap;
                 return Some(Err(e));
             }

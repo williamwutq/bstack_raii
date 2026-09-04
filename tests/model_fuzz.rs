@@ -232,13 +232,13 @@ fn run_once<A: BStackRaiiAllocator>(ops: &[Op], alloc: &A) {
 /// tolerating benign bounded oscillation.
 fn run_sequence<A: BStackRaiiAllocator>(ops: &[Op], alloc: &A) {
     run_once(ops, alloc);
-    let len1 = alloc.stack().len().unwrap();
+    let len1 = alloc.len().unwrap();
     run_once(ops, alloc);
-    let len2 = alloc.stack().len().unwrap();
+    let len2 = alloc.len().unwrap();
     let ceiling = len1.max(len2);
     for _ in 0..2 {
         run_once(ops, alloc);
-        let len = alloc.stack().len().unwrap();
+        let len = alloc.len().unwrap();
         assert!(
             len <= ceiling,
             "op sequence leaked: length grew past the first two passes' ceiling \

@@ -179,6 +179,11 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         if self.offset().is_null() {
             return Ok(None);
         }
+        // SAFETY: the pointer is non-null (checked above) and, by this `Foreign`'s
+        // construction contract, `self.range()` names a live `T` in its target file —
+        // exactly the file whose stack `f` is invoked with below (the local stack for a
+        // SELF pointer, else the resolved host's). `from_range` builds only an offset
+        // handle; the read happens through that matching stack.
         let t = unsafe { T::from_range(self.range()) };
         if self.inner.is_self() {
             Ok(Some(f(t, local.stack())))
@@ -223,6 +228,11 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
         if self.offset().is_null() {
             return Ok(None);
         }
+        // SAFETY: the pointer is non-null (checked above) and, by this `Foreign`'s
+        // construction contract, `self.range()` names a live `T` in its target file —
+        // exactly the file whose stack `f` is invoked with below (the local stack for a
+        // SELF pointer, else the resolved host's). `from_range` builds only an offset
+        // handle; the read happens through that matching stack.
         let t = unsafe { T::from_range(self.range()) };
         if self.inner.is_self() {
             Ok(Some(f(t, local.stack())))

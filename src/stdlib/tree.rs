@@ -574,9 +574,19 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     fn max_entry(stack: &BStack, off: u64) -> io::Result<(Vec<u8>, u64)> {
         let mut nb = Self::read_node(stack, off)?;
         while !nb.leaf {
-            nb = Self::read_node(stack, *nb.children.last().unwrap())?;
+            // Corrupt data (an internal node with no children) errors here rather than
+            // panicking past the caller's node-reclaim path.
+            let child = *nb
+                .children
+                .last()
+                .ok_or_else(|| io_error!("corrupt B-tree: internal node has no children"))?;
+            nb = Self::read_node(stack, child)?;
         }
-        let i = nb.keys.len() - 1;
+        let i = nb
+            .keys
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| io_error!("corrupt B-tree: empty leaf node"))?;
         Ok((nb.keys[i].clone(), nb.vals[i]))
     }
 
@@ -584,7 +594,14 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     fn min_entry(stack: &BStack, off: u64) -> io::Result<(Vec<u8>, u64)> {
         let mut nb = Self::read_node(stack, off)?;
         while !nb.leaf {
-            nb = Self::read_node(stack, nb.children[0])?;
+            let child = *nb
+                .children
+                .first()
+                .ok_or_else(|| io_error!("corrupt B-tree: internal node has no children"))?;
+            nb = Self::read_node(stack, child)?;
+        }
+        if nb.keys.is_empty() {
+            return Err(io_error!("corrupt B-tree: empty leaf node"));
         }
         Ok((nb.keys[0].clone(), nb.vals[0]))
     }
@@ -791,10 +808,21 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
             let nb = Self::read_node(stack, root)?;
             build.freed.push(root);
             let (root_nb, val) = Self::delete_bnode(&mut build, stack, nb, key)?;
-            let val = val.expect("key was present");
+            // `get` above confirmed the key is present, so `None` here means the on-disk
+            // structure is corrupt/inconsistent — return an error (which the `Err` arm
+            // below reclaims `build.writes` through) rather than panicking past the
+            // reclaim and leaking the path-copied nodes.
+            let val = val.ok_or_else(|| io_error!("corrupt B-tree: key vanished mid-delete"))?;
             // Collapse an empty root: a leaf → empty tree; an internal → its child.
             let new_root = if root_nb.keys.is_empty() {
-                if root_nb.leaf { 0 } else { root_nb.children[0] }
+                if root_nb.leaf {
+                    0
+                } else {
+                    *root_nb
+                        .children
+                        .first()
+                        .ok_or_else(|| io_error!("corrupt B-tree: internal node has no children"))?
+                }
             } else {
                 build.emit(&root_nb)?
             };

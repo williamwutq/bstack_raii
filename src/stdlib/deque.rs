@@ -609,7 +609,7 @@ impl<T: BStackBlock> BStackBlock for BStackDeque<T> {
         let ring_bytes = len
             .checked_mul(8)
             .ok_or_else(|| io_error!("deque length overflow"))?;
-        if ring_bytes > allocator.stack().len()? {
+        if ring_bytes > allocator.len()? {
             return Err(io_error!("deque length larger than the stack"));
         }
         // Deep-clone each element (in logical order) into the plan.

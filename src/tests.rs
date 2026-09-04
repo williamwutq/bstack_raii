@@ -110,10 +110,10 @@ fn assert_teardown_reclaims<T: BStackDrop>(
     mut build: impl FnMut() -> T,
 ) {
     build().bstack_drop(alloc).unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     build().bstack_drop(alloc).unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "teardown leaked (non-recursive?)"
     );
@@ -458,10 +458,10 @@ fn macro_recursive_drop_on_bulk_allocator() {
         MacroParent::new(&alloc, leaf, 7).unwrap()
     };
     build().bstack_drop(&alloc).unwrap();
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
     build().bstack_drop(&alloc).unwrap();
     assert_eq!(
-        alloc.stack().len().unwrap(),
+        alloc.len().unwrap(),
         base,
         "bulk teardown leaked (child not freed by dealloc_bulk?)"
     );
@@ -1500,7 +1500,7 @@ fn ctor_failure_hands_back_consumed_child() {
 
         // Warm up the WAL machinery once (its persistent block is a fixed cost).
         let _ = MacroLeaf::new(&alloc, 1).unwrap().bstack_drop(&alloc);
-        let baseline = alloc.stack().len().unwrap();
+        let baseline = alloc.len().unwrap();
 
         let mut faults = 0u32;
         for _ in 0..40 {
@@ -1533,7 +1533,7 @@ fn ctor_failure_hands_back_consumed_child() {
         // Bounded: dropping each handed-back child (above) reclaims its block, so
         // the file stays within a small constant of baseline; leaving them (an
         // orphaning ctor) would be ~40 child blocks of growth.
-        let grown = alloc.stack().len().unwrap().saturating_sub(baseline);
+        let grown = alloc.len().unwrap().saturating_sub(baseline);
         let child_sz = size_of::<<MacroLeaf as BStackBlock>::OnDisk>() as u64;
         assert!(
             grown < 4 * child_sz,
@@ -3223,7 +3223,7 @@ fn wal_clone_descent_orphans_reclaimed_by_finish() {
 
     let tmp = TempStack::new();
     let alloc = tmp.allocator(); // FirstFit names a WAL anchor
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
 
     {
         let mut plan = ClonePlan::new();
@@ -3233,7 +3233,7 @@ fn wal_clone_descent_orphans_reclaimed_by_finish() {
         // releases as the plan drops; the two orphans remain logged `Pending`.
     }
     assert!(
-        alloc.stack().len().unwrap() > base,
+        alloc.len().unwrap() > base,
         "descent allocated its blocks (+ the WAL block)"
     );
 
@@ -7341,10 +7341,10 @@ fn macro_foreign_owned_teardown_reclaims_across_files() {
     let foreign_alloc = foreign.allocator();
 
     // Baseline foreign length, then allocate the owned target in the foreign file.
-    let base = foreign_alloc.stack().len().unwrap();
+    let base = foreign_alloc.len().unwrap();
     let leaf = MacroLeaf::new(&foreign_alloc, 88).unwrap();
     let off = leaf.handle().range().start();
-    let grown = foreign_alloc.stack().len().unwrap();
+    let grown = foreign_alloc.len().unwrap();
     assert!(grown > base, "target should have grown the foreign file");
 
     // Global registry + attach the foreign file (tolerant of a prior init; several
@@ -7391,10 +7391,10 @@ fn foreign_owned_move_then_bstack_drop_reclaims_across_files() {
     let foreign = TempStack::new();
     let foreign_alloc = foreign.allocator();
 
-    let base = foreign_alloc.stack().len().unwrap();
+    let base = foreign_alloc.len().unwrap();
     let leaf = MacroLeaf::new(&foreign_alloc, 88).unwrap();
     let off = leaf.handle().range().start();
-    let grown = foreign_alloc.stack().len().unwrap();
+    let grown = foreign_alloc.len().unwrap();
     assert!(grown > base, "target should have grown the foreign file");
 
     let reg_file = TempStack::new();
@@ -7508,7 +7508,7 @@ fn foreign_owned_into_local_owned_self_resolves_and_frees() {
         let g = MacroLeaf::new(&alloc, 0).unwrap();
         g.bstack_drop(&alloc).unwrap();
     }
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
 
     // Allocate the target and hand its ownership to the holder via a SELF foreign
     // (`into_inner` relinquishes the `BStackOwned`, so there is a single owner).
@@ -7536,7 +7536,7 @@ fn foreign_owned_into_local_owned_self_resolves_and_frees() {
     local.bstack_drop(&alloc).unwrap();
 
     assert!(
-        alloc.stack().len().unwrap() <= base,
+        alloc.len().unwrap() <= base,
         "into_local + bstack_drop must reclaim the target"
     );
 }
@@ -7554,7 +7554,7 @@ fn foreign_rc_into_local_rc_self_resolves_and_frees() {
         let g = MacroLeaf::new(&alloc, 0).unwrap();
         g.bstack_drop(&alloc).unwrap();
     }
-    let base = alloc.stack().len().unwrap();
+    let base = alloc.len().unwrap();
 
     let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
     let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
@@ -7581,7 +7581,7 @@ fn foreign_rc_into_local_rc_self_resolves_and_frees() {
     drop(local);
 
     assert!(
-        alloc.stack().len().unwrap() <= base,
+        alloc.len().unwrap() <= base,
         "into_local + drop must reclaim the shared target"
     );
 }
@@ -7725,7 +7725,7 @@ fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
     let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
 
     // A shared target in the foreign file: strong = 1, weak = 1, back-pointer wired.
-    let base = foreign_alloc.stack().len().unwrap();
+    let base = foreign_alloc.len().unwrap();
     let data = alloc_block(&foreign_alloc, MacroStrongChild::eightcc(), data_size).unwrap();
     let ctrl = alloc_control(&foreign_alloc, ctrl_tag(), data, ctrl_size).unwrap();
     let data_off = data.start();
@@ -7734,7 +7734,7 @@ fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
         crate::io_core::refcount::load(foreign_alloc.stack(), nn(strong_off)).unwrap(),
         1
     );
-    let grown = foreign_alloc.stack().len().unwrap();
+    let grown = foreign_alloc.len().unwrap();
     assert!(grown > base);
 
     let reg_file = TempStack::new();
@@ -7812,8 +7812,8 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
         .bstack_drop(&*arc_b)
         .unwrap();
     }
-    let base_a = arc_a.stack().len().unwrap();
-    let base_b = arc_b.stack().len().unwrap();
+    let base_a = arc_a.len().unwrap();
+    let base_b = arc_b.len().unwrap();
 
     const N: usize = 48;
     const ROUNDS: usize = 3;
@@ -7880,12 +7880,12 @@ fn macro_foreign_concurrent_ab_ba_teardown() {
         // Both files returned exactly to baseline: every holder shell AND every
         // cross-file target was reclaimed, with no leak and no corruption.
         assert_eq!(
-            arc_a.stack().len().unwrap(),
+            arc_a.len().unwrap(),
             base_a,
             "file A not fully reclaimed after concurrent AB-BA teardown"
         );
         assert_eq!(
-            arc_b.stack().len().unwrap(),
+            arc_b.len().unwrap(),
             base_b,
             "file B not fully reclaimed after concurrent AB-BA teardown"
         );
@@ -7933,7 +7933,7 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
         h0.bstack_drop(&home_alloc).unwrap();
         c0.bstack_drop(&home_alloc).unwrap();
     }
-    let base_b = arc_b.stack().len().unwrap();
+    let base_b = arc_b.len().unwrap();
 
     // The real target + home holder owning it.
     let leaf = MacroLeaf::new(&*arc_b, 42).unwrap();
@@ -7971,7 +7971,7 @@ fn macro_foreign_owned_clone_deep_copies_across_files() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base_b,
         "clone+teardown leaked or double-freed on the foreign file"
     );
@@ -8019,7 +8019,7 @@ fn macro_foreign_owned_clone_on_bulk_home_copies_once() {
             .unwrap();
         h0.bstack_drop(&home_alloc).unwrap();
     }
-    let base_b = arc_b.stack().len().unwrap();
+    let base_b = arc_b.len().unwrap();
 
     let leaf = MacroLeaf::new(&*arc_b, 42).unwrap();
     let off = leaf.handle().range().start();
@@ -8053,7 +8053,7 @@ fn macro_foreign_owned_clone_on_bulk_home_copies_once() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base_b,
         "measure pass double-cloned the foreign target (guard missing/broken)"
     );
@@ -8079,7 +8079,7 @@ fn macro_foreign_strong_clone_bumps_count_across_files() {
     let data_size = size_of::<<MacroStrongChild as BStackBlock>::OnDisk>() as u64;
     let ctrl_size = size_of::<<MacroStrongChild as BStackWeakable>::Control>() as u64;
 
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
     let data = alloc_block(&*arc_b, MacroStrongChild::eightcc(), data_size).unwrap();
     let ctrl = alloc_control(&*arc_b, ctrl_tag(), data, ctrl_size).unwrap();
     let data_off = data.start();
@@ -8110,7 +8110,7 @@ fn macro_foreign_strong_clone_bumps_count_across_files() {
     assert_eq!(load(strong_off), 1);
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "target should be reclaimed once both strong owners drop"
     );
@@ -8216,8 +8216,8 @@ fn macro_foreign_concurrent_ab_ba_clone() {
             .unwrap();
         h.bstack_drop(&**ha).unwrap();
     }
-    let base_a = arc_a.stack().len().unwrap();
-    let base_b = arc_b.stack().len().unwrap();
+    let base_a = arc_a.len().unwrap();
+    let base_b = arc_b.len().unwrap();
 
     const N: usize = 32;
     const THREADS: usize = 4;
@@ -8293,12 +8293,12 @@ fn macro_foreign_concurrent_ab_ba_clone() {
             .unwrap();
     }
     assert_eq!(
-        arc_a.stack().len().unwrap(),
+        arc_a.len().unwrap(),
         base_a,
         "file A not fully reclaimed after concurrent AB-BA clone"
     );
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base_b,
         "file B not fully reclaimed after concurrent AB-BA clone"
     );
@@ -8340,7 +8340,7 @@ fn macro_foreign_vec_owned_across_files() {
         c.bstack_drop(&home_alloc).unwrap();
         h.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     // N owned foreign targets on B.
     const N: u32 = 5;
@@ -8384,7 +8384,7 @@ fn macro_foreign_vec_owned_across_files() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "foreign-vec clone/teardown leaked or double-freed on B"
     );
@@ -8427,8 +8427,8 @@ fn macro_foreign_vec_owned_move_yields_dual_vec() {
             d.bstack_drop(&home_alloc).unwrap();
         }
     }
-    let base_b = arc_b.stack().len().unwrap();
-    let base_home = home_alloc.stack().len().unwrap();
+    let base_b = arc_b.len().unwrap();
+    let base_home = home_alloc.len().unwrap();
 
     const N: u32 = 4;
     let mut links = Vec::new();
@@ -8459,9 +8459,9 @@ fn macro_foreign_vec_owned_move_yields_dual_vec() {
 
     // The move freed the parent shell + the `WidePtr` storage block; dropping the
     // duals freed the targets. Both files return to baseline — nothing leaked.
-    assert_eq!(arc_b.stack().len().unwrap(), base_b, "targets leaked on B");
+    assert_eq!(arc_b.len().unwrap(), base_b, "targets leaked on B");
     assert_eq!(
-        home_alloc.stack().len().unwrap(),
+        home_alloc.len().unwrap(),
         base_home,
         "parent shell or the WidePtr storage block leaked on home"
     );
@@ -8501,7 +8501,7 @@ fn macro_foreign_array_owned_across_files() {
         c.bstack_drop(&home_alloc).unwrap();
         h.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     let h = ForeignArrHolder::new(&home_alloc, 7, [mk(10), mk(20), mk(30)]).unwrap();
     let got = h.handle().get_links(hstack).unwrap();
@@ -8534,7 +8534,7 @@ fn macro_foreign_array_owned_across_files() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "foreign-array clone/teardown leaked or double-freed on B"
     );
@@ -8630,7 +8630,7 @@ fn macro_foreign_generic_across_files() {
         c.bstack_drop(&home_alloc).unwrap();
         h.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     let l = MacroLeaf::new(&*arc_b, 55).unwrap();
     let off = l.handle().range().start();
@@ -8661,7 +8661,7 @@ fn macro_foreign_generic_across_files() {
     // Teardown both → both leaves reclaimed → baseline.
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
-    assert_eq!(arc_b.stack().len().unwrap(), base);
+    assert_eq!(arc_b.len().unwrap(), base);
 
     // The generic vector form compiles + tears down (empty ⇒ self-contained).
     let gv = GenForeignVec::<MacroLeaf>::new(&home_alloc, vec![]).unwrap();
@@ -8826,7 +8826,7 @@ fn macro_foreign_in_enum_across_files() {
         c.bstack_drop(&home_alloc).unwrap();
         e.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     let e = ForeignEnum::new(&home_alloc, ForeignEnumData::Far(mk(77))).unwrap();
     let off = match e.handle().read(&home_alloc).unwrap() {
@@ -8861,7 +8861,7 @@ fn macro_foreign_in_enum_across_files() {
     e.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "foreign enum variant leaked or double-freed on B"
     );
@@ -9009,7 +9009,7 @@ fn macro_foreign_tuple_in_enum_variant() {
             .unwrap();
         e.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     let e = ForeignTupEnum::new(
         &home_alloc,
@@ -9050,7 +9050,7 @@ fn macro_foreign_tuple_in_enum_variant() {
     e.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "foreign tuple-in-enum variant leaked"
     );
@@ -9098,7 +9098,7 @@ fn macro_foreign_enum_container_variants() {
             .unwrap();
         e.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     // Vec variant.
     let e = ForeignContainerEnum::new(
@@ -9147,7 +9147,7 @@ fn macro_foreign_enum_container_variants() {
     c.bstack_drop(&home_alloc).unwrap();
 
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "enum foreign container variant leaked"
     );
@@ -9254,7 +9254,7 @@ fn macro_foreign_in_tuple_across_files() {
         c.bstack_drop(&home_alloc).unwrap();
         h.bstack_drop(&home_alloc).unwrap();
     }
-    let base = arc_b.stack().len().unwrap();
+    let base = arc_b.len().unwrap();
 
     let h = ForeignTupHolder::new(&home_alloc, 5, (100, mk(11)), (7, Some(mk(22)), 9)).unwrap();
 
@@ -9296,7 +9296,7 @@ fn macro_foreign_in_tuple_across_files() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base,
         "foreign-in-tuple leaked"
     );
@@ -9454,7 +9454,7 @@ fn stdlib_foreign_collection_target_clone_and_teardown() {
         h0.bstack_drop(&home_alloc).unwrap();
         c0.bstack_drop(&home_alloc).unwrap();
     }
-    let base_b = arc_b.stack().len().unwrap();
+    let base_b = arc_b.len().unwrap();
 
     // A home block owning the foreign deque.
     let h = ForeignCollectionHolder::new(&home_alloc, 7, unsafe {
@@ -9503,7 +9503,7 @@ fn stdlib_foreign_collection_target_clone_and_teardown() {
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
     assert_eq!(
-        arc_b.stack().len().unwrap(),
+        arc_b.len().unwrap(),
         base_b,
         "foreign collection clone+teardown leaked or double-freed"
     );

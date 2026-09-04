@@ -290,7 +290,7 @@ impl BStackBlock for BStackString {
         let new_data = if len != 0 {
             // See `read_bytes`: a corrupted `len` must not size an unbounded
             // allocation — bound it by the file's own size first.
-            if len > allocator.stack().len()? {
+            if len > allocator.len()? {
                 return Err(io_error!("corrupt string length exceeds file size"));
             }
             let mut bytes = vec![0u8; len as usize];
