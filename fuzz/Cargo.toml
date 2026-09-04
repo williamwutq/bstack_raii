@@ -11,13 +11,6 @@ cargo-fuzz = true
 # standard cargo-fuzz layout.
 [workspace]
 
-# FUZZ.md Lever 2: swap the crates.io `bstack` for a local vendored copy so the
-# fuzz build (and only the fuzz build — `bstack_raii`'s own Cargo.toml is
-# untouched) can turn on `debug-no-sync` below. See vendor/bstack/PIN.md for
-# the exact upstream commit this snapshot was taken from and why.
-[patch.crates-io]
-bstack = { path = "../vendor/bstack" }
-
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }

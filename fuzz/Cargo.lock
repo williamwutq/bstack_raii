@@ -19,7 +19,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bstack"
-version = "0.4.2"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3074a32b39b02ecd8768a09a6c37a5ccdffd93164127f87984c3939532260330"
 dependencies = [
  "libc",
  "windows-sys",
@@ -27,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "bstack_raii"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bstack",
  "bstack_raii_derive",
@@ -48,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "bstack_raii_derive"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",

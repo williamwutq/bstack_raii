@@ -30,11 +30,10 @@ magnitude slower. Levers:
 1. **RAM-back the files.** `/dev/shm` (Linux tmpfs); macOS needs a RAM disk
    (`diskutil erasevolume HFS+ ram `hdiutil attach -nomount ram://4096000``). One env knob on
    `TempStack` — immediate, zero coupling.
-2. **Vendor `bstack` locally for the fuzz build.** `[patch.crates-io] bstack = { path =
-   "vendor/bstack" }` (or a maintained fork branch) exposing the internal sync skip as an
-   opt-in; fuzz-only, never shipped. Preferable to blocking on upstream: full local control,
-   no dependence on a release cadence, and the durability change stays out of the published
-   crate until vetted.
+2. **Enable `bstack`'s `debug-no-sync` feature in the fuzz build only.** `fuzz/Cargo.toml`
+   turns on the published `debug-no-sync` feature (`bstack` ≥ 0.4.4), which skips the real
+   fsync in debug builds; `bstack_raii`'s own `Cargo.toml` is untouched, so the durability
+   skip never reaches the shipped crate.
 
 ## Oracles (the reusable core)
 
@@ -323,8 +322,7 @@ tests/
 ## Rollout
 
 1. **Done.** Lever 1 (RAM-backed `TempStack`, via `BSTACK_RAII_FUZZ_DIR`) and Lever 2
-   (vendored `bstack` snapshot at `vendor/bstack`, `debug-no-sync` patched into the fuzz
-   build only — see `vendor/bstack/PIN.md`).
+   (`bstack`'s published `debug-no-sync` feature enabled in the fuzz build only).
 2. **Done.** H1 (`rtti_decode`, `rtti_interpret`) — direct allocator-fuzz analog, best ROI.
    30-minute runs at ~85-93k execs/s (no-sync active) with 0 crashes across 320M execs.
 3. **Partial.** Shared `Model` + O1/O2 landed as the proptest CI mirror
