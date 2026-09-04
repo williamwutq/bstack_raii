@@ -217,7 +217,22 @@ impl Shape {
                     inner: Box::new(Shape::decode_at(r, depth + 1)?),
                 }
             }
-            t::VEC => Shape::Vec(Box::new(Shape::decode_at(r, depth + 1)?)),
+            t::VEC => {
+                let inner = Shape::decode_at(r, depth + 1)?;
+                // A Vec element must be a leaf (the derive only emits Vec<leaf> /
+                // Vec<Option<leaf>> / Vec<Foreign>). The teardown / clone Vec walks free /
+                // deep-copy per leaf element and would silently skip a nested container's
+                // owned children (a leak + shallow-alias clone), so reject a container
+                // element here rather than round-trip a shape they cannot handle.
+                if !inner.is_vec_element_leaf() {
+                    return Err(rtti_err!(
+                        Malformed,
+                        "RTTI decode: a Vec element must be a leaf reference / POD / Foreign, \
+                         not a nested container"
+                    ));
+                }
+                Shape::Vec(Box::new(inner))
+            }
             t::TUPLE => {
                 let k = need(r.u8())? as usize;
                 let items = (0..k)
@@ -678,5 +693,34 @@ mod tests {
         deep.extend_from_slice(&8u32.to_le_bytes());
         let err = Shape::decode(&mut Reader::new(&deep)).unwrap_err();
         assert!(err.to_string().contains("[BSTACK0818]"), "got: {err}");
+    }
+
+    // A hand-forged / corrupt schema can spell a `Vec` whose element is a nested
+    // container. The derive never emits that (its codegen rejects `Vec<[block; N]>` /
+    // `Vec<Vec>` / `Vec<tuple>`), and the teardown / clone `Vec` walks free / deep-copy
+    // per *leaf* element — a container element's owned children would be silently skipped
+    // (a leak + shallow-alias clone). `decode` rejects it instead.
+    #[test]
+    fn decode_rejects_vec_of_container_element() {
+        // A legitimate `Vec<Owned>` decodes fine.
+        let mut ok = vec![shape_tag::VEC, shape_tag::OWNED];
+        ok.extend_from_slice(&[b'P'; 8]); // owned tag (eightcc)
+        assert!(Shape::decode(&mut Reader::new(&ok)).is_ok());
+
+        // `Vec<[Owned; 2]>` — an array element — is refused.
+        let mut arr = vec![shape_tag::VEC, shape_tag::ARRAY];
+        arr.extend_from_slice(&2u32.to_le_bytes()); // array length
+        arr.push(shape_tag::OWNED);
+        arr.extend_from_slice(&[b'P'; 8]);
+        let err = Shape::decode(&mut Reader::new(&arr)).unwrap_err();
+        assert!(
+            err.to_string().contains("Vec element must be a leaf"),
+            "got: {err}"
+        );
+
+        // `Vec<Vec<Owned>>` is likewise refused.
+        let mut vv = vec![shape_tag::VEC, shape_tag::VEC, shape_tag::OWNED];
+        vv.extend_from_slice(&[b'P'; 8]);
+        assert!(Shape::decode(&mut Reader::new(&vv)).is_err());
     }
 }

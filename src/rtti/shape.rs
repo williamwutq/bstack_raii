@@ -104,6 +104,25 @@ impl Shape {
             other => other,
         }
     }
+
+    /// Whether this shape is a valid `Vec` **element**: a leaf reference / POD / `Foreign`
+    /// (optionally `Option`-wrapped) — one the `teardown` / `clone` per-element `Vec`
+    /// walks actually handle. A nested container (`Vec` / `Array` / `Tuple` / `Embed` /
+    /// `Class`) is **not**: those own children the flat leaf walk would silently skip
+    /// (a leak + shallow clone). The derive never emits `Vec<container>` (its codegen
+    /// rejects `Vec<[block; N]>` / `Vec<Vec>` / `Vec<tuple>`), so [`decode`](Self::decode)
+    /// rejects such a shape rather than round-trip one the interpreters cannot free.
+    pub(in crate::rtti) fn is_vec_element_leaf(&self) -> bool {
+        matches!(
+            self.peel_option(),
+            Shape::Pod { .. }
+                | Shape::Ref(_)
+                | Shape::Owned(_)
+                | Shape::Strong(_)
+                | Shape::Weak(_)
+                | Shape::Foreign { .. }
+        )
+    }
 }
 
 impl RttiRegistry {
