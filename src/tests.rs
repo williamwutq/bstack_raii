@@ -5353,25 +5353,42 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
     }
 
     let tmp = TempStack::new();
-    let alloc = tmp.allocator(); // FirstFit is a BStackRaiiAllocator
-    let stack = alloc.stack();
 
     // Source owns a child, so each deep clone allocates two blocks (+ a WAL block).
-    let leaf = MacroLeaf::new(&alloc, 7).unwrap();
-    let src = MacroParent::new(&alloc, leaf, 1).unwrap();
+    // (`BStackOwned` is a bare offset — it carries no allocator and never frees on
+    // drop — so `src` stays valid across the allocator reopens below.)
+    let src = {
+        let alloc = tmp.allocator(); // FirstFit is a BStackRaiiAllocator
+        let leaf = MacroLeaf::new(&alloc, 7).unwrap();
+        MacroParent::new(&alloc, leaf, 1).unwrap()
+    };
 
-    // Repeatedly crash the clone commit. If the orphans (and WAL block) were
-    // leaked, the committed length would climb every iteration; WAL reclamation
-    // frees them back to the free list, so growth flattens once it's warm.
+    // Repeatedly crash the clone commit. A commit fault leaves the clone's fresh
+    // blocks orphaned and — under bstack 0.4.4's FirstFit — flags the allocator
+    // `recovery_needed`, so it refuses further mutation until the file is reopened.
+    // Recovery is therefore modeled exactly as production does after a crash: drop
+    // the faulted allocator, reopen (its constructor runs FirstFit's free-list
+    // recovery and clears the flag), and run `wal::finish` to abandon the still-
+    // `Pending` clone transaction and free its orphans. If the orphans (or the WAL
+    // block) leaked, the committed length would climb every iteration; recovery
+    // frees them back, so growth flattens once it's warm.
     let mut prev: Option<u64> = None;
     for i in 0..30 {
-        stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
-        // Automatic WAL: `try_clone_in` on an anchored allocator (FirstFit) logs
-        // and reclaims its orphans with no separate opt-in call.
-        let r = src.try_clone_in(&alloc);
-        stack.set_fault_policy(None);
-        assert!(r.is_err(), "injected fault must fail the clone commit");
-        let len = stack.len().unwrap();
+        {
+            // Reopen; the fresh FirstFit recovers any prior fault on construction.
+            let alloc = tmp.allocator();
+            let stack = alloc.stack();
+            stack.set_fault_policy(Some(Arc::new(FailFirstInplaceGen(AtomicBool::new(false)))));
+            let r = src.try_clone_in(&alloc);
+            stack.set_fault_policy(None);
+            assert!(r.is_err(), "injected fault must fail the clone commit");
+            // `alloc` is now flagged `recovery_needed`; drop it so the reopen recovers.
+        }
+        // Reopen: FirstFit recovery clears the flag and rebuilds the free list; then
+        // `wal::finish` abandons the `Pending` clone txn and frees its orphan blocks.
+        let alloc = tmp.allocator();
+        crate::io_core::wal::finish(&alloc).unwrap();
+        let len = alloc.len().unwrap();
         if i >= 3 {
             assert_eq!(len, prev.unwrap(), "faulted clone leaked at iter {i}");
         }
@@ -5379,6 +5396,8 @@ fn wal_clone_reclaims_orphans_on_commit_fault() {
     }
 
     // Source intact; a real (unfaulted) clone still succeeds, reusing the space.
+    let alloc = tmp.allocator();
+    let stack = alloc.stack();
     let cl = src.try_clone_in(&alloc).unwrap();
     assert_eq!(
         cl.handle()
