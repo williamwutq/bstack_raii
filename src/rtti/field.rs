@@ -117,6 +117,29 @@ impl RttiRegistry {
         unreachable!("the last segment returns inside the loop")
     }
 
+    /// Validate that `block_off` names a live block of type `ordinal` — the precondition
+    /// the **safe** [`swap`](Self::swap) / [`swap_foreign`](Self::swap_foreign) need but
+    /// that [`resolve_field`](Self::resolve_field) does not itself check. Those two do a
+    /// raw write at `block_off + field.offset` and hand the displaced slot back as an
+    /// *owning* [`AnyRef`] / [`ForeignPtr`]; with a wrong or null `block_off` the write
+    /// lands at an arbitrary in-file location and the handed-back reference is fabricated
+    /// over arbitrary bytes, whose later safe `bstack_drop` would free storage the caller
+    /// does not own. (`set` guards the same base with its `unsafe` contract instead — it
+    /// has a *further* obligation validation can't cover: a POD image may overwrite
+    /// invariant-bearing bytes even at a correct base.) Unlike [`verify_data_block`], a
+    /// null base is rejected here: a live instance never sits at offset 0.
+    fn verify_block_of(&self, data: &BStack, block_off: u64, ordinal: RttiOrdinal) -> RttiResult<()> {
+        let off = Offset::from_raw(block_off);
+        if off.is_null() {
+            return Err(rtti_err!(
+                Mutator,
+                "RTTI mutator: block offset 0 does not name a live block"
+            ));
+        }
+        let tag = self.load_type(ordinal)?.tag;
+        verify_data_block(data, off, tag)
+    }
+
     /// Read a single field named by `path` into a [`Value`] — a targeted `get`
     /// (`read_value` scoped to one field). Follows an owning reference into its child,
     /// exactly as a full read would. A `#[bstack_static]` class variable at the path
@@ -231,6 +254,10 @@ impl RttiRegistry {
         path: &[&str],
         new: AnyRef,
     ) -> RttiResult<Option<AnyRef>> {
+        // `block_off` is caller-supplied; validate it names a live block of `ordinal`
+        // before resolving, so the raw write and the owning-`AnyRef` handback below
+        // cannot be aimed at an arbitrary in-file location (see `verify_block_of`).
+        self.verify_block_of(data, block_off, ordinal)?;
         let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             Resolved::Class { .. } => {
@@ -354,8 +381,9 @@ impl RttiRegistry {
         // displaced — never both hand back an owning `AnyRef` to the same block.
         let old_bytes = data.swap(offset, new_off.get().to_le_bytes())?;
         let old = u64::from_le_bytes(old_bytes[..8].try_into().unwrap());
-        // SAFETY: `old` was displaced from the field's own slot, which held a live
-        // target of the field's declared (schema-resolved) tag.
+        // SAFETY: `block_off` was validated (`verify_block_of`) to name a live block of
+        // `ordinal`, so `old` was displaced from that block's own field slot, which held
+        // a live target of the field's declared (schema-resolved) tag.
         Ok((old != 0).then(|| unsafe { AnyRef::new(tag, old) }))
     }
 
@@ -382,6 +410,10 @@ impl RttiRegistry {
         path: &[&str],
         new: ForeignPtr,
     ) -> RttiResult<Option<ForeignPtr>> {
+        // `block_off` is caller-supplied; validate it names a live block of `ordinal`
+        // before resolving, so the raw 16-byte write and the owning-`ForeignPtr`
+        // handback below cannot be aimed at an arbitrary in-file location.
+        self.verify_block_of(data, block_off, ordinal)?;
         let (offset, mut shape) = match self.resolve_field(data, ordinal, block_off, path)? {
             Resolved::Instance { offset, shape } => (offset, shape),
             Resolved::Class { .. } => {

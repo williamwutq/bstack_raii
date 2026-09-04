@@ -7660,6 +7660,54 @@ fn foreign_into_local_rejects_wrong_file_target() {
 }
 
 #[test]
+fn clone_lock_nested_contended_returns_wouldblock_not_deadlock() {
+    // The per-file clone lock, acquired NESTED (while this thread already holds another
+    // file's clone lock — i.e. the descent reached a `Foreign` child in a second file),
+    // must never *block* on a lock another thread holds. Otherwise two cross-file clones
+    // acquiring two files in opposite order (A→B vs B→A) deadlock permanently. Instead it
+    // returns a retryable `WouldBlock`. This is the structural guarantee that makes the
+    // AB↔BA clone deadlock impossible; the same-file self-cycle guard cannot see it.
+    use crate::io_core::wal::HeldLock;
+    use std::sync::mpsc;
+
+    let a = TempStack::new();
+    let b = TempStack::new();
+    let alloc_a = a.allocator();
+    let alloc_b = b.allocator();
+
+    let (held_tx, held_rx) = mpsc::channel::<()>(); // T2 → main: "I hold B"
+    let (release_tx, release_rx) = mpsc::channel::<()>(); // main → T2: "you may release B"
+
+    std::thread::scope(|s| {
+        // Borrow the allocator by reference; the `move` closure owns its channel ends
+        // (an mpsc `Receiver` is `!Sync`, so it must be moved in, not shared by ref).
+        let alloc_b_ref = &alloc_b;
+        s.spawn(move || {
+            // T2's FIRST clone lock (not nested) → blocks normally, uncontended, succeeds.
+            let _b_lock = HeldLock::acquire(alloc_b_ref).expect("first acquire of B succeeds");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap(); // keep B held until main has probed it
+        });
+
+        // Main already holds A (a first, non-nested acquire — succeeds).
+        let _a_lock = HeldLock::acquire(&alloc_a).expect("first acquire of A succeeds");
+        held_rx.recv().unwrap(); // wait until T2 actually holds B
+        // Nested acquire of B while T2 holds it: must fail fast, never block/hang.
+        // (`HeldLock` is not `Debug`, so match rather than `unwrap_err`.)
+        let err = match HeldLock::acquire(&alloc_b) {
+            Ok(_) => panic!("a nested acquire of a contended file lock must error, not block"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "contention while holding another clone lock must be a retryable WouldBlock"
+        );
+        release_tx.send(()).unwrap(); // let T2 release B and finish
+    });
+}
+
+#[test]
 fn macro_foreign_strong_teardown_frees_at_zero_across_files() {
     // Cross-file RC teardown: a `#[bstack_strong] Foreign<T>` decrements the target's
     // strong count *in the target's own file* (via the foreign host's stack + the

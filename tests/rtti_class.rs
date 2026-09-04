@@ -2735,6 +2735,63 @@ fn interpret_swap_rejects_fabricated_target() {
     std::fs::remove_file(&dpath).ok();
 }
 
+#[test]
+fn interpret_swap_rejects_fabricated_block_off() {
+    // `swap` is a *safe* fn but writes at `block_off + field.offset` and hands the
+    // displaced slot back as an owning `AnyRef`. A bogus `block_off` must be rejected
+    // (validated against the on-disk header) — otherwise safe code drives an arbitrary
+    // in-file write and gets an owning handle over arbitrary bytes (a wrong-place free).
+    let schema = temp_path("swapblk_schema");
+    let reg = rtti::sync(&schema).unwrap();
+    let (alloc, dpath) = data_alloc("swapblk_data");
+    let ord = reg.ordinal_of(<Wrap as BStackCast>::eightcc()).unwrap();
+    let point_tag = <Point as BStackCast>::eightcc();
+
+    let w = Wrap::new(&alloc, Point::new(&alloc, 1, 2).unwrap(), 5).unwrap();
+    let off = BStackBlock::range(w.handle()).start();
+
+    // A genuine replacement target, so only `block_off` is at fault below.
+    let np = Point::new(&alloc, 8, 9).unwrap();
+    let np_off = BStackBlock::range(np.handle()).start();
+    let good_new = || unsafe { AnyRef::new(point_tag, np_off) };
+
+    // (a) A null base (offset 0) names no live block.
+    assert!(
+        reg.swap(alloc.stack(), ord, 0, &["inner"], good_new())
+            .is_err(),
+        "null block_off must be rejected"
+    );
+    // (b) An out-of-bounds base is rejected.
+    assert!(
+        reg.swap(alloc.stack(), ord, 0xDEAD_BEEF, &["inner"], good_new())
+            .is_err(),
+        "out-of-bounds block_off must be rejected"
+    );
+    // (c) An in-bounds base of the WRONG type (the `Point` block, not a `Wrap`) is
+    // rejected — the header tag does not match `ordinal`.
+    assert!(
+        reg.swap(alloc.stack(), ord, np_off, &["inner"], good_new())
+            .is_err(),
+        "wrong-type block_off must be rejected"
+    );
+
+    // The real block and its field are untouched by the rejected swaps.
+    assert_eq!(
+        reg.get(alloc.stack(), ord, off, &["inner", "x"]).unwrap(),
+        pod(&1u32.to_le_bytes())
+    );
+    // (d) The correct base still swaps in fine.
+    assert!(
+        reg.swap(alloc.stack(), ord, off, &["inner"], good_new())
+            .unwrap()
+            .is_some()
+    );
+
+    drop(reg);
+    std::fs::remove_file(&schema).ok();
+    std::fs::remove_file(&dpath).ok();
+}
+
 // A self-referential owned foreign — used to build a teardown/clone cycle.
 #[bstack_class]
 struct FCycle {

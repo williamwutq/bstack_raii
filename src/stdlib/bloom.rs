@@ -226,6 +226,12 @@ impl<K: Pod> BStackCountingBloomFilter<K> {
     pub fn clear<A: BStackRaiiAllocator>(&self, allocator: &A) -> io::Result<()> {
         let handle = self.range.start();
         let [data, m] = read_fields::<2>(allocator.stack(), handle + DATA_OFF)?;
+        // `m` (the counter-array byte length) is an untrusted on-disk field: bound it by
+        // the stack size before allocating, so a forged huge `m` cannot drive an
+        // unbounded allocation (an abort), mirroring the sibling containers.
+        if m > allocator.stack().len()? {
+            return Err(io_error!("bloom filter counter array larger than the stack"));
+        }
         allocator.stack().set_batched([
             (
                 data,
@@ -402,6 +408,11 @@ impl<K: Pod> BStackBlock for BStackCountingBloomFilter<K> {
         let [data, m, k, n] = read_fields::<4>(allocator.stack(), handle + DATA_OFF)?;
 
         let new_data = if m != 0 {
+            // Untrusted `m`: bound by the stack size before allocating (mirrors the
+            // sibling containers), so a forged huge `m` can't drive an unbounded alloc.
+            if m > allocator.stack().len()? {
+                return Err(io_error!("bloom filter counter array larger than the stack"));
+            }
             let mut bytes = vec![0u8; m as usize];
             allocator.stack().get_into(data, &mut bytes)?;
             let dst = plan.alloc_raw(allocator, m)?;

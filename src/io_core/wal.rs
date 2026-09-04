@@ -476,7 +476,33 @@ impl HeldLock {
             ));
         }
         let arc = wal_lock_for(allocator);
-        let guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        // If this thread already holds another file's clone lock, this is a NESTED
+        // cross-file acquisition — the descent reached a `Foreign` child in a second
+        // file. A *blocking* lock here is hold-and-wait: two threads cloning graphs that
+        // reference each other, acquiring the two files' locks in opposite order (A→B vs
+        // B→A), deadlock permanently. The same-file self-cycle guard above cannot see it
+        // (different key, different thread). So for the nested case acquire non-blockingly
+        // and turn contention into the same retryable `WouldBlock` a self-cycle yields:
+        // a thread holding a clone lock then never waits on another, hold-and-wait is
+        // broken, and deadlock is structurally impossible. The first (home) lock still
+        // blocks — a lone lock with nothing else held cannot form a wait cycle.
+        let nested = HELD_CLONE_LOCKS.with(|h| !h.borrow().is_empty());
+        let guard = if nested {
+            match arc.try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(io_error!(
+                        WouldBlock,
+                        "clone contends for another file's WAL lock while already holding \
+                         one (a concurrent cross-file clone is acquiring the same files in \
+                         the opposite order); retry the clone"
+                    ));
+                }
+            }
+        } else {
+            arc.lock().unwrap_or_else(|e| e.into_inner())
+        };
         // SAFETY: the guard borrows the `Mutex` owned by `arc`, which this struct
         // keeps alive; `Drop` releases the guard before `arc` is dropped, so the
         // borrow never dangles. The transmute only extends the guard's lifetime to
