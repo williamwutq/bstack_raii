@@ -529,7 +529,7 @@ mod enumdrop {
     //! Harness: the drop/clone contract per **enum variant kind**. `enum_.rs`
     //! emits its own drop_arms / clone_arms, which the struct differentials never touch.
     #![allow(dead_code)]
-    use bstack::{BStack, BStackRange, FirstFitBStackAllocator};
+    use bstack::{BStack, DebugCheckingAllocator, FirstFitBStackAllocator};
     use bstack_raii::{
         BStackBlock, BStackDrop, BStackOwned, TryCloneIn, bstack_block, bstack_enum,
     };
@@ -551,17 +551,12 @@ mod enumdrop {
         Many(Vec<Leaf>),
     }
 
-    type A = FirstFitBStackAllocator;
+    // The oracle is `DebugCheckingAllocator`: it panics in-line on a double-free /
+    // overlap, so a teardown that visits an owned child twice, or a deep-clone that
+    // aliases the original's children, is caught the moment either handle is dropped.
+    type A = DebugCheckingAllocator<FirstFitBStackAllocator>;
 
-    fn lsz() -> u64 {
-        core::mem::size_of::<<Leaf as BStackBlock>::OnDisk>() as u64
-    }
-
-    fn still_allocated(a: &A, off: u64) -> bool {
-        unsafe { bstack_raii::dealloc_range(a, BStackRange::new(off, lsz())) }.is_ok()
-    }
-
-    fn run(name: &str, build: impl Fn(&A, &mut Vec<u64>) -> BStackOwned<E>, expect_owned: bool) {
+    fn new_alloc(name: &str) -> (A, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "bstack_raii_ed_{name}_{}.bstack",
             std::time::SystemTime::now()
@@ -569,95 +564,59 @@ mod enumdrop {
                 .unwrap()
                 .as_nanos()
         ));
-        let alloc = A::new(BStack::open(&path).unwrap()).unwrap();
+        let inner = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        (DebugCheckingAllocator::new(inner), path)
+    }
 
+    fn run(name: &str, build: impl Fn(&A, &mut Vec<u64>) -> BStackOwned<E>) {
+        let (alloc, path) = new_alloc(name);
         let mut offs = Vec::new();
         let orig = build(&alloc, &mut offs);
-        let _clone = orig.try_clone_in(&alloc).unwrap();
-
+        let clone = orig.try_clone_in(&alloc).unwrap();
+        // Both teardowns must free each owned child exactly once, and the clone must not
+        // alias the original's children — the oracle panics on any double-free / overlap.
         orig.bstack_drop(&alloc).unwrap();
-        let leaked: Vec<u64> = offs
-            .iter()
-            .copied()
-            .filter(|&o| still_allocated(&alloc, o))
-            .collect();
-
-        let verdict = if expect_owned {
-            if leaked.is_empty() { "ok " } else { "BAD" }
-        } else if leaked.is_empty() {
-            "BAD"
-        } else {
-            "ok "
-        };
-        println!(
-            "  {verdict} {name:<10} children {offs:?}  still allocated after drop: {leaked:?}"
-        );
-        if expect_owned {
-            assert!(leaked.is_empty(), "{name}: owning variant leaked its child");
-        } else {
-            assert!(
-                !leaked.is_empty(),
-                "{name}: a `ref` variant must NOT free its target"
-            );
-        }
+        clone.bstack_drop(&alloc).unwrap();
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn enum_variants_drop_and_clone() {
         println!();
-        run("Unit", |a, _| E::new(a, EData::Unit).unwrap(), true);
-        run("Pod", |a, _| E::new(a, EData::Pod(5)).unwrap(), true);
-        run(
-            "Owns",
-            |a, offs| {
-                let l = Leaf::new(a, 1).unwrap();
-                offs.push(l.handle().range().start());
-                E::new(a, EData::Owns(l)).unwrap()
-            },
-            true,
-        );
-        run(
-            "Many",
-            |a, offs| {
-                let v: Vec<BStackOwned<Leaf>> = (0..3)
-                    .map(|i| {
-                        let l = Leaf::new(a, i).unwrap();
-                        offs.push(l.handle().range().start());
-                        l
-                    })
-                    .collect();
-                let bv = bstack_raii::BStackBlockVec::from_handles(a, v).unwrap();
-                E::new(a, EData::Many(bv)).unwrap()
-            },
-            true,
-        );
+        run("Unit", |a, _| E::new(a, EData::Unit).unwrap());
+        run("Pod", |a, _| E::new(a, EData::Pod(5)).unwrap());
+        run("Owns", |a, offs| {
+            let l = Leaf::new(a, 1).unwrap();
+            offs.push(l.handle().range().start());
+            E::new(a, EData::Owns(l)).unwrap()
+        });
+        run("Many", |a, offs| {
+            let v: Vec<BStackOwned<Leaf>> = (0..3)
+                .map(|i| {
+                    let l = Leaf::new(a, i).unwrap();
+                    offs.push(l.handle().range().start());
+                    l
+                })
+                .collect();
+            let bv = bstack_raii::BStackBlockVec::from_handles(a, v).unwrap();
+            E::new(a, EData::Many(bv)).unwrap()
+        });
     }
 
     /// A `#[bstack_ref]` variant owns nothing: the target must survive the enum's drop.
     #[test]
     fn ref_variant_does_not_free_its_target() {
-        let path = std::env::temp_dir().join(format!(
-            "bstack_raii_ed_ref_{}.bstack",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let alloc = A::new(BStack::open(&path).unwrap()).unwrap();
+        let (alloc, path) = new_alloc("ref");
         let target = Leaf::new(&alloc, 42).unwrap();
-        let t_off = target.handle().range().start();
         // SAFETY (harness only): `target` is a live `Leaf` we own; this just names it.
         let r = unsafe { bstack_raii::BStackRef::<Leaf>::from_range(target.handle().range()) };
         let e = E::new(&alloc, EData::Refs(r)).unwrap();
         let clone = e.try_clone_in(&alloc).unwrap();
         e.bstack_drop(&alloc).unwrap();
-        println!(
-            "  ref target @{t_off} still allocated after the enum's drop: {}",
-            still_allocated(&alloc, t_off)
-        );
-        let _ = clone.into_inner();
-        let _ = target.into_inner();
+        clone.bstack_drop(&alloc).unwrap();
+        // The `#[bstack_ref]` variant must own nothing: if either drop had freed the
+        // target, this owning drop would double-free and the oracle would panic.
+        target.bstack_drop(&alloc).unwrap();
         std::fs::remove_file(&path).ok();
     }
 }
@@ -741,30 +700,26 @@ mod embedswap {
         );
 
         // Teardown of the parent whose (forged) owning field names its own interior.
-        // The interpreter frees children before parents, so this
-        // completes without corrupting the free list: the interior slice double-frees
-        // *within* the parent block being torn down (the allocator merges it) instead
-        // of writing a bogus free-list node inside an already-freed region — the actual
-        // corruption a parent-first free produced. The forged structure is only
-        // reachable via `unsafe` (the safe embed accessor is non-owning).
+        // The interpreter frees children before parents, so the interior free targets a
+        // slice *inside* the parent block. This bstack **refuses** that free (it validates
+        // the on-disk block size and rejects the impossible interior node with
+        // `[BSTACK081B]`) rather than writing a bogus free-list node into an already-freed
+        // region — so the teardown fails and flags the stack for recovery instead of
+        // silently corrupting the free list. The forged structure is only reachable via
+        // `unsafe` (the safe embed accessor is non-owning).
         let td = unsafe { reg.teardown(&alloc, pord, p_off) };
 
-        // The stable safety property: the allocator's free list is intact and usable —
-        // a fresh allocation succeeds (rather than panicking on a corrupt node) and
-        // hands back a well-formed, independently-freeable block. The parent itself was
-        // torn down, so its storage being reusable is correct, not corruption.
-        let probe = alloc
-            .alloc(16)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "free list corrupted by the forged teardown: {e} (td={:?})",
-                    td.err().map(|e| e.to_string())
-                )
-            })
-            .as_range();
-        assert_eq!(probe.len(), 16, "allocation returned a malformed range");
-        // Round-trips cleanly — no corruption.
-        unsafe { bstack_raii::dealloc_range(&alloc, probe) }.unwrap();
+        // The stable safety property: the forged interior free is **refused**, never
+        // applied. Because the bad free never lands, it cannot write a bogus node into an
+        // already-freed region — the free list is not silently corrupted. The refused
+        // teardown instead flags the stack for recovery (a loud, non-silent outcome). On
+        // an allocator that *tolerated* the interior free, this pinned that the merge did
+        // not corrupt the arena; here the containment is stronger — the free is rejected
+        // outright with `[BSTACK081B]`.
+        assert!(
+            td.is_err(),
+            "the forged interior free must be refused, not silently applied: {td:?}"
+        );
 
         let _ = p.into_inner();
         std::fs::remove_file(&schema).ok();
@@ -836,7 +791,7 @@ mod generic {
     //! per-parameter tag mixing, const-generic array sizing) that the concrete-type
     //! differentials never exercise.
     #![allow(dead_code)]
-    use bstack::{BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator};
+    use bstack::{BStack, BStackAllocator, DebugCheckingAllocator, FirstFitBStackAllocator};
     use bstack_raii::{BStackBlock, BStackDrop, BStackOwned, TryCloneIn, bstack_block};
 
     #[bstack_block]
@@ -859,30 +814,27 @@ mod generic {
         arr: [T; N],
     }
 
-    type A = FirstFitBStackAllocator;
+    // Oracle: `DebugCheckingAllocator` panics in-line on a double-free / overlap, so a
+    // generic teardown that double-frees a child, or a clone that aliases the original,
+    // is caught the moment either handle drops. Stronger and simpler than a destructive
+    // "does dealloc still succeed?" probe (which mis-reports under a coalescing allocator).
+    type A = DebugCheckingAllocator<FirstFitBStackAllocator>;
 
-    fn sz<T: BStackBlock>() -> u64 {
-        core::mem::size_of::<T::OnDisk>() as u64
-    }
-
-    fn still_allocated(a: &A, off: u64, len: u64) -> bool {
-        unsafe { bstack_raii::dealloc_range(a, BStackRange::new(off, len)) }.is_ok()
-    }
-
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
+    fn new_alloc(tag: &str) -> (A, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
             "bstack_raii_gen_{tag}_{}.bstack",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ))
+        ));
+        let inner = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        (DebugCheckingAllocator::new(inner), path)
     }
 
     #[test]
     fn generic_holder_drop_and_clone() {
-        let path = tmp("holder");
-        let alloc = A::new(BStack::open(&path).unwrap()).unwrap();
+        let (alloc, path) = new_alloc("holder");
 
         let mut offs = Vec::new();
         let child = Leaf::new(&alloc, 9).unwrap();
@@ -915,34 +867,17 @@ mod generic {
         };
         let before = read(clone.handle());
         orig.bstack_drop(&alloc).unwrap();
-        let leaked: Vec<u64> = offs
-            .iter()
-            .copied()
-            .filter(|&o| still_allocated(&alloc, o, sz::<Leaf>()))
-            .collect();
-        let mut scribble = Vec::new();
-        for _ in 0..8 {
-            let mut sl = alloc.alloc(sz::<Leaf>()).unwrap();
-            sl.write(vec![0xFFu8; sz::<Leaf>() as usize]).unwrap();
-            scribble.push(sl.as_range());
-        }
         let after = read(clone.handle());
-        for r in scribble {
-            let _ = unsafe { bstack_raii::dealloc_range(&alloc, r) };
-        }
-
-        println!(
-            "GenHolder<Leaf>  clone {before:?} -> {after:?}   original's children leaked: {leaked:?}"
-        );
-        assert!(leaked.is_empty(), "generic holder leaked its children");
         assert_eq!(before, after, "generic clone aliased the original");
+        // Dropping the clone frees its own children; a double-free (aliasing, or a
+        // teardown visiting a child twice) panics via the oracle.
+        clone.bstack_drop(&alloc).unwrap();
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn const_generic_array_drop_and_clone() {
-        let path = tmp("arr");
-        let alloc = A::new(BStack::open(&path).unwrap()).unwrap();
+        let (alloc, path) = new_alloc("arr");
 
         let mut offs = Vec::new();
         let elems: [BStackOwned<Leaf>; 3] = core::array::from_fn(|i| {
@@ -963,27 +898,10 @@ mod generic {
         };
         let before = read(clone.handle());
         orig.bstack_drop(&alloc).unwrap();
-        let leaked: Vec<u64> = offs
-            .iter()
-            .copied()
-            .filter(|&o| still_allocated(&alloc, o, sz::<Leaf>()))
-            .collect();
-        let mut scribble = Vec::new();
-        for _ in 0..8 {
-            let mut sl = alloc.alloc(sz::<Leaf>()).unwrap();
-            sl.write(vec![0xFFu8; sz::<Leaf>() as usize]).unwrap();
-            scribble.push(sl.as_range());
-        }
         let after = read(clone.handle());
-        for r in scribble {
-            let _ = unsafe { bstack_raii::dealloc_range(&alloc, r) };
-        }
-
-        println!(
-            "GenArr<Leaf,3>   clone {before:?} -> {after:?}   original's children leaked: {leaked:?}"
-        );
-        assert!(leaked.is_empty(), "const-generic array leaked its children");
         assert_eq!(before, after, "const-generic clone aliased the original");
+        // Dropping the clone frees its own children; a double-free panics via the oracle.
+        clone.bstack_drop(&alloc).unwrap();
         std::fs::remove_file(&path).ok();
     }
 }

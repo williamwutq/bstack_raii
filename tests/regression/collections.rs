@@ -175,7 +175,7 @@ mod collections {
     //!   (b) the clone still reads back its three values (so the clone never aliased
     //!       the original's children, which the drop just reclaimed).
     #![allow(dead_code)]
-    use bstack::{BStack, BStackAllocator, BStackRange, FirstFitBStackAllocator};
+    use bstack::{BStack, BStackAllocator, DebugCheckingAllocator, FirstFitBStackAllocator};
     use bstack_raii::{
         BStackBTreeMap, BStackBinaryHeap, BStackBlock, BStackDeque, BStackDrop, BStackHashMap,
         BStackLinkedList, BStackOwned, TryCloneIn, bstack_block,
@@ -186,16 +186,11 @@ mod collections {
         v: u32,
     }
 
-    type A = FirstFitBStackAllocator;
-
-    fn leaf_sz() -> u64 {
-        core::mem::size_of::<<Leaf as BStackBlock>::OnDisk>() as u64
-    }
-
-    /// A range that still frees cleanly was NOT freed by the teardown.
-    fn still_allocated(a: &A, off: u64) -> bool {
-        unsafe { bstack_raii::dealloc_range(a, BStackRange::new(off, leaf_sz())) }.is_ok()
-    }
+    // The oracle is `DebugCheckingAllocator`, which panics in-line on a double-free /
+    // overlapping allocation. It is a strictly stronger teardown/clone check than a
+    // destructive "does dealloc still succeed?" probe (which mis-reports under a
+    // coalescing/validating allocator), and is independent of the inner allocator.
+    type A = DebugCheckingAllocator<FirstFitBStackAllocator>;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -214,49 +209,30 @@ mod collections {
         V: Fn(&A, &C) -> Vec<u32>,
     {
         let path = tmp(name);
-        let alloc = A::new(BStack::open(&path).unwrap()).unwrap();
+        let inner = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let alloc = DebugCheckingAllocator::new(inner);
 
+        // `child_offs` is unused now (the destructive leak probe is gone) but kept so the
+        // `build` closures need no signature change.
         let mut child_offs = Vec::new();
         let orig = build(&alloc, &mut child_offs);
         let clone = orig.try_clone_in(&alloc).unwrap();
 
+        // A deep clone is independent: its values survive the original's drop unchanged.
         let before = read_values(&alloc, clone.handle());
+        assert!(!before.is_empty(), "{name}: fixture built no children");
         orig.bstack_drop(&alloc).unwrap();
-        // Probe for leaks FIRST — the scribble below would re-occupy the freed slots.
-        let leaked: Vec<u64> = child_offs
-            .iter()
-            .copied()
-            .filter(|&o| still_allocated(&alloc, o))
-            .collect();
-        // Scribble over whatever the drop reclaimed, so an aliasing clone cannot read
-        // stale-but-intact bytes and appear healthy.
-        let mut scribble = Vec::new();
-        for _ in 0..8 {
-            let mut sl = alloc.alloc(leaf_sz()).unwrap();
-            sl.write(vec![0xFFu8; leaf_sz() as usize]).unwrap();
-            scribble.push(sl.as_range());
-        }
         let after = read_values(&alloc, clone.handle());
-        for r in scribble {
-            let _ = unsafe { bstack_raii::dealloc_range(&alloc, r) };
-        }
-
-        let ok_leak = leaked.is_empty();
-        let ok_alias = !before.is_empty() && after == before;
-
-        println!(
-            "  {:<11} clone before drop {before:?} -> after {after:?}   original's children leaked: {leaked:?}   {}",
-            name,
-            if ok_leak && ok_alias { "ok" } else { "BAD" }
-        );
-        assert!(
-            ok_leak,
-            "{name}: dropping the collection left its own children allocated"
-        );
-        assert!(
-            ok_alias,
+        assert_eq!(
+            after, before,
             "{name}: the clone's values changed when the original was dropped (aliasing)"
         );
+
+        // Dropping the clone frees ITS OWN children. If the clone had aliased the
+        // original's now-freed blocks, this is a double-free and the oracle panics; and
+        // the original's own teardown above would already have double-freed a child it
+        // visited twice. So a clean run proves both teardowns free each block exactly once.
+        clone.bstack_drop(&alloc).unwrap();
 
         std::fs::remove_file(&path).ok();
     }
