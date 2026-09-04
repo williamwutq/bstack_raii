@@ -246,7 +246,7 @@ pub fn wal_teardown<A: BStackRaiiAllocator, T: BStackDrop>(
 /// Free a raw block range by reconstructing an owned slice and delegating to the
 /// allocator. The central sink the generated `bstack_drop` code funnels through,
 /// since ranges carry no allocator of their own — a thin public entry over the
-/// sink-aware [`Sink::dealloc`] (kept a free function because generated
+/// sink-aware `Sink::dealloc` (kept a free function because generated
 /// `bstack_drop` code and every collection call it by this name).
 ///
 /// # Safety

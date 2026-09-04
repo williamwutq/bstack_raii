@@ -10,8 +10,8 @@ use bytemuck::{Pod, Zeroable};
 use super::{FileId, Offset, ResolvedFileId, ResolvedTypeId, TypeId};
 
 /// The crate's **wide pointer** (a "fat pointer"): a persisted cross-file reference,
-/// assembled from its three orthogonal [components](super) — a [`FileId`] (which
-/// file), a [`TypeId`] (which type, or untyped), and an [`Offset`] (where in that
+/// assembled from its three orthogonal components — a [`FileId`] (which
+/// file), a `TypeId` (which type, or untyped), and an [`Offset`] (where in that
 /// file).
 ///
 /// This is the canonical on-disk representation: `#[repr(C)]` over the three
@@ -51,8 +51,8 @@ impl WidePtr {
         offset: Offset::NULL,
     };
 
-    /// An **untyped** pointer to `(file, offset)` — its [`TypeId`] is
-    /// [`UNTYPED`](TypeId::UNTYPED). Tag it with [`with_type`](Self::with_type) when
+    /// An **untyped** pointer to `(file, offset)` — its `TypeId` is
+    /// `UNTYPED`. Tag it with [`with_type`](Self::with_type) when
     /// an RTTI type is known.
     pub const fn new(file: FileId, offset: Offset) -> Self {
         WidePtr {
@@ -68,7 +68,7 @@ impl WidePtr {
     }
 
     /// This pointer tagged with RTTI type `ty` (chains off [`new`](Self::new)); pass
-    /// [`TypeId::UNTYPED`] to clear it.
+    /// `TypeId::UNTYPED` to clear it.
     pub const fn with_type(mut self, ty: TypeId) -> Self {
         self.ty = ty;
         self
@@ -114,7 +114,7 @@ impl WidePtr {
         self.file
     }
 
-    /// The RTTI type tag (possibly [`UNTYPED`](TypeId::UNTYPED)).
+    /// The RTTI type tag (possibly `UNTYPED`).
     pub const fn type_id(self) -> TypeId {
         self.ty
     }
@@ -149,12 +149,12 @@ impl WidePtr {
     }
 
     /// The target file refined to an ordinary registered file
-    /// ([`ResolvedFileId`]), or `None` for [`SELF`](FileId::SELF) / a special id.
+    /// (`ResolvedFileId`), or `None` for [`SELF`](FileId::SELF) / a special id.
     pub const fn resolved_file(self) -> Option<ResolvedFileId> {
         self.file.resolve()
     }
 
-    /// The type tag refined to a typed id ([`ResolvedTypeId`]), or `None` if the
+    /// The type tag refined to a typed id (`ResolvedTypeId`), or `None` if the
     /// pointer is untyped.
     pub const fn resolved_type(self) -> Option<ResolvedTypeId> {
         self.ty.resolve()
@@ -231,7 +231,7 @@ impl<'a> BrandedWidePtr<'a> {
         self.ptr.file()
     }
 
-    /// The RTTI [`TypeId`] — [`WidePtr::type_id`].
+    /// The RTTI `TypeId` — [`WidePtr::type_id`].
     #[inline(always)]
     pub const fn type_id(self) -> TypeId {
         self.ptr.type_id()

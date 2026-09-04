@@ -82,7 +82,7 @@ const MIN_CAP: u64 = 4;
 /// A typed handle (a newtype over a [`BStackRange`]); [`new`](Self::new) returns
 /// a bare [`BStackOwned<BStackDeque<T>>`] that frees nothing on scope exit — free
 /// it with [`bstack_drop`](BStackDrop::bstack_drop) or wrap it
-/// ([`AutoDrop`] / [`crate::BStackCow`]).
+/// (`AutoDrop` / [`crate::BStackCow`]).
 ///
 /// The deque owns its elements' blocks: pushing takes a [`BStackOwned<T>`],
 /// popping hands one back, and teardown recursively frees every element and the

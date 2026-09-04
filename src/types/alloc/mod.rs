@@ -37,7 +37,7 @@ use crate::registry::FileId;
 /// `unsafe impl BStackRaiiAllocator for MyAlloc {}` (defaulting to `None`, or
 /// returning `Some(slot)` if it reserves a stable slot).
 ///
-/// The WAL machinery it feeds lives in [`crate::io_core::wal`]; the trait itself is
+/// The WAL machinery it feeds lives in `crate::io_core::wal`; the trait itself is
 /// the crate's front-door allocator bound, and lives here among the semantic types.
 ///
 /// # Safety
@@ -70,7 +70,7 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     /// [`ForeignHostAllocator`](crate::registry::ForeignHostAllocator) overrides this
     /// with the foreign file's id, so a free collected while tearing down a foreign
     /// subtree is recorded against — and, on recovery, reclaimed in — *that* file
-    /// (see [`crate::io_core::wal`]'s `free_recorded`). Callers other than the
+    /// (see `crate::io_core::wal`'s `free_recorded`). Callers other than the
     /// teardown WAL have no reason to read this.
     fn wal_file_id(&self) -> FileId {
         FileId::SELF
@@ -107,7 +107,7 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     ///
     /// # Safety
     /// Each range must be a live allocation owned by `self` that no other live
-    /// handle will also free (as for [`crate::io_core::teardown`]'s `dealloc_range`,
+    /// handle will also free (as for `crate::io_core::teardown`'s `dealloc_range`,
     /// whose obligation this method carries range-by-range). `BStackRange::new` is a
     /// safe constructor, so nothing gates the argument but this contract; the safe
     /// ways to free remain [`BStackDrop`](crate::BStackDrop) / [`AutoDrop`](crate::AutoDrop).

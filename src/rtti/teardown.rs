@@ -42,7 +42,7 @@ impl RttiRegistry {
     /// and the root **must already be detached** (unlinked from any parent): this
     /// frees it unconditionally, so a still-linked root leaves its parent pointing
     /// at freed storage and a wrong offset frees ranges the caller does not own —
-    /// the same obligation that makes [`BStackBlock::from_range`] `unsafe`, reached
+    /// the same obligation that makes `BStackBlock::from_range` `unsafe`, reached
     /// with a bare integer instead of a fabricated handle.
     ///
     /// The walk

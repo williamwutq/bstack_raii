@@ -94,7 +94,7 @@ pub trait BStackWeakable: BStackBlock {
     /// The on-disk control-block payload (the generated `XOnDiskRef`).
     type Control: Pod;
     /// The control block's [`EightCC`] tag — the tag stamped into the control
-    /// (`XOnDiskRef`) header, distinct from the data tag ([`BStackCast::eightcc`]).
+    /// (`XOnDiskRef`) header, distinct from the data tag (`BStackCast::eightcc`).
     /// Lets a validator confirm a region *is* this type's control block directly by
     /// its header, not only indirectly via its forward data pointer.
     fn control_eightcc() -> EightCC;

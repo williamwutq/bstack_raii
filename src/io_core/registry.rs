@@ -2,14 +2,14 @@
 //! `Foreign<T>` (cross-file pointers), built before `Foreign<T>` itself.
 //!
 //! A `Foreign<T>` is "a slice with a file identity attached": a [`FileId`] plus a
-//! [`BStackRange`]. Paths are variable-length and awkward to embed on disk, so the
+//! `BStackRange`. Paths are variable-length and awkward to embed on disk, so the
 //! registry maps each file's **persistent path** to a small, **stable** numeric
 //! [`FileId`] that a `Foreign` can store as a plain integer. Resolving that id
 //! back to the file's live allocator (to read/write/allocate in it) happens here.
 //!
 //! ## Two layers
 //!
-//! * **Persistent** — a dedicated bstack file (its own [`FirstFitBStackAllocator`])
+//! * **Persistent** — a dedicated bstack file (its own `FirstFitBStackAllocator`)
 //!   holding the **append-only** path table. Ids are just indices into it, so a
 //!   `Foreign` written to disk with `FileId(5)` means the same path on every future
 //!   run. Paths are *never removed* (that would renumber ids and dangle stored
@@ -48,13 +48,13 @@ use crate::util::io_error;
 use crate::{BStackRaiiAllocator, get_u64};
 
 /// The allocator capability's cross-file projection, defined among the
-/// [semantic types](crate::types::alloc); re-exported here because resolving a
+/// semantic types; re-exported here because resolving a
 /// [`FileId`] to a live host is the registry's job.
 pub use crate::types::alloc::SyncBStackRaiiAllocator;
 pub use crate::types::alloc::{BStackRaiiAllocError, BStackRaiiHost};
 
 /// The stable per-file identity underlying `Foreign<T>`. Defined among the wide
-/// pointer's [components](crate::primitives); re-exported here as its resolution
+/// pointer's components; re-exported here as its resolution
 /// (path table, live hosts) is the registry's job.
 pub use crate::primitives::FileId;
 
@@ -70,7 +70,7 @@ pub use crate::primitives::FileId;
 ///
 /// It owns an `Arc<dyn BStackRaiiHost>` (not a borrow) precisely so it can be
 /// `'static`, which [`BStackRaiiAllocator`]'s `'static` supertrait
-/// ([`BStackOwnedSliceAllocator`]) demands — and so the host stays alive for the
+/// (`BStackOwnedSliceAllocator`) demands — and so the host stays alive for the
 /// whole teardown even if it is concurrently [`detach`](FileRegistry::detach)ed.
 ///
 /// [`into_stack`](BStackAllocator::into_stack) is unsupported (the adapter does not

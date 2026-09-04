@@ -100,7 +100,7 @@ pub trait TryCloneIn: BStackBlock + Sized {
 /// Accumulates a deep clone's allocations, payload writes, and refcount bumps so
 /// the writes commit as one atomic batch after every allocation has succeeded.
 ///
-/// See the [module docs](self#atomicity-model) for the two-phase model. Built up
+/// See the module docs for the two-phase model. Built up
 /// by the generated `__bstack_clone_into` methods during the recursive descent,
 /// then either [`commit`](Self::commit)ted or [`rollback`](Self::rollback)ed.
 pub struct ClonePlan {

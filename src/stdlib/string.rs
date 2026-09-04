@@ -56,7 +56,7 @@ const STRING_SIZE: u64 = size_of::<StringOnDisk>() as u64;
 ///
 /// A typed handle (a newtype over a [`BStackRange`]); [`new`](Self::new) returns a
 /// bare [`BStackOwned<BStackString>`] that frees nothing on scope exit — free it
-/// with [`bstack_drop`](BStackDrop::bstack_drop) or wrap it ([`AutoDrop`] /
+/// with `bstack_drop` or wrap it (`AutoDrop` /
 /// [`crate::BStackCow`]).
 pub struct BStackString {
     range: BStackRange,

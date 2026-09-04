@@ -13,7 +13,7 @@
 use std::mem;
 
 /// An insertion-ordered map from `String` keys to `T`, backed by a `Vec` of pairs.
-/// See the [module docs](self).
+/// See the module docs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SmallStringMap<T> {
     entries: Vec<(String, T)>,

@@ -19,7 +19,7 @@
 //!
 //! Each `insert` / `remove` is atomic per call and external-lock-free: the entire
 //! probe *and* the resulting bucket + metadata writes run inside one
-//! [`bstack::BStack::inplace_gen`] (see [`probe_commit`]), so a concurrent writer
+//! [`bstack::BStack::inplace_gen`] (see `probe_commit`), so a concurrent writer
 //! never observes a torn table and a crash never corrupts it. **Growth / rehash**
 //! is likewise atomic: a bigger bucket block is allocated first (an orphan), then
 //! one `inplace_gen` snapshots every live bucket, rebuilds the table into the new
@@ -126,7 +126,7 @@ fn new_bucket_writes(
 /// A typed handle (a newtype over a [`BStackRange`]); [`new`](Self::new) returns
 /// a bare [`BStackOwned<BStackHashMap<K, V>>`] that frees nothing on scope exit —
 /// free it with [`bstack_drop`](BStackDrop::bstack_drop) or wrap it
-/// ([`AutoDrop`] / [`crate::BStackCow`]).
+/// (`AutoDrop` / [`crate::BStackCow`]).
 ///
 /// The map owns its values' blocks: [`insert`](Self::insert) takes a
 /// [`BStackOwned<V>`], [`remove`](Self::remove) hands one back (as does an
@@ -190,7 +190,7 @@ impl<K: Pod, V: BStackBlock> BStackHashMap<K, V> {
     ///
     /// Atomic and external-lock-free: grows the table first if the load factor
     /// would be exceeded, then probes and commits the bucket + metadata writes in
-    /// one [`probe_commit`].
+    /// one `probe_commit`.
     pub fn insert<A: BStackRaiiAllocator>(
         &self,
         allocator: &A,

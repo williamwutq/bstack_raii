@@ -15,15 +15,15 @@ use super::{HEADER_TAG_OFFSET, Shape, add_off};
 /// analog of `&dyn Any`. It bridges the interpreted world back to compiled-in types:
 /// [`downcast`](Self::downcast) hands back a real typed block handle when the
 /// reference's tag matches a type's compile-time [`eightcc`](BStackCast::eightcc),
-/// otherwise the structure can be read generically (via [`RttiRegistry::read_any`]).
+/// otherwise the structure can be read generically (via `RttiRegistry::read_any`).
 ///
-/// Obtain one from a typed pointer with [`RttiRegistry::any_ref`] (its tag is then
+/// Obtain one from a typed pointer with `RttiRegistry::any_ref` (its tag is then
 /// registry-authoritative — a stray pointer resolves to `None`), or straight from a
 /// block's on-disk header with [`AnyRef::from_block`].
 ///
 /// The match is an eightcc (hash) equality, so it is only as sound as tag
 /// uniqueness. Within a program whose types were registered by
-/// [`sync`](RttiRegistry::sync_compiled) that holds — sync rejects colliding types
+/// `sync` that holds — sync rejects colliding types
 /// (`[BSTACK0806]`) — so a successful `downcast` truly is that type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnyRef {
@@ -32,7 +32,7 @@ pub struct AnyRef {
 }
 
 impl AnyRef {
-    /// Construct from a known tag + offset. Prefer [`RttiRegistry::any_ref`] (which
+    /// Construct from a known tag + offset. Prefer `RttiRegistry::any_ref` (which
     /// resolves the tag through the registry) or [`AnyRef::from_block`] — both are
     /// safe because they read the tag from an authoritative source.
     ///
@@ -135,7 +135,7 @@ pub enum Value {
     Class(Box<[u8]>),
 }
 
-/// A whole vector moved out of a block by [`RttiRegistry::move_out`]: ownership of its
+/// A whole vector moved out of a block by `RttiRegistry::move_out`: ownership of its
 /// data block and every element, transferred as a unit — the RTTI analog of a
 /// detached `BStackVec` handle. (A vec data block has no eightcc, so [`AnyRef`] can't
 /// represent it.) The caller owns it: free the data block (and its owned elements) to
@@ -151,7 +151,7 @@ pub struct VecRef {
     pub elem: Shape,
 }
 
-/// One immediate field moved out of a block by [`RttiRegistry::move_out`], with its
+/// One immediate field moved out of a block by `RttiRegistry::move_out`, with its
 /// **ownership transferred to the caller** — the RTTI analog of a `bstack_move!` tuple
 /// element. POD comes out by value; references come out as [`AnyRef`]s the caller now
 /// owns (downcast / tear down / `swap` elsewhere).
@@ -205,7 +205,7 @@ pub enum Moved {
 }
 
 /// One cross-file [`Foreign`](crate::Foreign) pointer handed out by
-/// [`move_out`](RttiRegistry::move_out) as an element of a [`Moved::ForeignList`]:
+/// `move_out` as an element of a [`Moved::ForeignList`]:
 /// the target's tag, its ownership kind, and its `(file_id, offset)` (`offset == 0`
 /// == null). The caller owns the reference and reclaims it in its own file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

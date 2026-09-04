@@ -55,7 +55,7 @@ unsafe impl<T: Pod> Pod for BoxOnDisk<T> {}
 /// handle), so it is `Copy` and carries no allocator. Ownership is expressed the
 /// usual way: [`new`](Self::new) hands back a bare [`BStackOwned<BStackBox<T>>`]
 /// that frees nothing on scope exit — free it with
-/// [`bstack_drop`](BStackDrop::bstack_drop) or wrap it in an
+/// `bstack_drop` or wrap it in an
 /// [`crate::AutoDrop`]/[`crate::BStackCow`].
 pub struct BStackBox<T: Pod> {
     range: BStackRange,

@@ -44,7 +44,7 @@ use crate::util::io_error;
 
 /// A **typed cross-file pointer** to a `T` block in another `bstack` file — the
 /// self-qualifying counterpart of [`BStackRef`](super::BStackRef) (an in-file offset with
-/// no file identity); see the [module docs](self) for its on-disk wire form.
+/// no file identity); see the module docs for its on-disk wire form.
 ///
 /// It is one of two kinds: an **explicit** pointer (carries the target's
 /// [`FileId`](crate::registry::FileId), so it resolves through the
@@ -55,7 +55,7 @@ use crate::util::io_error;
 /// `Copy`. An explicit pointer can be [`detach`](Self::detach)ed to a `'static`,
 /// borrow-free `Foreign`; a `SELF` pointer cannot (it is only valid within the scope of
 /// the file it was read from). `T: 'static` because a persisted block target holds no
-/// in-memory borrow. See the [module docs](self) for teardown / deep-clone semantics.
+/// in-memory borrow. See the module docs for teardown / deep-clone semantics.
 pub struct Foreign<'a, T: 'static> {
     inner: BrandedWidePtr<'a>,
     _marker: PhantomData<fn() -> T>,
@@ -162,7 +162,7 @@ impl<'a, T: BStackBlock + 'static> Foreign<'a, T> {
     /// [`BStack`] of the file it lives in.
     ///
     /// The two failure modes are kept apart rather than conflated into one
-    /// `Option`: `Ok(None)` is the [null niche](self) (`address == 0`, a genuinely
+    /// `Option`: `Ok(None)` is the null niche (`address == 0`, a genuinely
     /// absent pointer — not an error, same as reading a null `#[bstack_ref]`
     /// field); `Err` is an I/O-shaped [`io::ErrorKind::NotFound`] meaning the
     /// pointer is non-null but its target file can't currently be reached (a

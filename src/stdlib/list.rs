@@ -173,7 +173,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     ///
     /// Atomic and external-lock-free: the node is allocated first (an orphan),
     /// then the tail read, node-image write, tail/`prev.next` relink and length
-    /// bump all commit as one crash-atomic [`atomic_update`]. A crash before the
+    /// bump all commit as one crash-atomic `atomic_update`. A crash before the
     /// commit leaks the orphan node; it never tears the list.
     pub fn push_back<A: BStackRaiiAllocator>(
         &self,
@@ -283,7 +283,7 @@ impl<T: BStackBlock> BStackLinkedList<T> {
     ///
     /// Atomic and external-lock-free: the tail is read, the target node's
     /// `prev`/`value` read (a dependent second round), and the relink + length
-    /// decrement commit as one [`atomic_update`]. Only *after* the node is
+    /// decrement commit as one `atomic_update`. Only *after* the node is
     /// unlinked is its shell freed — a crash between leaks the shell, never a
     /// dangling link.
     pub fn pop_back<A: BStackRaiiAllocator>(

@@ -49,7 +49,7 @@ pub trait BStackBlock: BStackCast + Sized {
 
     /// Wrap a range as a typed handle (no I/O, no validation).
     ///
-    /// The handle itself is a **non-owning view** — `Copy`, no [`BStackDrop`], so
+    /// The handle itself is a **non-owning view** — `Copy`, no `BStackDrop`, so
     /// holding or duplicating one can never free anything. Ownership (and the
     /// obligation to free exactly once) lives only in the affine wrappers
     /// [`BStackOwned`](crate::BStackOwned) / [`crate::BStackRc`] / the

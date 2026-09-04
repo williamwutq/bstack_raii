@@ -1,7 +1,7 @@
 //! [`BStackRc`] + [`BStackWeak`]: the with-allocator shared handles.
 //!
 //! Neither hand-writes a `Drop`. Each embeds an [`AutoDrop`] over a
-//! without-allocator *drop core* ([`StrongCore`] / [`WeakRef`]) whose
+//! without-allocator *drop core* (`StrongCore` / [`WeakRef`]) whose
 //! [`BStackDrop`] performs the refcount release; the embedded guard runs it on
 //! scope exit.
 
@@ -97,7 +97,7 @@ pub(crate) fn strong_counter_off(data_start: u64, ctrl: Option<BStackRange>) -> 
 // Each is a concrete, non-`Copy` ownership token a generated
 // `__bstack_drop_children` mints for one `#[bstack_strong]` / `#[bstack_weak]`
 // field; its `BStackDrop` carries that annotation's refcount-release logic. They
-// live here beside [`StrongCore`] (the `BStackRc` drop core that dispatches to
+// live here beside `StrongCore` (the `BStackRc` drop core that dispatches to
 // them) and the control-block offset constants they read.
 // ---------------------------------------------------------------------------
 
@@ -105,7 +105,7 @@ pub(crate) fn strong_counter_off(data_start: u64, ctrl: Option<BStackRange>) -> 
 /// decrements the inline refcount and frees at zero.
 ///
 /// The macro only emits this for children whose type is `#[bstack_block(rc)]`,
-/// so the inline `refcount` at [`RC_REFCOUNT_OFFSET`] is guaranteed
+/// so the inline `refcount` at `RC_REFCOUNT_OFFSET` is guaranteed
 /// present; the type system does not otherwise enforce it. Not `Copy`: it
 /// embodies exactly one strong-count debt, paid once by `bstack_drop`.
 pub struct StrongRef<T>(BStackRef<T>);
@@ -259,7 +259,7 @@ fn release_weak<A: BStackRaiiAllocator>(allocator: &A, ctrl_range: BStackRange) 
 /// The two-phase strong release for an `(rc, weak)` block, given raw data and
 /// control ranges. Requires only `T: BStackBlock` (for the data block's own
 /// recursive teardown), so it is shared by both [`StrongWeakRef::bstack_drop`]
-/// and [`BStackRc`]'s `Drop` (via [`StrongCore`]) — the latter carries
+/// and [`BStackRc`]'s `Drop` (via `StrongCore`) — the latter carries
 /// `T: BStackBlock` and so cannot construct a `StrongWeakRef<T>` (which needs
 /// `BStackWeakable`) itself.
 pub(crate) fn strong_release_ctrl<T: BStackBlock, A: BStackRaiiAllocator>(
@@ -308,9 +308,9 @@ impl<T: BStackBlock> BStackDrop for StrongCore<T> {
 
 /// A shared, refcounted, allocator-bound handle.
 ///
-/// Serves **both** block kinds via its [`StrongCore`]'s runtime `ctrl`:
+/// Serves **both** block kinds via its `StrongCore`'s runtime `ctrl`:
 /// * `None` — a plain `#[bstack_block(rc)]` block, whose refcount lives inline
-///   in the data block at [`RC_REFCOUNT_OFFSET`].
+///   in the data block at `RC_REFCOUNT_OFFSET`.
 /// * `Some(range)` — an `#[bstack_block(rc, weak)]` block, whose `strong`/`weak`
 ///   counters live in a separate control block at `range`.
 ///

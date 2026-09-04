@@ -158,7 +158,7 @@ impl NonNullOffset {
     /// child slot) — erroring rather than panicking on the `0` that only a corrupt
     /// or forged base could produce. The bridge from the `u64` that offset
     /// arithmetic ([`checked_off`], `add_off`) yields to
-    /// the [`NonNullOffset`] the counter ops ([`crate::io_core::refcount`]) require.
+    /// the [`NonNullOffset`] the counter ops (`crate::io_core::refcount`) require.
     #[inline]
     pub fn from_field(off: u64) -> io::Result<NonNullOffset> {
         Self::new(Offset::from_raw(off)).ok_or_else(|| io_error!("field offset resolved to null"))

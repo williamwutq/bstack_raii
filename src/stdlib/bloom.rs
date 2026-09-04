@@ -77,8 +77,8 @@ const BLOOM_SIZE: u64 = size_of::<BloomOnDisk>() as u64;
 /// A typed handle (a newtype over a [`BStackRange`]); [`new`](Self::new) /
 /// [`with_capacity`](Self::with_capacity) return a bare
 /// [`BStackOwned<BStackCountingBloomFilter<K>>`] that frees nothing on scope exit
-/// — free it with [`bstack_drop`](BStackDrop::bstack_drop) or wrap it
-/// ([`AutoDrop`] / [`crate::BStackCow`]).
+/// — free it with `bstack_drop` or wrap it
+/// (`AutoDrop` / [`crate::BStackCow`]).
 pub struct BStackCountingBloomFilter<K: Pod> {
     range: BStackRange,
     _marker: PhantomData<fn() -> K>,

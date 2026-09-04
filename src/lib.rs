@@ -14,16 +14,16 @@
 //!
 //! | Module         | Contents                                                    |
 //! |----------------|-------------------------------------------------------------|
-//! | [`layout`]     | On-disk primitives: [`EightCC`], [`BlockHeader`] (both Pod). |
-//! | [`reference`]  | [`BStackRef`]: typed range wrapper + buffered `OnDisk` read. |
-//! | [`teardown`]   | [`BStackDrop`] trait, [`AutoDrop`] RAII guard, [`dealloc_range`]. |
+//! | `layout`       | On-disk primitives: [`EightCC`], [`BlockHeader`] (both Pod). |
+//! | `reference`    | [`BStackRef`]: typed range wrapper + buffered `OnDisk` read. |
+//! | `teardown`     | [`BStackDrop`] trait, [`AutoDrop`] RAII guard, [`dealloc_range`]. |
 //! | `handback`     | The hand-back error family: [`ConstructError`], [`ReplaceError`], [`CastError`], [`IntoLocalError`] + the [`HandBack`] trait. |
-//! | [`block`]      | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
-//! | [`refcount`]   | Little-endian atomic CAS ops over on-disk `u64` counters.    |
+//! | `block`        | Block-type contracts: [`BStackCast`], [`BStackBlock`], [`BStackWeakable`]. |
+//! | `refcount`     | Little-endian atomic CAS ops over on-disk `u64` counters.    |
 //! | `bulk`         | Sequential fallbacks for [`BStackRaiiAllocator::alloc_many`] / [`free_many`](BStackRaiiAllocator::free_many); bulk allocators override those trait methods. |
 //! | `clone`        | [`TryClone`] / [`TryCloneIn`]: fallible clone for handles that touch disk. |
-//! | [`owned`]      | [`BStackOwned`] + the [`OwnedRef`] without-allocator drop core. |
-//! | [`shared`]     | [`BStackRc`] / [`BStackWeak`] + the [`StrongRef`] / [`StrongWeakRef`] / [`WeakRef`] drop cores. |
+//! | `owned`        | [`BStackOwned`] + the [`OwnedRef`] without-allocator drop core. |
+//! | `shared`       | [`BStackRc`] / [`BStackWeak`] + the [`StrongRef`] / [`StrongWeakRef`] / [`WeakRef`] drop cores. |
 //! | `cast`         | Typed ↔ untyped handle conversion — the runtime behind `bstack_cast!`. |
 //! | `vec`          | [`VecDesc`]-backed growable vectors reached through a fixed-size field. |
 //! | [`registry`]   | Process-wide path↔[`FileId`](registry::FileId) registry underlying `Foreign<T>`. |
@@ -45,7 +45,7 @@
 //!
 //! Feature-complete: the runtime primitives, the procedural macros
 //! ([`macro@bstack_block`], [`macro@bstack_enum`], [`bstack_move`],
-//! [`bstack_cast`]), and the [`stdlib`] collection suite are all implemented and
+//! [`bstack_cast`]), and the `stdlib` collection suite are all implemented and
 //! exercised by the test suite. The main open gap is `Foreign<T>` cross-file
 //! deep-clone/teardown dispatch, which is still deferred (a `Foreign` field is
 //! byte-copied on clone and freed by nobody on teardown regardless of its
@@ -76,7 +76,7 @@ pub use handback::{CastError, ConstructError, HandBack, IntoLocalError, ReplaceE
 pub use io_core::ClonePlan;
 pub use io_core::TryCloneIn;
 /// The inert on-disk **wire** form of a [`Foreign`] pointer — the composed
-/// [wide pointer](crate::primitives). Not part of the public API — generated
+/// wide pointer. Not part of the public API — generated
 /// `#[bstack_block]` code names it through `::bstack_raii::WidePtr`; user code should
 /// never use it directly.
 #[doc(hidden)]

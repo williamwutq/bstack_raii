@@ -154,7 +154,7 @@ impl<'a, A: BStackRaiiAllocator> Build<'a, A> {
 /// A typed handle (a newtype over a [`BStackRange`]); [`new`](Self::new) returns a
 /// bare [`BStackOwned<BStackBTreeMap<K, V>>`] that frees nothing on scope exit —
 /// free it with [`bstack_drop`](BStackDrop::bstack_drop) or wrap it
-/// ([`AutoDrop`] / [`crate::BStackCow`]).
+/// (`AutoDrop` / [`crate::BStackCow`]).
 pub struct BStackBTreeMap<K: Pod + Ord, V: BStackBlock> {
     range: BStackRange,
     _marker: PhantomData<fn() -> (K, V)>,

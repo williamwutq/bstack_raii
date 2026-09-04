@@ -142,7 +142,7 @@ impl RttiErrorKind {
 /// An RTTI interpreter / codec error: a [`kind`](RttiErrorKind) (the stable code) and a
 /// human message. The message is a [`Cow`] — a fixed string is `Borrowed` (no
 /// allocation), a message built from runtime values is `Owned`; construct with the
-/// [`rtti_err!`] macro rather than by hand.
+/// `rtti_err!` macro rather than by hand.
 #[derive(Clone, Debug)]
 pub struct RttiError {
     kind: RttiErrorKind,
@@ -150,7 +150,7 @@ pub struct RttiError {
 }
 
 impl RttiError {
-    /// Construct from a category and message. Prefer the [`rtti_err!`] macro, which
+    /// Construct from a category and message. Prefer the `rtti_err!` macro, which
     /// picks `Cow::Borrowed` / `Cow::Owned` for you.
     pub fn new(kind: RttiErrorKind, msg: Cow<'static, str>) -> Self {
         Self { kind, msg }
@@ -199,7 +199,7 @@ impl From<io::Error> for RttiError {
 impl From<RttiError> for io::Error {
     /// Surface an RTTI error under `io::Result` at the persistence boundary. Boxes once
     /// (here, on the error path only), keeping the [`RttiError`] recoverable via
-    /// [`io::Error::downcast_ref`].
+    /// `io::Error::downcast_ref`.
     fn from(e: RttiError) -> Self {
         io::Error::new(e.kind.io_kind(), e)
     }

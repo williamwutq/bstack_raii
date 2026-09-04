@@ -15,16 +15,16 @@
 //! renumbered, so it is a stable, compact, `u32`-sized handle that resolves to the
 //! full [`EightCC`] and descriptor by a direct array index.
 //!
-//! On open the whole stack is scanned into memory ([`RttiRegistry`]) so every
+//! On open the whole stack is scanned into memory (`RttiRegistry`) so every
 //! lookup is O(1). The scanned *structure* is immutable and safe to cache; a
 //! **mutable class-variable value**, however, must be read live from the bstack —
 //! another handle can rewrite its fixed-size slot in place.
 //!
 //! ## Codec
 //!
-//! [`encode_type`] / [`decode_type`] are the symmetric serialize / deserialize
-//! pair for a type's record body; [`RttiRegistry::append`] frames + `push`es one,
-//! [`RttiRegistry::load_type`] reads + decodes one. The `Shape` grammar parses
+//! `encode_type` / `decode_type` are the symmetric serialize / deserialize
+//! pair for a type's record body; `RttiRegistry::append` frames + `push`es one,
+//! `RttiRegistry::load_type` reads + decodes one. The `Shape` grammar parses
 //! recursively — safe because a shape's depth is bounded by the *source type*
 //! nesting, never by data depth (the data walk, added later, is the one that must
 //! stay non-recursive).
@@ -33,15 +33,15 @@
 //!
 //! Read + write of struct and enum records is in place; the on-disk RTTI-typed
 //! pointer is the existing [`WidePtr`] (its `type_index` is the ordinal `+ 1`).
-//! The `#[bstack_class]` macro fills [`RTTI_TYPES`] at link time, and [`sync`]
-//! appends every missing schema to a file. [`RttiRegistry::read_value`] /
-//! [`RttiRegistry::read_ptr`] are the non-recursive **read interpreter** (schema over
-//! a live data file → a [`Value`] tree, no compiled-in types), and
-//! [`RttiRegistry::teardown`] is the non-recursive **free interpreter** (reclaims
+//! The `#[bstack_class]` macro fills `RTTI_TYPES` at link time, and `sync`
+//! appends every missing schema to a file. `RttiRegistry::read_value` /
+//! `RttiRegistry::read_ptr` are the non-recursive **read interpreter** (schema over
+//! a live data file → a `Value` tree, no compiled-in types), and
+//! `RttiRegistry::teardown` is the non-recursive **free interpreter** (reclaims
 //! `owned` / `embed` / `strong` / `weak` / `ref` / `vec` / array / tuple / option,
-//! refcount decrements and all), and [`RttiRegistry::clone_value`] is the
+//! refcount decrements and all), and `RttiRegistry::clone_value` is the
 //! non-recursive **deep-clone interpreter** (owned deep-copied, shared
-//! refcount-bumped). [`RttiRegistry::class_value`] / [`RttiRegistry::set_class_value`]
+//! refcount-bumped). `RttiRegistry::class_value` / `RttiRegistry::set_class_value`
 //! read and write a `#[bstack_static]` class variable's value live in the schema
 //! stack (a `#[bstack_mut]` one is set in place, crash-atomically). Cross-file
 //! `Foreign` pointers are handled too — scalar or inside a `Vec` / array / tuple —
@@ -49,15 +49,15 @@
 //! acting on it in place.
 //!
 //! Individual fields are reached by a **path** (`["outer", "inner", …]`):
-//! [`get`](RttiRegistry::get) reads one field, [`set`](RttiRegistry::set) overwrites
-//! a POD / `ref` leaf, and [`swap`](RttiRegistry::swap) exchanges an owning reference
+//! `get` reads one field, `set` overwrites
+//! a POD / `ref` leaf, and `swap` exchanges an owning reference
 //! for another (eightcc-checked), handing the old target back.
-//! [`move_out`](RttiRegistry::move_out) disassembles a block into its owned parts (a
-//! [`SmallStringMap`]`<`[`Moved`]`>`), freeing only the shell — the RTTI `bstack_move!`.
+//! `move_out` disassembles a block into its owned parts (a
+//! [`SmallStringMap`]`<``Moved``>`), freeing only the shell — the RTTI `bstack_move!`.
 //!
-//! [`AnyRef`] bridges back to compiled-in types: it is the RTTI `&dyn Any`, whose
-//! [`downcast`](AnyRef::downcast) hands back a real typed handle on an eightcc match,
-//! falling back to generic interpretation ([`RttiRegistry::read_any`]) otherwise.
+//! `AnyRef` bridges back to compiled-in types: it is the RTTI `&dyn Any`, whose
+//! `downcast` hands back a real typed handle on an eightcc match,
+//! falling back to generic interpretation (`RttiRegistry::read_any`) otherwise.
 
 use crate::primitives::WidePtr;
 use crate::types::compiled::rc::CTRL_DATA_OFFSET;
@@ -177,7 +177,7 @@ pub fn typed_ptr(file_id: u64, offset: u64, ordinal: RttiOrdinal) -> WidePtr {
 }
 
 /// Build an RTTI field path from **dotted field names** for
-/// [`get`](RttiRegistry::get) / [`set`](RttiRegistry::set) / [`swap`](RttiRegistry::swap):
+/// `get` / `set` / `swap`:
 /// `rtti_path!(outer.inner.leaf)` expands to `&["outer", "inner", "leaf"]`, and a
 /// single name `rtti_path!(field)` to `&["field"]`. The result is a `&[&str]`, so it
 /// drops straight into the path argument.
