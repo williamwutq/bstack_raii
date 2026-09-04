@@ -131,8 +131,14 @@ impl RttiRegistry {
         // weak is released and no real weak handles remain (else it stays, with
         // strong == 0 refusing any upgrade).
         let mut to_free = vec![BStackRange::new(block_off, cache[&ordinal].ondisk_size)];
-        if let Some(ctrl_off) = ctrl_off
-            && refcount::fetch_sub(data, ctrl_off.checked_add(CTRL_WEAK_OFFSET)?, 1)? == 1
+        // For `(rc, weak)`: release the phantom weak, and free the control block too if
+        // it was the last handle. The weak counter slot is bound once so a commit
+        // failure below can restore this decrement (symmetric with the strong restore).
+        let weak_slot = ctrl_off
+            .map(|c| c.checked_add(CTRL_WEAK_OFFSET))
+            .transpose()?;
+        if let (Some(ctrl_off), Some(weak_slot)) = (ctrl_off, weak_slot)
+            && refcount::fetch_sub(data, weak_slot, 1)? == 1
         {
             to_free.push(BStackRange::new(ctrl_off.as_u64(), CONTROL_SIZE));
         }
@@ -144,6 +150,19 @@ impl RttiRegistry {
         // the control block, if included, has no remaining references; both live in
         // this file.
         if let Err(e) = unsafe { crate::io_core::commit_home_frees(alloc, to_free) } {
+            // The shell free is atomic, so on its failure the object is still fully
+            // present (the moved-out parts live only in `map`, dropped here as
+            // non-owning tokens that free nothing). Restore the refcounts the commit
+            // path took — the CAS'd strong and, for `(rc, weak)`, the phantom-weak
+            // decrement — so the still-intact object keeps its sole owner (and a live
+            // weak can still recover it), honoring move_out's "left intact on error"
+            // contract just as the move_fields error path does.
+            if let Some(slot) = strong_slot {
+                let _ = refcount::fetch_add(data, slot, 1);
+            }
+            if let Some(weak_slot) = weak_slot {
+                let _ = refcount::fetch_add(data, weak_slot, 1);
+            }
             // SAFETY: `materialized` are this call's own embed copies.
             let _ = unsafe { alloc.free_many(std::mem::take(&mut materialized)) };
             return Err(e.into());
