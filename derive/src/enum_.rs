@@ -7,7 +7,7 @@ use syn::{Error, Fields, Ident};
 
 use crate::emit::*;
 use crate::layout;
-use crate::model::{VariantCtx, VariantParts};
+use crate::model::{EUsage, VariantCtx, VariantParts};
 use crate::util::*;
 
 /// Implementation of the `#[bstack_enum]` attribute macro.
@@ -40,17 +40,7 @@ pub fn expand_enum(attr: TokenStream, input: syn::ItemEnum) -> syn::Result<Token
             ));
         }
     }
-    #[derive(Default)]
-    struct EUsage {
-        strong: bool,
-        weak: bool,
-        /// The param is the target of a `#[bstack_owned] V(Foreign<T>)` variant (an
-        /// owned foreign deep-clone runs `try_clone_in`, needing `TryCloneIn`).
-        foreign_owned: bool,
-        /// The param is the target of *any* `Foreign<T>` variant; `Foreign<'a, T>`
-        /// requires `T: 'static`.
-        foreign: bool,
-    }
+    // Per-parameter usage across variants (see `EUsage` in `model`).
     let mut eusage: Vec<(Ident, EUsage)> = type_params
         .iter()
         .map(|p| ((*p).clone(), EUsage::default()))

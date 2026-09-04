@@ -15,7 +15,7 @@ use quote::{format_ident, quote};
 use syn::{Error, Fields, Ident, ItemStruct, Type};
 
 use crate::emit::*;
-use crate::model::{FieldCtx, FieldParts};
+use crate::model::{FieldCtx, FieldParts, Usage};
 use crate::util::*;
 
 pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> {
@@ -95,33 +95,9 @@ pub fn expand(attr: TokenStream, input: ItemStruct) -> syn::Result<TokenStream> 
     let on_disk = format_ident!("{}OnDisk", name);
     let control = format_ident!("{}OnDiskRef", name);
 
-    // Per-parameter usage across fields — driving both the trait bound and whether
-    // the parameter is stored INLINE (making `XOnDisk`, and its `size_of` /
-    // `offset_of`, depend on it). A parameter is either a **POD** value (`T: Pod`,
-    // stored by value) or a **block reference / embed** (`T: BStackBlock`, plus
-    // `BStackShared` / `BStackWeakable` for strong / weak elements). `ref` / `owned`
-    // / `strong` / `weak` lower to a bare `u64` offset (not in `XOnDisk`); `#[embed]`
-    // and POD store the type inline (in `XOnDisk`).
-    #[derive(Default)]
-    struct Usage {
-        pod: bool,
-        blockish: bool,
-        strong: bool,
-        weak: bool,
-        in_ondisk: bool,
-        /// The parameter is the target of a `#[bstack_owned] Foreign<T>` (scalar or in
-        /// a container). Unlike a plain owned child (cloned via `__bstack_clone_into`,
-        /// needing only `BStackBlock`), an owned foreign deep-clone runs a self-
-        /// contained `try_clone_in` on the target's file, so it needs `TryCloneIn`.
-        foreign_owned: bool,
-        /// The parameter is the target of *any* `Foreign<T>` (any kind). `Foreign<'a, T>`
-        /// requires `T: 'static`, so such a parameter needs the `'static` bound even
-        /// though a foreign target is never stored inline (so `in_ondisk` is not set).
-        foreign: bool,
-        /// The parameter is `#[embed]`ded (inlined). `#[embed]` targets must be
-        /// self-contained (`BStackEmbeddable`) — never `(rc)` / `(rc, weak)`.
-        embed: bool,
-    }
+    // Per-parameter usage across fields (see `Usage` in `model`) — driving both the
+    // trait bound and whether the parameter is stored INLINE (making `XOnDisk`, and
+    // its `size_of` / `offset_of`, depend on it).
     let mut usage: Vec<(Ident, Usage)> = type_params
         .iter()
         .map(|p| ((*p).clone(), Usage::default()))

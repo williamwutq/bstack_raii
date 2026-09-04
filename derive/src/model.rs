@@ -67,6 +67,55 @@ pub(crate) struct VariantCtx<'a> {
     pub payload_const: &'a Ident,
 }
 
+/// Per-generic-parameter usage across a `#[bstack_block]` struct's fields — driving
+/// both the trait bound the parameter gets and whether it is stored INLINE (making
+/// `XOnDisk`, and its `size_of` / `offset_of`, depend on it). A parameter is either a
+/// **POD** value (`T: Pod`, stored by value) or a **block reference / embed**
+/// (`T: BStackBlock`, plus `BStackShared` / `BStackWeakable` for strong / weak
+/// elements). `ref` / `owned` / `strong` / `weak` lower to a bare `u64` offset (not in
+/// `XOnDisk`); `#[embed]` and POD store the type inline (in `XOnDisk`).
+///
+/// [`crate::block`] fills one per type parameter while walking the fields, then reads
+/// it back to build the augmented generics (the `where`-clause bounds) and the
+/// `XOnDisk` parameter list. The `#[bstack_enum]` analogue is [`EUsage`].
+#[derive(Default)]
+pub(crate) struct Usage {
+    pub pod: bool,
+    pub blockish: bool,
+    pub strong: bool,
+    pub weak: bool,
+    pub in_ondisk: bool,
+    /// The parameter is the target of a `#[bstack_owned] Foreign<T>` (scalar or in
+    /// a container). Unlike a plain owned child (cloned via `__bstack_clone_into`,
+    /// needing only `BStackBlock`), an owned foreign deep-clone runs a self-
+    /// contained `try_clone_in` on the target's file, so it needs `TryCloneIn`.
+    pub foreign_owned: bool,
+    /// The parameter is the target of *any* `Foreign<T>` (any kind). `Foreign<'a, T>`
+    /// requires `T: 'static`, so such a parameter needs the `'static` bound even
+    /// though a foreign target is never stored inline (so `in_ondisk` is not set).
+    pub foreign: bool,
+    /// The parameter is `#[embed]`ded (inlined). `#[embed]` targets must be
+    /// self-contained (`BStackEmbeddable`) — never `(rc)` / `(rc, weak)`.
+    pub embed: bool,
+}
+
+/// Per-generic-parameter usage across a `#[bstack_enum]`'s variants — the [`Usage`]
+/// analogue for the enum path. Fewer fields: an enum parameter is always a reference
+/// (a POD / `#[embed]` variant storing it inline is rejected up front, since its
+/// payload width would then depend on the parameter), so there is no `pod` / `embed` /
+/// `in_ondisk` axis; only the reference-kind bounds and the foreign target flags.
+#[derive(Default)]
+pub(crate) struct EUsage {
+    pub strong: bool,
+    pub weak: bool,
+    /// The param is the target of a `#[bstack_owned] V(Foreign<T>)` variant (an
+    /// owned foreign deep-clone runs `try_clone_in`, needing `TryCloneIn`).
+    pub foreign_owned: bool,
+    /// The param is the target of *any* `Foreign<T>` variant; `Foreign<'a, T>`
+    /// requires `T: 'static`.
+    pub foreign: bool,
+}
+
 /// Everything one enum **variant** contributes to the generated block, grouped by
 /// the match arm / helper enum it lands in. The parallel of [`FieldParts`] for the
 /// `#[bstack_enum]` path: a shape-lowering `emit::*_variant` fills the relevant
