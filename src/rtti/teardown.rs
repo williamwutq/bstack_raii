@@ -224,6 +224,10 @@ impl RttiRegistry {
                             let stride = self.shape_stride(&inner, &mut cache)?;
                             let byte_len = read_u64(data, data_off)?;
                             let len = checked_vec_len(byte_len, data_size, stride)?;
+                            // Peel any `Option` wrapper: an `Option<owned/strong/weak>`
+                            // element shares the bare leaf's nullable slot and must be
+                            // released, not fall through as inert POD (which would leak).
+                            let elem = inner.peel_option();
                             // Charge for all elements up front — `len` comes off the
                             // (untrusted) descriptor, and the element ops are pushed
                             // eagerly, so a huge count must fail cleanly here rather than
@@ -235,7 +239,7 @@ impl RttiRegistry {
                                     "RTTI teardown budget exceeded (corrupt data or a cycle?)"
                                 )
                             })?;
-                            match &*inner {
+                            match elem {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {

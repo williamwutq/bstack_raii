@@ -262,8 +262,11 @@ impl<K: Pod> BStackHashSet<K> {
         let stride = Self::stride();
         let ksz = Self::ksize();
         loop {
+            // `cap`/`used` are untrusted on-disk fields, so widen to `u128` for the
+            // load-factor multiply — a forged huge `cap` must not overflow-panic here
+            // (it is rejected by the stack bound in `grow`).
             let [cap, _len, used] = read_fields::<3>(allocator.stack(), handle + CAP_OFF)?;
-            if cap == 0 || (used + 1) * 4 > cap * 3 {
+            if cap == 0 || (used as u128 + 1) * 4 > cap as u128 * 3 {
                 self.grow(allocator)?;
                 continue;
             }
@@ -431,8 +434,16 @@ impl<K: Pod> BStackBlock for BStackHashSet<K> {
         let [table, cap, _len, _used, bloom_off] =
             read_fields::<5>(allocator.stack(), handle + TABLE_OFF)?;
         if table != 0 {
+            // Untrusted `cap`: checked math (a wrap would size the freed range wrong)
+            // and a stack bound, mirroring the clone path below and the `map` sibling.
+            let table_size = cap
+                .checked_mul(Self::stride())
+                .ok_or_else(|| io_error!("hash set capacity overflow"))?;
+            if table_size > allocator.stack().len()? {
+                return Err(io_error!("hash set bucket block larger than the stack"));
+            }
             // SAFETY: the set solely owns its bucket block.
-            unsafe { dealloc_range(allocator, BStackRange::new(table, cap * Self::stride()))? };
+            unsafe { dealloc_range(allocator, BStackRange::new(table, table_size))? };
         }
         if bloom_off != 0 {
             // SAFETY: the set solely owns its embedded Bloom filter.

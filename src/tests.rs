@@ -7617,12 +7617,45 @@ fn foreign_weak_into_local_weak_self_decrements() {
     let (_, weak): (u32, crate::ForeignWeak<MacroStrongChild>) = bstack_move!(h, &alloc).unwrap();
     assert!(weak.is_self());
     // Resolve to a live in-file `BStackWeak`; dropping it decrements weak 2 -> 1.
-    let local = weak.into_local(&alloc);
+    let local = weak.into_local(&alloc).unwrap();
     drop(local);
     assert_eq!(
         load(weak_off),
         1,
         "into_local + drop must decrement the weak count"
+    );
+}
+
+#[test]
+fn foreign_into_local_rejects_wrong_file_target() {
+    // The safe `into_local` on a strong / weak foreign must reject an explicit-`FileId`
+    // pointer whose home file is not the given target allocator's file: otherwise the
+    // returned handle's drop would decrement / free at the stored offset in the WRONG
+    // file (a double-free / UAF reachable from entirely safe code). The `ForeignOwned`
+    // sibling already enforced this; `ForeignRc` / `ForeignWeak` now match it. (A `SELF`
+    // pointer carries no id to check — the `*_self_*` tests above cover that path.)
+    use crate::Foreign;
+    use crate::registry::FileId;
+
+    let tmp = TempStack::new();
+    let alloc = tmp.allocator(); // a plain local file; not the host of file id 3
+    // An explicit cross-file pointer naming a file this target does not host. Offset is
+    // immaterial: the file guard fires before any block is read.
+    let elsewhere = FileId::from_u64(3).unwrap();
+
+    let rc =
+        unsafe { crate::ForeignRc::from_foreign(Foreign::<MacroStrongChild>::new(elsewhere, 64)) };
+    assert!(
+        rc.into_local(&alloc).is_err(),
+        "ForeignRc::into_local must reject a wrong-file target"
+    );
+
+    let weak = unsafe {
+        crate::ForeignWeak::from_foreign(Foreign::<MacroStrongChild>::new(elsewhere, 64))
+    };
+    assert!(
+        weak.into_local(&alloc).is_err(),
+        "ForeignWeak::into_local must reject a wrong-file target"
     );
 }
 

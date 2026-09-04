@@ -853,7 +853,14 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
         if off == 0 {
             return Ok(None);
         }
+        // A forged cyclic leftmost/rightmost chain never reaches a leaf; bound the
+        // descent like `get` so it errors instead of looping forever.
+        let mut depth = 0u32;
         loop {
+            depth += 1;
+            if depth > MAX_TREE_DEPTH {
+                return Err(depth_exceeded());
+            }
             let nb = Self::read_node(stack, off)?;
             if nb.leaf {
                 let i = if leftmost { 0 } else { nb.keys.len() - 1 };
@@ -875,23 +882,28 @@ impl<K: Pod + Ord, V: BStackBlock> BStackBTreeMap<K, V> {
     pub fn to_vec(&self, stack: &BStack) -> io::Result<Vec<(K, V)>> {
         let mut out = Vec::new();
         let root = read_u64(stack, self.range.start() + ROOT_OFF)?;
-        Self::collect(stack, root, &mut out)?;
+        Self::collect(stack, root, 0, &mut out)?;
         Ok(out)
     }
 
-    fn collect(stack: &BStack, off: u64, out: &mut Vec<(K, V)>) -> io::Result<()> {
+    fn collect(stack: &BStack, off: u64, depth: u32, out: &mut Vec<(K, V)>) -> io::Result<()> {
         if off == 0 {
             return Ok(());
+        }
+        // A forged cyclic child pointer would otherwise recurse until the native
+        // stack overflows; bound the descent like every sibling walk.
+        if depth >= MAX_TREE_DEPTH {
+            return Err(depth_exceeded());
         }
         let nb = Self::read_node(stack, off)?;
         for i in 0..nb.keys.len() {
             if !nb.leaf {
-                Self::collect(stack, nb.children[i], out)?;
+                Self::collect(stack, nb.children[i], depth + 1, out)?;
             }
             out.push((Self::read_key(&nb.keys[i]), Self::value_at(nb.vals[i])));
         }
         if !nb.leaf {
-            Self::collect(stack, nb.children[nb.keys.len()], out)?;
+            Self::collect(stack, nb.children[nb.keys.len()], depth + 1, out)?;
         }
         Ok(())
     }

@@ -89,6 +89,21 @@ impl Shape {
             _ => read_u64(data, base)? != 0,
         })
     }
+
+    /// Strip any leading `Option` wrapper(s), returning the inner leaf shape. An
+    /// `Option<owned/strong/weak/foreign>` element occupies the **same** on-disk slot as
+    /// the bare leaf (a nullable offset / `WidePtr`, `0`/null = `None`), so the
+    /// destructive `Vec` walks in `teardown` / `clone` dispatch on the peeled leaf — an
+    /// `Option`-wrapped owning element must be freed / deep-copied exactly as the bare
+    /// one is, never fall through as inert POD (which would leak, or alias the source's
+    /// children into the clone → double-free). Mirrors [`foreign_leaf`](Self::foreign_leaf)
+    /// / [`element_ref_tag`](Self::element_ref_tag), which already peel `Option`.
+    pub(in crate::rtti) fn peel_option(&self) -> &Shape {
+        match self {
+            Shape::Option(inner) => inner.peel_option(),
+            other => other,
+        }
+    }
 }
 
 impl RttiRegistry {

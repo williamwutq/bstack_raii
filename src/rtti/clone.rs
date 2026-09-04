@@ -377,7 +377,11 @@ impl RttiRegistry {
                             })?;
                             let sbase = add_off(src_data, BYTEVEC_HEADER)?;
                             let nbase = add_off(new_data, BYTEVEC_HEADER)?;
-                            match &*inner {
+                            // Peel any `Option` wrapper: an `Option<owned/strong/weak>`
+                            // element shares the bare leaf's nullable slot, so it must
+                            // clone+repoint (not fall through as POD, which would leave
+                            // the copy aliasing the source's children → double-free).
+                            match inner.peel_option() {
                                 Shape::Owned(tag) => {
                                     let ord = self.ordinal_of(*tag).ok_or_else(unknown_tag)?;
                                     for i in 0..len {

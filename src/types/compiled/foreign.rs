@@ -21,8 +21,36 @@ use super::super::traits::{BStackBlock, BStackRef, BStackShared, BStackWeakable,
 use super::{BStackOwned, BStackRc, BStackWeak};
 use crate::BStackRaiiAllocator;
 use crate::io_core::foreign::{foreign_drop_owned, foreign_drop_strong, foreign_drop_weak};
+use crate::primitives::WidePtr;
 use crate::registry::{self, FileId};
 use crate::util::io_error;
+
+/// Reject an explicit-`FileId` (non-[`SELF`](FileId::SELF)) foreign pointer whose home
+/// file is not the file `target` addresses. The three `into_local` methods hand back an
+/// in-file handle (`BStackOwned` / `BStackRc` / `BStackWeak`) whose safe drop
+/// decrements/frees at the *stored offset interpreted in `target`'s file*; binding that
+/// handle to the wrong file would free an unrelated block there. A `SELF` pointer
+/// carries no identity to check — it is only meaningful in the file it was read from, so
+/// the caller keeps that obligation (exactly as for a cast-produced [`BStackRef`]).
+fn ensure_target_file<A: BStackRaiiAllocator>(repr: WidePtr, target: &A) -> io::Result<()> {
+    if repr.is_self() {
+        return Ok(());
+    }
+    // Resolve `target`'s identity: its adapter-declared id (a `ForeignHostAllocator`),
+    // or the registry's reverse map for a plain allocator over an attached file.
+    let target_id = match target.wal_file_id() {
+        FileId::SELF => registry::id_of_host(target.stack()),
+        id => Some(id),
+    };
+    if target_id.map(FileId::as_u64) != Some(repr.file_id()) {
+        return Err(io_error!(
+            InvalidInput,
+            "Foreign::into_local: the pointer's home file is not the given target \
+             allocator's file"
+        ));
+    }
+    Ok(())
+}
 
 /// The RAII dual of [`BStackOwned`](crate::BStackOwned) for a target owned through a
 /// [`Foreign`] pointer. [`bstack_drop`](Self::bstack_drop) deep-frees the target in its
@@ -118,25 +146,9 @@ impl<'a, T: BStackBlock + 'static> ForeignOwned<'a, T> {
     /// the caller keeps that obligation, exactly as for a cast-produced
     /// [`BStackRef`].
     pub fn into_local<A: BStackRaiiAllocator>(self, target: &A) -> io::Result<BStackOwned<T>> {
-        let repr = self.ptr.repr();
-        // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file;
-        // `SELF` carries no identity to check.
-        if !repr.is_self() {
-            // Resolve `target`'s identity: its adapter-declared id (a
-            // `ForeignHostAllocator`), or the registry's reverse map for a plain
-            // allocator over an attached file.
-            let target_id = match target.wal_file_id() {
-                FileId::SELF => registry::id_of_host(target.stack()),
-                id => Some(id),
-            };
-            if target_id.map(FileId::as_u64) != Some(repr.file_id()) {
-                return Err(io_error!(
-                    InvalidInput,
-                    "ForeignOwned::into_local: the pointer's home file is not the \
-                     given target allocator's file"
-                ));
-            }
-        }
+        // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file, else
+        // the returned handle's safe `bstack_drop` would free in the wrong file.
+        ensure_target_file(self.ptr.repr(), target)?;
         // SAFETY: `self` was the sole owner (its `from_foreign` contract) and is
         // consumed here, so the returned `BStackOwned` becomes the sole owner of the
         // same live block, in the target's own file.
@@ -200,6 +212,10 @@ impl<'a, T: BStackShared + 'static> ForeignRc<'a, T> {
         self,
         target: &'t A,
     ) -> io::Result<BStackRc<'t, T, A>> {
+        // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file, else
+        // the returned `BStackRc`'s drop would decrement/free the strong count in the
+        // wrong file. (Also avoids reading a bogus control block from that file below.)
+        ensure_target_file(self.ptr.repr(), target)?;
         // SAFETY: the stored offset is the target's live shared data block.
         let data = unsafe { BStackRef::<T>::from_range(self.ptr.range()) };
         let (data, ctrl) = <T as BStackShared>::strong_parts(data, target)?;
@@ -250,9 +266,17 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
     /// Resolve to a live [`BStackWeak<T>`](crate::BStackWeak) bound to `target` — the
     /// in-file **weak** handle for the target's own file. Consumes `self`, transferring
     /// the single weak reference. `target` must address the target's file (the home
-    /// allocator for a [`SELF`](FileId::SELF) target, else the target file's host).
-    /// Infallible: a weak handle only names the control block.
-    pub fn into_local<'t, A: BStackRaiiAllocator>(self, target: &'t A) -> BStackWeak<'t, T, A> {
+    /// allocator for a [`SELF`](FileId::SELF) target, else the target file's host); an
+    /// explicit-`FileId` pointer whose home is not `target`'s file is rejected
+    /// (`InvalidInput`), since the returned handle's drop would decrement the weak count
+    /// in the wrong file.
+    pub fn into_local<'t, A: BStackRaiiAllocator>(
+        self,
+        target: &'t A,
+    ) -> io::Result<BStackWeak<'t, T, A>> {
+        // An explicit-`FileId` pointer (non-`SELF`) must name `target`'s own file, else
+        // the returned `BStackWeak`'s drop would decrement/free in the wrong file.
+        ensure_target_file(self.ptr.repr(), target)?;
         let ctrl_off = self.ptr.offset().get();
         // SAFETY: a weak `Foreign` stores the target's control-block offset.
         let ctrl = unsafe {
@@ -263,6 +287,6 @@ impl<'a, T: BStackWeakable + 'static> ForeignWeak<'a, T> {
         };
         // SAFETY: `self` held one weak ref (its `from_foreign` contract) and is
         // consumed, so the returned handle accounts for exactly that count.
-        unsafe { BStackWeak::from_raw(ctrl, target) }
+        Ok(unsafe { BStackWeak::from_raw(ctrl, target) })
     }
 }
