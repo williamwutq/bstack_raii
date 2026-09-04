@@ -128,7 +128,12 @@ impl RttiRegistry {
     /// has a *further* obligation validation can't cover: a POD image may overwrite
     /// invariant-bearing bytes even at a correct base.) Unlike [`verify_data_block`], a
     /// null base is rejected here: a live instance never sits at offset 0.
-    fn verify_block_of(&self, data: &BStack, block_off: u64, ordinal: RttiOrdinal) -> RttiResult<()> {
+    fn verify_block_of(
+        &self,
+        data: &BStack,
+        block_off: u64,
+        ordinal: RttiOrdinal,
+    ) -> RttiResult<()> {
         let off = Offset::from_raw(block_off);
         if off.is_null() {
             return Err(rtti_err!(

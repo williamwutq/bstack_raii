@@ -152,7 +152,18 @@ impl<T: Pod> BStackMove for BStackBox<T> {
         allocator: &A,
     ) -> io::Result<T> {
         let me = owned.into_inner();
-        let value = me.get(allocator.stack())?;
+        // Read the value out before freeing the shell. `into_inner` already defused the
+        // owning wrapper, so on a read fault the shell would leak — free it on the error
+        // path too. The box was consumed by value and its `Pod` payload has no child to
+        // hand back, so freeing-then-erroring is the correct contract.
+        let value = match me.get(allocator.stack()) {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY: `me` was the sole owner (from a `BStackOwned`); freed once.
+                let _ = unsafe { dealloc_range(allocator, me.range) };
+                return Err(e);
+            }
+        };
         // Childless: free the shell after reading the value out.
         // SAFETY: `me` was the sole owner (it came from a `BStackOwned`).
         unsafe { dealloc_range(allocator, me.range)? };

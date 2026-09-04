@@ -611,11 +611,7 @@ fn interpret_teardown_strong_rc() {
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
     let base = alloc.len().unwrap();
     unsafe { reg.teardown(&alloc, ord, build()) }.unwrap();
-    assert_eq!(
-        alloc.len().unwrap(),
-        base,
-        "strong(rc) teardown leaked"
-    );
+    assert_eq!(alloc.len().unwrap(), base, "strong(rc) teardown leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();
@@ -679,11 +675,7 @@ fn interpret_teardown_weak_field() {
     cycle();
     let base = alloc.len().unwrap();
     cycle();
-    assert_eq!(
-        alloc.len().unwrap(),
-        base,
-        "weak-field teardown leaked"
-    );
+    assert_eq!(alloc.len().unwrap(), base, "weak-field teardown leaked");
 
     drop(reg);
     std::fs::remove_file(&schema).ok();

@@ -9295,11 +9295,7 @@ fn macro_foreign_in_tuple_across_files() {
 
     h.bstack_drop(&home_alloc).unwrap();
     c.bstack_drop(&home_alloc).unwrap();
-    assert_eq!(
-        arc_b.len().unwrap(),
-        base,
-        "foreign-in-tuple leaked"
-    );
+    assert_eq!(arc_b.len().unwrap(), base, "foreign-in-tuple leaked");
     reg.detach(fid);
 }
 
