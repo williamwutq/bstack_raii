@@ -397,8 +397,17 @@ mod freemany {
         let mut partials = 0usize;
         let mut continued = false;
         for target in 0..24u64 {
-            // Re-allocate a fresh trio each sweep so each run starts clean.
-            let alloc2 = FirstFitBStackAllocator::new(
+            // Re-allocate a fresh trio each sweep so each run starts clean. Wrapped in
+            // `Recorder` (shared with the O5 harness) rather than a bare
+            // `FirstFitBStackAllocator`: it records a range into `freed()` only when
+            // the *underlying* `dealloc` genuinely completes, which is the sound,
+            // non-destructive way to ask "was this range actually freed?" A fresh
+            // `dealloc_range` re-probe on the original offset (the previous approach
+            // here) is UB once two adjacent frees coalesce — the higher block's header
+            // is absorbed into the merged free block, so the re-probe reads whatever
+            // bytes happen to be there instead of detecting "already free", and can
+            // itself corrupt the free list.
+            let alloc2 = crate::recorder::Recorder::new(
                 BStack::open(path.with_extension(format!("s{target}"))).unwrap(),
             )
             .unwrap();
@@ -413,22 +422,21 @@ mod freemany {
             let r = unsafe { alloc2.free_many(rs.clone()) };
             alloc2.stack().set_fault_policy(None);
 
-            // Probe which of the three are still allocated afterwards: a fresh
-            // `dealloc_range` succeeds on a still-allocated block and reports
-            // "already free" on one `free_many` already reclaimed.
-            let still_allocated: Vec<BStackRange> = rs
+            let freed: std::collections::BTreeSet<u64> =
+                alloc2.freed().into_iter().map(|(start, _)| start).collect();
+            let actual: std::collections::BTreeSet<u64> = rs
                 .iter()
-                .copied()
-                .filter(|x| unsafe { bstack_raii::dealloc_range(&alloc2, *x) }.is_ok())
+                .map(BStackRange::start)
+                .filter(|start| !freed.contains(start))
                 .collect();
 
             match r {
                 Ok(()) => {
                     // No fault landed on a dealloc: everything was freed.
                     assert!(
-                        still_allocated.is_empty(),
+                        actual.is_empty(),
                         "fault@{target}: free_many returned Ok but left {} range(s) allocated",
-                        still_allocated.len()
+                        actual.len()
                     );
                 }
                 Err(e) => {
@@ -441,13 +449,11 @@ mod freemany {
                         .expect("a partial free_many returns a FreeManyError source");
                     let reported: std::collections::BTreeSet<u64> =
                         fme.unfreed().iter().map(|r| r.start()).collect();
-                    let actual: std::collections::BTreeSet<u64> =
-                        still_allocated.iter().map(|r| r.start()).collect();
                     // Every range genuinely still allocated is reported, so the caller
-                    // never silently leaks one. (`dealloc_range` is not atomic against
-                    // an injected mid-op fault, so `reported` may *over*-report a range
-                    // whose free completed before a follow-up op faulted — hence
-                    // superset, not equality.)
+                    // never silently leaks one. (A single `dealloc` is not atomic
+                    // against an injected mid-op fault, so `reported` may *over*-report
+                    // a range whose free completed before a follow-up op faulted —
+                    // hence superset, not equality.)
                     assert!(
                         actual.is_subset(&reported),
                         "fault@{target}: a still-allocated range was not reported: \

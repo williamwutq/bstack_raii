@@ -233,9 +233,14 @@ mod tddiff {
         let schema = std::env::temp_dir().join(format!("bstack_raii_tdd_s_{stamp}.bstack"));
         let data = std::env::temp_dir().join(format!("bstack_raii_tdd_d_{stamp}.bstack"));
         let reg = rtti::sync(&schema).unwrap();
-        // FirstFit *reports* a double free as `Err`; DebugCheckingAllocator panics, which
-        // would stop the sweep at the first reclaimed block.
-        let alloc = FirstFitBStackAllocator::new(BStack::open(&data).unwrap()).unwrap();
+        // `Recorder` (shared with the O5 harness): it records a range into `freed()`
+        // only when the underlying `dealloc` genuinely completes, so the sweep below
+        // can tell which of `rec`'s blocks teardown actually reclaimed without a
+        // second, destructive `dealloc_range` probe per range (unsound once two
+        // adjacent frees coalesce — the higher block's header is absorbed into the
+        // merged free block) and without `DebugCheckingAllocator`'s panic-on-first-
+        // double-free, which would stop the sweep at the first reclaimed block.
+        let alloc = crate::recorder::Recorder::new(BStack::open(&data).unwrap()).unwrap();
 
         // --- build ------------------------------------------------------------
         let a = Leaf::new(&alloc, 1).unwrap();
@@ -301,17 +306,18 @@ mod tddiff {
         unsafe { reg.teardown(&alloc, ord, root_off) }.unwrap();
 
         // --- probe ------------------------------------------------------------
+        // Non-destructive: a block teardown missed is one whose `(off, len)` never
+        // passed through `alloc.dealloc()`, per `Recorder`'s ground-truth log — not
+        // one a stale-offset re-probe merely failed to detect as free.
+        let freed: std::collections::BTreeSet<(u64, u64)> = alloc.freed().into_iter().collect();
         println!("after RttiRegistry::teardown:");
         let mut missed = Vec::new();
         for (name, off, len) in &rec {
-            let r =
-                unsafe { bstack_raii::dealloc_range(&alloc, bstack::BStackRange::new(*off, *len)) };
-            match r {
-                Ok(()) => {
-                    println!("  MISSED  {name:<12} @{off} ({len} B) — still allocated");
-                    missed.push(*name);
-                }
-                Err(e) => println!("  freed   {name:<12} @{off} ({len} B)  [{e}]"),
+            if freed.contains(&(*off, *len)) {
+                println!("  freed   {name:<12} @{off} ({len} B)");
+            } else {
+                println!("  MISSED  {name:<12} @{off} ({len} B) — still allocated");
+                missed.push(*name);
             }
         }
         println!("\nRTTI missed: {missed:?}");
@@ -319,7 +325,7 @@ mod tddiff {
             missed.contains(&"d (ref, must survive)"),
             "a `ref` target must not be freed by teardown"
         );
-        let _ = d_keep.into_inner(); // the probe above already freed it
+        let _ = d_keep.into_inner(); // never freed (not in `alloc.freed()`); discard without a disk-level free
 
         std::fs::remove_file(&schema).ok();
         std::fs::remove_file(&data).ok();
