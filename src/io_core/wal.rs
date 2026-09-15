@@ -1059,7 +1059,9 @@ pub(crate) fn commit_frees<A: BStackRaiiAllocator>(
         // SAFETY: each range was collected from an owned handle's own teardown (or a
         // caller that asserts the same), so it is a live allocation no other handle
         // will also free.
-        return unsafe { allocator.free_many(slices.into_iter().map(|(_, r)| r)) };
+        unsafe { allocator.free_many(slices.into_iter().map(|(_, r)| r)) }?;
+        coalesce_best_effort(allocator);
+        return Ok(());
     }
     let held = HeldLock::acquire(allocator)?;
     let mut log = WalLog::with_capacity(slices.len());
@@ -1074,7 +1076,17 @@ pub(crate) fn commit_frees<A: BStackRaiiAllocator>(
     let wal_range = held.persist(allocator, &log, WalStatus::Pending)?;
     held.mark_complete(allocator, wal_range.start())?;
     held.finish(allocator)?;
+    coalesce_best_effort(allocator);
     Ok(())
+}
+
+/// Run [`BStackRaiiAllocator::coalesce_after_op`] now that a unit of frees has
+/// committed, swallowing a failure: the frees already landed, so a coalesce error
+/// only costs a missed reuse opportunity, not correctness — not worth failing an
+/// already-successful [`commit_frees`] over. A no-op for every allocator that
+/// coalesces automatically (the default trait method).
+fn coalesce_best_effort<A: BStackRaiiAllocator>(allocator: &A) {
+    let _ = allocator.coalesce_after_op();
 }
 
 /// Commit a batch of **home-file** owned-range frees for crash recovery, routed

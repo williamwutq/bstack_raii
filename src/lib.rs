@@ -99,7 +99,7 @@ pub use stdlib::{
     HashSetIter, HashSetOnDisk, HeapOnDisk, ListIter, ListOnDisk, MapOnDisk, NodeOnDisk,
     StringOnDisk, TreeOnDisk, TreeSetOnDisk,
 };
-pub use types::alloc::BStackRaiiAllocator;
+pub use types::alloc::{BStackRaiiAllocator, PeriodicCoalesceAllocator};
 pub use types::compiled::{
     BStackBlockVec, BStackOwned, BStackRc, BStackRefVec, BStackStrongVec, BStackVec, BStackWeak,
     BStackWeakVec, BlockHeader, ForeignOwned, ForeignRc, ForeignWeak, OwnedRef, StrongRef,

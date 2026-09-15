@@ -7,11 +7,13 @@
 //! module.
 
 pub mod host;
+pub mod periodic_coalesce;
 
 // Facade: the allocator capability ([`BStackRaiiAllocator`], below) plus its host
 // projection, re-exported at this module's root. (`registry` also re-exports the
 // host types, where the cross-file plumbing that consumes them lives.)
 pub use host::{BStackRaiiAllocError, BStackRaiiHost};
+pub use periodic_coalesce::PeriodicCoalesceAllocator;
 
 use std::io;
 
@@ -132,6 +134,36 @@ pub unsafe trait BStackRaiiAllocator: BStackOwnedSliceAllocator {
     fn atomic_bulk(&self) -> bool {
         false
     }
+
+    /// Called once after a unit of work that may have freed something commits —
+    /// currently, a whole subtree teardown's collected frees
+    /// ([`commit_frees`](crate::io_core::wal::commit_frees), the shared home for both
+    /// `wal_teardown` and the RTTI interpreter's free sink) — so an allocator whose
+    /// free-list does **not** coalesce automatically on every `dealloc` gets a
+    /// chance to merge adjacent free blocks back into reusable space. Not wired into
+    /// [`ClonePlan::commit`](crate::io_core::clone::ClonePlan::commit): a clone only
+    /// *allocates* (see the single-polarity note in `io_core::wal`), so it never has
+    /// anything fresh to coalesce and calling this there would just be a wasted scan.
+    ///
+    /// The default is a no-op: every allocator that coalesces eagerly (FirstFit,
+    /// GhostTree, Slab, CheckedSlab) needs nothing here and pays nothing for it. An
+    /// allocator with deferred coalescing (e.g. [`bstack::SegregatedBStackAllocator`],
+    /// whose own `coalesce()` is a separate, crash-atomic call by design — its
+    /// author's intent is "run it after a unit of work," the same granularity as a
+    /// GC pass after a task, not on every single free) overrides this to call it.
+    ///
+    /// Call sites treat a failure here as best-effort and swallow it: the unit of
+    /// work this follows has already committed, so a failed coalesce means less
+    /// space is immediately reusable until the next successful call — not a
+    /// correctness issue worth failing an already-succeeded operation over.
+    ///
+    /// A caller driving frees through [`free_many`](Self::free_many)/
+    /// [`dealloc_range`](crate::io_core::dealloc_range) directly, outside the
+    /// teardown/RTTI machinery, does not get this automatically — call
+    /// `coalesce_after_op` (or the allocator's own `coalesce`) explicitly when done.
+    fn coalesce_after_op(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A thread-shareable [`BStackRaiiAllocator`] — the bound a file's live host must
@@ -209,11 +241,13 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
 }
 // Segregated reserves 24 B at payload offset 0 (matching Slab/CheckedSlab), so
 // `STD_WAL_ANCHOR` at `[8, 16)` is safe here too. Its own free-list coalescing is
-// **not** automatic — the caller must run `SegregatedBStackAllocator::coalesce`
-// explicitly (itself crash-atomic and safe to call concurrently with alloc/dealloc)
-// to merge adjacent free blocks back into the largest size class; `bstack_raii`
-// takes no position on when that should happen, so a caller relying on coalescing
-// for space reuse must schedule it.
+// **not** automatic — merging adjacent free blocks back into the largest size class
+// needs an explicit `coalesce()` call, by design: the allocator's author intends it
+// to run once per unit of work (a whole teardown, a whole clone — the same
+// granularity as a GC pass after a task), not eagerly on every single free, which
+// would give it FirstFit's latency profile instead of Segregated's. `coalesce_after_op`
+// below wires that in at exactly the two commit points that mark "one unit of work
+// just landed" — see its doc on the trait.
 unsafe impl BStackRaiiAllocator for bstack::SegregatedBStackAllocator {
     fn wal_anchor(&self) -> Option<NonNullOffset> {
         Some(STD_WAL_ANCHOR)
@@ -221,6 +255,9 @@ unsafe impl BStackRaiiAllocator for bstack::SegregatedBStackAllocator {
     // Segregated implements `BStackBulkAllocator` — route the multi-block helpers
     // through the atomic bulk ops.
     bulk_raii_methods!();
+    fn coalesce_after_op(&self) -> io::Result<()> {
+        self.coalesce().map(|_merged_bytes| ())
+    }
 }
 // The O2 fuzz oracle (overlap / double-free) needs a checking wrapper around a
 // normal allocator; only this crate can bridge a `bstack`-foreign generic
