@@ -207,6 +207,21 @@ unsafe impl BStackRaiiAllocator for bstack::CheckedSlabBStackAllocator {
         Some(STD_WAL_ANCHOR)
     }
 }
+// Segregated reserves 24 B at payload offset 0 (matching Slab/CheckedSlab), so
+// `STD_WAL_ANCHOR` at `[8, 16)` is safe here too. Its own free-list coalescing is
+// **not** automatic — the caller must run `SegregatedBStackAllocator::coalesce`
+// explicitly (itself crash-atomic and safe to call concurrently with alloc/dealloc)
+// to merge adjacent free blocks back into the largest size class; `bstack_raii`
+// takes no position on when that should happen, so a caller relying on coalescing
+// for space reuse must schedule it.
+unsafe impl BStackRaiiAllocator for bstack::SegregatedBStackAllocator {
+    fn wal_anchor(&self) -> Option<NonNullOffset> {
+        Some(STD_WAL_ANCHOR)
+    }
+    // Segregated implements `BStackBulkAllocator` — route the multi-block helpers
+    // through the atomic bulk ops.
+    bulk_raii_methods!();
+}
 // The O2 fuzz oracle (overlap / double-free) needs a checking wrapper around a
 // normal allocator; only this crate can bridge a `bstack`-foreign generic
 // (`DebugCheckingAllocator<A>`) to our `BStackRaiiAllocator` (orphan rules), so it

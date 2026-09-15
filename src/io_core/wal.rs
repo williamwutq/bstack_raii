@@ -94,9 +94,9 @@ const WAL_COUNT_OFFSET: u64 = 16;
 
 /// Anchor offset for the bstack-provided freeing allocators: the second `u64`
 /// word of the user-reserved region every one of them keeps at payload offset 0
-/// and never hands out (FirstFit reserves 16 B there, GhostTree 32 B, Slab and
-/// CheckedSlab 24 B — all ≥ 16). Payload offset 0 is left as `bstack_raii`'s null
-/// niche, so the anchor is the *next* word, `[8, 16)`.
+/// and never hands out (FirstFit reserves 16 B there, GhostTree 32 B, Slab,
+/// CheckedSlab, and Segregated 24 B — all ≥ 16). Payload offset 0 is left as
+/// `bstack_raii`'s null niche, so the anchor is the *next* word, `[8, 16)`.
 pub const STD_WAL_ANCHOR: NonNullOffset =
     // SAFETY: 8 is non-zero.
     unsafe { NonNullOffset::new_unchecked(Offset::from_raw(8)) };
