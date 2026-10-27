@@ -4,6 +4,99 @@
 //! each finding is an isolated `mod` (fault-injection ones self-gate via their
 //! own `#![cfg(feature = "fault-injection")]`).
 
+/// `DebugCheckingAllocator` documents that concurrent use is unsupported without
+/// external synchronization. This wrapper is that external synchronization. One
+/// mutex is held across each allocator call that eliminates false overlap panics.
+mod serialized {
+    use std::io;
+    use std::sync::Mutex;
+
+    use bstack::{
+        BStack, BStackAllocError, BStackAllocator, BStackOwnedSlice, DebugCheckingAllocator,
+        FirstFitBStackAllocator,
+    };
+    use bstack_raii::{BStackRaiiAllocator, NonNullOffset, STD_WAL_ANCHOR};
+
+    pub struct Serialized {
+        inner: DebugCheckingAllocator<FirstFitBStackAllocator>,
+        lock: Mutex<()>,
+    }
+
+    impl Serialized {
+        pub fn new(inner: DebugCheckingAllocator<FirstFitBStackAllocator>) -> Self {
+            Serialized {
+                inner,
+                lock: Mutex::new(()),
+            }
+        }
+    }
+
+    impl BStackAllocator for Serialized {
+        type Error = io::Error;
+        type Allocated<'a> = BStackOwnedSlice<'a, Self>;
+
+        fn stack(&self) -> &BStack {
+            self.inner.stack()
+        }
+
+        fn into_stack(self) -> BStack {
+            self.inner.into_stack()
+        }
+
+        fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+            let _g = self.lock.lock().unwrap();
+            let r = self.inner.alloc(len)?.as_range();
+            // SAFETY: `r` is a fresh live allocation from `inner`
+            Ok(unsafe { BStackOwnedSlice::from_raw_range(self, r) })
+        }
+
+        fn realloc<'a>(
+            &'a self,
+            handle: BStackOwnedSlice<'a, Self>,
+            new_len: u64,
+        ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+            let _g = self.lock.lock().unwrap();
+            // SAFETY: the live allocation `handle` named owned by `inner`
+            let inner_h =
+                unsafe { BStackOwnedSlice::from_raw_range(&self.inner, handle.as_range()) };
+            match self.inner.realloc(inner_h, new_len) {
+                Ok(s) => Ok(unsafe { BStackOwnedSlice::from_raw_range(self, s.as_range()) }),
+                Err(e) => Err(match e.handle {
+                    Some(h) => BStackAllocError::with_handle(e.source, unsafe {
+                        BStackOwnedSlice::from_raw_range(self, h.as_range())
+                    }),
+                    None => BStackAllocError::lost(e.source),
+                }),
+            }
+        }
+
+        fn dealloc<'a>(
+            &'a self,
+            handle: BStackOwnedSlice<'a, Self>,
+        ) -> Result<(), BStackAllocError<'a, Self>> {
+            let _g = self.lock.lock().unwrap();
+            // SAFETY: the live allocation `handle` named owned by `inner`
+            let inner_h =
+                unsafe { BStackOwnedSlice::from_raw_range(&self.inner, handle.as_range()) };
+            self.inner.dealloc(inner_h).map_err(|e| match e.handle {
+                Some(h) => BStackAllocError::with_handle(e.source, unsafe {
+                    BStackOwnedSlice::from_raw_range(self, h.as_range())
+                }),
+                None => BStackAllocError::lost(e.source),
+            })
+        }
+    }
+
+    // SAFETY: forwards every allocation to `FirstFitBStackAllocator` through the
+    // debug checking allocator, which upholds the null niche at payload offset 0 and
+    // reserves the `[8, 16)` WAL anchor slot; this wrapper only serializes the calls.
+    unsafe impl BStackRaiiAllocator for Serialized {
+        fn wal_anchor(&self) -> Option<NonNullOffset> {
+            Some(STD_WAL_ANCHOR)
+        }
+    }
+}
+
 mod atomicity {
     #![allow(clippy::module_inception)]
     //! Regression tests for read-modify-write atomicity of the pointer/vector slots.
@@ -13,7 +106,9 @@ mod atomicity {
     //! concurrent callers never both reclaim the same displaced block — a double free.
     //!
     //! The oracle is `DebugCheckingAllocator`, which panics in-line on a double free;
-    //! if a test completes, no double free occurred. These are contention tests, so
+    //! if a test completes, no double free occurred. It is wrapped in
+    //! `super::serialized::Serialized`, the external synchronization its docs require
+    //! for concurrent use. These are contention tests, so
     //! they loop enough to expose any non-atomic slot under load (seconds) — a pass is
     //! the absence of that panic.
     #![forbid(unsafe_code)]
@@ -23,7 +118,9 @@ mod atomicity {
     use bstack::{BStack, BStackAllocator, DebugCheckingAllocator, FirstFitBStackAllocator};
     use bstack_raii::{BStackDrop, BStackString, bstack_block};
 
-    type Alloc = DebugCheckingAllocator<FirstFitBStackAllocator>;
+    use super::serialized::Serialized;
+
+    type Alloc = Serialized;
 
     fn alloc(tag: &str) -> (Arc<Alloc>, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
@@ -34,7 +131,7 @@ mod atomicity {
                 .as_nanos()
         ));
         let inner = FirstFitBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
-        (Arc::new(DebugCheckingAllocator::new(inner)), path)
+        (Arc::new(Serialized::new(DebugCheckingAllocator::new(inner))), path)
     }
 
     #[bstack_block]
